@@ -1,0 +1,259 @@
+"""CNN + SE classifier used by the active NumPy backend."""
+
+from pathlib import Path
+from typing import Dict, List, Mapping, Tuple
+
+import numpy as np
+
+from nn.activations import relu, relu_backward
+from nn.layers import BatchNorm2D, Conv2D, Dense, Dropout, MaxPool2D, SqueezeExcitation
+
+
+class CNN:
+    """
+    Three-stage CNN + SE classifier for image classification.
+
+    Input: (N, H, W, 3). Output: (N, num_classes).
+    """
+
+    def __init__(
+        self,
+        input_size: Tuple[int, int],
+        num_classes: int,
+        seed: int | None = None,
+        dropout_p: float = 0.5,
+    ):
+        if seed is not None:
+            np.random.seed(seed)
+        height, width = input_size
+        if height < 8 or width < 8:
+            raise ValueError("input_size must be at least (8, 8)")
+
+        self.conv1 = Conv2D(3, 32, (3, 3), stride=1, padding=1)
+        self.bn1 = BatchNorm2D(32)
+        self.conv2 = Conv2D(32, 32, (3, 3), stride=1, padding=1)
+        self.bn2 = BatchNorm2D(32)
+        self.se1 = SqueezeExcitation(32, reduction=4)
+        self.pool1 = MaxPool2D((2, 2), stride=2)
+
+        self.conv3 = Conv2D(32, 64, (3, 3), stride=1, padding=1)
+        self.bn3 = BatchNorm2D(64)
+        self.conv4 = Conv2D(64, 64, (3, 3), stride=1, padding=1)
+        self.bn4 = BatchNorm2D(64)
+        self.se2 = SqueezeExcitation(64, reduction=4)
+        self.pool2 = MaxPool2D((2, 2), stride=2)
+
+        self.conv5 = Conv2D(64, 128, (3, 3), stride=1, padding=1)
+        self.bn5 = BatchNorm2D(128)
+        self.conv6 = Conv2D(128, 128, (3, 3), stride=1, padding=1)
+        self.bn6 = BatchNorm2D(128)
+        self.se3 = SqueezeExcitation(128, reduction=4)
+        self.pool3 = MaxPool2D((2, 2), stride=2)
+
+        feat_h, feat_w = height // 8, width // 8
+        self.fc1 = Dense(feat_h * feat_w * 128, 256)
+        self.dropout = Dropout(p=dropout_p)
+        self.fc2 = Dense(256, num_classes)
+
+        self._input_size = input_size
+        self._num_classes = num_classes
+        self._training = True
+        self._feature_shape = None
+
+    def train(self) -> None:
+        self._training = True
+
+    def eval(self) -> None:
+        self._training = False
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        """x: (N, H, W, 3). Returns logits (N, num_classes)."""
+        x = self.conv1.forward(x)
+        x = self.bn1.forward(x, training=self._training)
+        self._pre_relu1 = x
+        x = relu(x)
+        x = self.conv2.forward(x)
+        x = self.bn2.forward(x, training=self._training)
+        self._pre_relu2 = x
+        x = relu(x)
+        x = self.se1.forward(x)
+        x = self.pool1.forward(x)
+
+        x = self.conv3.forward(x)
+        x = self.bn3.forward(x, training=self._training)
+        self._pre_relu3 = x
+        x = relu(x)
+        x = self.conv4.forward(x)
+        x = self.bn4.forward(x, training=self._training)
+        self._pre_relu4 = x
+        x = relu(x)
+        x = self.se2.forward(x)
+        x = self.pool2.forward(x)
+
+        x = self.conv5.forward(x)
+        x = self.bn5.forward(x, training=self._training)
+        self._pre_relu5 = x
+        x = relu(x)
+        x = self.conv6.forward(x)
+        x = self.bn6.forward(x, training=self._training)
+        self._pre_relu6 = x
+        x = relu(x)
+        x = self.se3.forward(x)
+        x = self.pool3.forward(x)
+
+        self._feature_shape = x.shape
+        x = x.reshape(x.shape[0], -1)
+        x = self.fc1.forward(x)
+        self._fc1_pre = x
+        x = relu(x)
+        x = self.dropout.forward(x, training=self._training)
+        logits = self.fc2.forward(x)
+        return logits
+
+    def backward(self, dlogits: np.ndarray) -> None:
+        dx = self.fc2.backward(dlogits)
+        dx = self.dropout.backward(dx)
+        dx = relu_backward(dx, self._fc1_pre)
+        dx = self.fc1.backward(dx)
+        dx = dx.reshape(self._feature_shape)
+
+        dx = self.pool3.backward(dx)
+        dx = self.se3.backward(dx)
+        dx = relu_backward(dx, self._pre_relu6)
+        dx = self.bn6.backward(dx)
+        dx = self.conv6.backward(dx)
+        dx = relu_backward(dx, self._pre_relu5)
+        dx = self.bn5.backward(dx)
+        dx = self.conv5.backward(dx)
+
+        dx = self.pool2.backward(dx)
+        dx = self.se2.backward(dx)
+        dx = relu_backward(dx, self._pre_relu4)
+        dx = self.bn4.backward(dx)
+        dx = self.conv4.backward(dx)
+        dx = relu_backward(dx, self._pre_relu3)
+        dx = self.bn3.backward(dx)
+        dx = self.conv3.backward(dx)
+
+        dx = self.pool1.backward(dx)
+        dx = self.se1.backward(dx)
+        dx = relu_backward(dx, self._pre_relu2)
+        dx = self.bn2.backward(dx)
+        dx = self.conv2.backward(dx)
+        dx = relu_backward(dx, self._pre_relu1)
+        dx = self.bn1.backward(dx)
+        self.conv1.backward(dx)
+
+    def get_parameters(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        params: List[Tuple[np.ndarray, np.ndarray]] = []
+        for layer in [
+            self.conv1,
+            self.bn1,
+            self.conv2,
+            self.bn2,
+            self.se1,
+            self.conv3,
+            self.bn3,
+            self.conv4,
+            self.bn4,
+            self.se2,
+            self.conv5,
+            self.bn5,
+            self.conv6,
+            self.bn6,
+            self.se3,
+            self.fc1,
+            self.fc2,
+        ]:
+            params.extend(layer.get_params())
+        return params
+
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        return {
+            "conv1.W": self.conv1.W,
+            "conv1.b": self.conv1.b,
+            "bn1.gamma": self.bn1.gamma,
+            "bn1.beta": self.bn1.beta,
+            "bn1.running_mean": self.bn1.running_mean,
+            "bn1.running_var": self.bn1.running_var,
+            "conv2.W": self.conv2.W,
+            "conv2.b": self.conv2.b,
+            "bn2.gamma": self.bn2.gamma,
+            "bn2.beta": self.bn2.beta,
+            "bn2.running_mean": self.bn2.running_mean,
+            "bn2.running_var": self.bn2.running_var,
+            "se1.fc1.W": self.se1.fc1.W,
+            "se1.fc1.b": self.se1.fc1.b,
+            "se1.fc2.W": self.se1.fc2.W,
+            "se1.fc2.b": self.se1.fc2.b,
+            "conv3.W": self.conv3.W,
+            "conv3.b": self.conv3.b,
+            "bn3.gamma": self.bn3.gamma,
+            "bn3.beta": self.bn3.beta,
+            "bn3.running_mean": self.bn3.running_mean,
+            "bn3.running_var": self.bn3.running_var,
+            "conv4.W": self.conv4.W,
+            "conv4.b": self.conv4.b,
+            "bn4.gamma": self.bn4.gamma,
+            "bn4.beta": self.bn4.beta,
+            "bn4.running_mean": self.bn4.running_mean,
+            "bn4.running_var": self.bn4.running_var,
+            "se2.fc1.W": self.se2.fc1.W,
+            "se2.fc1.b": self.se2.fc1.b,
+            "se2.fc2.W": self.se2.fc2.W,
+            "se2.fc2.b": self.se2.fc2.b,
+            "conv5.W": self.conv5.W,
+            "conv5.b": self.conv5.b,
+            "bn5.gamma": self.bn5.gamma,
+            "bn5.beta": self.bn5.beta,
+            "bn5.running_mean": self.bn5.running_mean,
+            "bn5.running_var": self.bn5.running_var,
+            "conv6.W": self.conv6.W,
+            "conv6.b": self.conv6.b,
+            "bn6.gamma": self.bn6.gamma,
+            "bn6.beta": self.bn6.beta,
+            "bn6.running_mean": self.bn6.running_mean,
+            "bn6.running_var": self.bn6.running_var,
+            "se3.fc1.W": self.se3.fc1.W,
+            "se3.fc1.b": self.se3.fc1.b,
+            "se3.fc2.W": self.se3.fc2.W,
+            "se3.fc2.b": self.se3.fc2.b,
+            "fc1.W": self.fc1.W,
+            "fc1.b": self.fc1.b,
+            "fc2.W": self.fc2.W,
+            "fc2.b": self.fc2.b,
+        }
+
+    def load_state_dict(self, state: Mapping[str, np.ndarray]) -> None:
+        expected = self.state_dict()
+        missing = sorted(set(expected.keys()) - set(state.keys()))
+        if missing:
+            raise KeyError(f"Missing weights: {missing}")
+        for key, target in expected.items():
+            source = np.asarray(state[key], dtype=np.float64)
+            if source.shape != target.shape:
+                raise ValueError(f"Shape mismatch for {key}: expected {target.shape}, got {source.shape}")
+            target[...] = source
+
+    def save_weights(self, path: str | Path) -> None:
+        checkpoint = Path(path)
+        if checkpoint.suffix != ".npz":
+            raise ValueError("Checkpoint path must use .npz extension")
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(checkpoint, **self.state_dict())
+
+    def load_weights(self, path: str | Path) -> None:
+        checkpoint = Path(path).resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+        if checkpoint.suffix != ".npz":
+            raise ValueError("Checkpoint must be .npz")
+        try:
+            data = np.load(checkpoint, allow_pickle=False)
+        except Exception as exc:
+            raise ValueError(f"Invalid checkpoint file: {exc}") from exc
+        try:
+            state = {key: data[key] for key in data.files}
+        finally:
+            data.close()
+        self.load_state_dict(state)

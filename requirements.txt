@@ -1,0 +1,16 @@
+# Core numeric backend retained for the legacy implementation.
+numpy>=2.0,<3
+
+# Image loading and preprocessing.
+pillow>=10.0
+
+# Default training and inference backend.
+torch>=2.10.0
+
+# GUI and camera/image processing support.
+opencv-python>=4.10.0
+
+# Test runner.
+pytest>=9.0
+
+pillow
