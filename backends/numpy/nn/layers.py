@@ -289,43 +289,42 @@ class BatchNorm2D:
             raise ValueError(f"BatchNorm2D expected C={self.num_features}, got {C}")
         self._training = bool(training)
         if training:
-            # Batch statistics across N,H,W
+            # Batch statistics across N,H,W during normal training.
             mean = np.mean(x, axis=(0, 1, 2))
             var = np.var(x, axis=(0, 1, 2))
-            # Normalize
             inv_std = 1.0 / np.sqrt(var + self.eps)
             x_hat = (x - mean) * inv_std
-            # Save for backward
             self._x_hat = x_hat
             self._inv_std = inv_std
             self._batch_mean = mean
-            # Update running stats
             self.running_mean = self.momentum * self.running_mean + (1.0 - self.momentum) * mean
             self.running_var = self.momentum * self.running_var + (1.0 - self.momentum) * var
         else:
+            # Eval-mode normalization is also used during backbone freeze so BN
+            # running statistics stay fixed while affine parameters may still adapt.
             inv_std = 1.0 / np.sqrt(self.running_var + self.eps)
             x_hat = (x - self.running_mean) * inv_std
-            self._x_hat = None
-            self._inv_std = None
-            self._batch_mean = None
-        # Scale and shift
+            self._x_hat = x_hat
+            self._inv_std = inv_std
+            self._batch_mean = self.running_mean
         return x_hat * self.gamma + self.beta
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """dout: (N, H, W, C). Returns dx of same shape. Valid only if called after training forward."""
+        """dout: (N, H, W, C). Returns dx of same shape."""
         if self._x_hat is None or self._inv_std is None:
-            # In eval mode, BN is affine; gradients only flow to gamma/beta, dx is dout * gamma
-            self._dgamma = np.sum(dout * 0.0, axis=(0, 1, 2))  # no-op safeguard
+            raise RuntimeError("BatchNorm2D.backward called before forward")
+        if not self._training:
+            # During frozen-backbone training, running stats stay fixed but
+            # affine parameters may remain trainable when requested.
+            self._dgamma = np.sum(dout * self._x_hat, axis=(0, 1, 2))
             self._dbeta = np.sum(dout, axis=(0, 1, 2))
-            return dout * self.gamma
+            return dout * (self.gamma * self._inv_std)
         N, H, W, C = dout.shape
         M = float(N * H * W)
         x_hat = self._x_hat
         inv_std = self._inv_std
-        # Gradients w.r.t. gamma and beta
         self._dgamma = np.sum(dout * x_hat, axis=(0, 1, 2))
         self._dbeta = np.sum(dout, axis=(0, 1, 2))
-        # Gradient w.r.t. x
         dx_hat = dout * self.gamma
         dx = (1.0 / M) * inv_std * (
             M * dx_hat

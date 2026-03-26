@@ -1,5 +1,4 @@
-"""
-PyTorch training backend.
+"""PyTorch training backend.
 
 This backend keeps the project data pipeline and CLI style close to the legacy
 NumPy trainer, but runs the model, gradients, optimizer, and checkpointing in
@@ -11,17 +10,22 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import sys
 from pathlib import Path
-from typing import List
 
 import numpy as np
 
 import config
 from backends.torch.model import TorchCNN
 from data.loaders import load_image
-from data.preprocessing import preprocess_image, resize
+from data.preprocessing import preprocess_image
 from utils.safety import install_dataset_write_guard, tree_signature
+from utils.training import (
+    augment_batch,
+    build_epoch_phase_map,
+    compute_phase_learning_rate,
+    parse_bool_flag,
+    validate_phase_learning_rates,
+)
 
 install_dataset_write_guard()
 
@@ -30,80 +34,6 @@ try:
     from torch import nn
 except Exception as exc:
     raise SystemExit(f"PyTorch backend is unavailable in this interpreter: {exc}") from exc
-
-
-def cosine_lr(base_lr: float, step: int, total_steps: int, min_lr_ratio: float = 0.1) -> float:
-    if total_steps <= 1:
-        return base_lr
-    progress = min(max(step / max(1, total_steps - 1), 0.0), 1.0)
-    cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
-    return float(base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine))
-
-
-def random_resized_crop_batch(
-    x: np.ndarray,
-    rng: np.random.Generator,
-    scale: tuple[float, float] = (0.6, 1.0),
-    ratio: tuple[float, float] = (3 / 4, 4 / 3),
-) -> np.ndarray:
-    """Apply the same crop policy as the legacy trainer before converting to torch."""
-    batch_size, height, width, _ = x.shape
-    out = np.empty_like(x)
-    for index in range(batch_size):
-        area = height * width
-        applied = False
-        for _ in range(10):
-            target_area = float(area) * float(rng.uniform(scale[0], scale[1]))
-            log_ratio = (np.log(ratio[0]), np.log(ratio[1]))
-            aspect = float(np.exp(rng.uniform(*log_ratio)))
-            crop_h = int(round(np.sqrt(target_area * aspect)))
-            crop_w = int(round(np.sqrt(target_area / aspect)))
-            if 1 <= crop_h <= height and 1 <= crop_w <= width:
-                y0 = int(rng.integers(0, max(1, height - crop_h + 1)))
-                x0 = int(rng.integers(0, max(1, width - crop_w + 1)))
-                crop = x[index, y0 : y0 + crop_h, x0 : x0 + crop_w, :]
-                crop_u8 = np.clip(crop * 255.0, 0, 255).astype(np.uint8)
-                out[index] = np.asarray(resize(crop_u8, (height, width)), dtype=np.float32) / 255.0
-                applied = True
-                break
-        if not applied:
-            out[index] = x[index]
-    return out
-
-
-def augment_batch(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Mirror the current NumPy augmentation policy for backend parity."""
-    out = x.copy()
-    batch_size, height, width, _ = out.shape
-    if rng.random() < 0.9:
-        out = random_resized_crop_batch(out, rng)
-    flip_mask = rng.random(batch_size) < 0.5
-    out[flip_mask] = out[flip_mask, :, ::-1, :]
-
-    brightness = 1.0 + rng.uniform(-0.12, 0.12, size=(batch_size, 1, 1, 1))
-    contrast = 1.0 + rng.uniform(-0.12, 0.12, size=(batch_size, 1, 1, 1))
-    mean = np.mean(out, axis=(1, 2), keepdims=True)
-    out = (out - mean) * contrast + mean
-    out = out * brightness
-
-    pad = 4
-    padded = np.pad(out, ((0, 0), (pad, pad), (pad, pad), (0, 0)), mode="reflect")
-    for index in range(batch_size):
-        y0 = int(rng.integers(0, 2 * pad + 1))
-        x0 = int(rng.integers(0, 2 * pad + 1))
-        out[index] = padded[index, y0 : y0 + height, x0 : x0 + width, :]
-
-    for index in range(batch_size):
-        if rng.random() < 0.3:
-            cut = int(rng.integers(max(2, height // 8), max(4, height // 4)))
-            cy = int(rng.integers(0, height))
-            cx = int(rng.integers(0, width))
-            y1 = max(0, cy - cut // 2)
-            y2 = min(height, cy + cut // 2)
-            x1 = max(0, cx - cut // 2)
-            x2 = min(width, cx + cut // 2)
-            out[index, y1:y2, x1:x2, :] = 0.0
-    return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
 def list_labeled_paths(
@@ -306,13 +236,59 @@ def load_weights_forgiving(model: TorchCNN, checkpoint_path: str | Path, skip_pr
     return loaded, skipped
 
 
+def _apply_backbone_freeze_state(model: TorchCNN, backbone_frozen: bool, freeze_bn_affine: bool) -> None:
+    """Apply the temporary freeze policy after each `model.train()` call.
+
+    `model.train()` recursively flips every module back to training mode, so the
+    trainer reapplies the backbone freeze state each epoch to keep BN running
+    statistics fixed when the backbone is frozen.
+    """
+    for parameter in model.iter_head_parameters():
+        parameter.requires_grad = True
+
+    for parameter in model.iter_backbone_parameters():
+        parameter.requires_grad = not backbone_frozen
+
+    for bn_layer in model.backbone_batchnorm_layers():
+        if backbone_frozen:
+            bn_layer.eval()
+            if bn_layer.weight is not None:
+                bn_layer.weight.requires_grad = not freeze_bn_affine
+            if bn_layer.bias is not None:
+                bn_layer.bias.requires_grad = not freeze_bn_affine
+        else:
+            bn_layer.train()
+            if bn_layer.weight is not None:
+                bn_layer.weight.requires_grad = True
+            if bn_layer.bias is not None:
+                bn_layer.bias.requires_grad = True
+
+
+def _build_optimizer(
+    args: argparse.Namespace,
+    model: TorchCNN,
+    lr_value: float,
+) -> torch.optim.Optimizer:
+    """Recreate the optimizer intentionally when freeze state changes.
+
+    Rebuilding the optimizer makes the transition explicit and avoids carrying
+    stale momentum state across a different parameter set.
+    """
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(parameters, lr=lr_value, weight_decay=args.weight_decay)
+    return torch.optim.SGD(parameters, lr=lr_value, momentum=args.momentum, weight_decay=args.weight_decay)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train image classifier with the PyTorch backend")
     parser.add_argument("--help-md", action="store_true", help="Print Markdown guide and exit")
     parser.add_argument("--data-dir", type=str, default=None, help="Directory with train images")
     parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, nargs="+", default=[1e-3], help="One learning rate per phase")
+    parser.add_argument("--phase-count", type=int, default=1, help="Number of contiguous training phases")
+    parser.add_argument("--warmup-epochs", type=int, default=0, help="Warmup epochs at the start of each phase")
     parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw", help="Optimizer type")
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum (for SGD)")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay")
@@ -321,7 +297,7 @@ def main() -> None:
     parser.add_argument("--val-split", type=float, default=0.2, help="Validation split ratio")
     parser.add_argument("--min-lr-ratio", type=float, default=0.2, help="Minimum LR ratio for cosine schedule")
     parser.add_argument("--lr-schedule", choices=["cosine", "step", "constant"], default="cosine", help="LR schedule type")
-    parser.add_argument("--step-size", type=int, default=10, help="StepLR epoch interval")
+    parser.add_argument("--step-size", type=int, default=10, help="StepLR epoch interval inside each phase")
     parser.add_argument("--gamma", type=float, default=0.5, help="StepLR decay factor")
     parser.add_argument("--early-stop-metric", choices=["val_loss", "val_acc"], default="val_loss", help="Metric for early stopping")
     parser.add_argument("--grad-clip", type=float, default=5.0, help="Global gradient clip norm (0 disables)")
@@ -329,7 +305,7 @@ def main() -> None:
     parser.add_argument("--balance-sampling", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
-    parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for the monitored metric")
+    parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
     parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "best_torch_model.pt"))
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
@@ -339,15 +315,18 @@ def main() -> None:
     parser.add_argument("--partition", type=int, default=0, help="Train only on shard id [0..P-1]")
     parser.add_argument("--auto-next-partition", action=argparse.BooleanOptionalAction, default=False, help="Rotate partition id across runs and save state to --partition-state")
     parser.add_argument("--partition-state", type=str, default=str(config.CHECKPOINT_DIR / "partition_state.json"), help="State file for --auto-next-partition")
-    parser.add_argument(
-        "--class-count",
-        type=int,
-        default=None,
-        help="Total number of classes. Defaults to the detected dataset class count.",
-    )
+    parser.add_argument("--class-count", type=int, default=None, help="Total number of classes. Defaults to the detected dataset class count.")
     parser.add_argument("--enforce-readonly-dataset", action=argparse.BooleanOptionalAction, default=True, help="Verify Dataset unchanged before/after run")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Training device")
+    parser.add_argument(
+        "--freeze-bn-affine",
+        type=parse_bool_flag,
+        nargs="?",
+        const=True,
+        default=True,
+        help="When false, keep BN affine parameters trainable during backbone freeze",
+    )
     args = parser.parse_args()
 
     if args.help_md:
@@ -357,6 +336,13 @@ def main() -> None:
         except Exception as exc:
             raise SystemExit(f"Help file not found or unreadable: {exc}") from exc
         return
+
+    if args.phase_count > args.epochs:
+        raise SystemExit("--phase-count cannot be greater than --epochs")
+    try:
+        lr_values = validate_phase_learning_rates(args.lr, args.phase_count)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -435,11 +421,6 @@ def main() -> None:
             print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (e.g., classifier head)")
             model.to(device)
 
-    if args.optimizer == "adamw":
-        optimizer: torch.optim.Optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-
     batch_size = max(1, int(args.batch_size))
     x_train = None
     x_val = None
@@ -450,15 +431,41 @@ def main() -> None:
             x_val = _load_batch(val_paths, input_size)
 
     num_batches = (y_train.size + batch_size - 1) // batch_size
-    total_steps = max(1, args.epochs * num_batches)
-    global_step = 0
+    phase_map = build_epoch_phase_map(args.epochs, args.phase_count)
+    current_phase_index = -1
+    phase_best_val_acc = -float("inf")
+    phase_plateau_epochs = 0
+    freeze_patience = 5
+    backbone_frozen = False
+
     best_val_loss = float("inf")
     best_val_acc = 0.0
     best_saved = False
     bad_epochs = 0
+    current_lr = lr_values[0]
+
+    _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
+    optimizer: torch.optim.Optimizer = _build_optimizer(args, model, lr_value=current_lr)
 
     for epoch in range(args.epochs):
+        phase_config = phase_map[epoch]
+        if phase_config.phase_index != current_phase_index:
+            current_phase_index = phase_config.phase_index
+            phase_best_val_acc = -float("inf")
+            phase_plateau_epochs = 0
+            backbone_frozen = False
+            model.train()
+            _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
+            optimizer = _build_optimizer(args, model, lr_value=lr_values[current_phase_index])
+            print(
+                f"Phase {current_phase_index + 1}/{args.phase_count}  "
+                f"base_lr={lr_values[current_phase_index]:.6f}  "
+                f"epochs={phase_config.epochs_in_phase}  "
+                "cosine_restarts_per_phase=yes"
+            )
+
         model.train()
+        _apply_backbone_freeze_state(model, backbone_frozen=backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
         permutation = build_balanced_epoch_indices(y_train, rng) if args.balance_sampling else rng.permutation(y_train.size)
         epoch_loss = 0.0
         epoch_correct = 0
@@ -476,12 +483,17 @@ def main() -> None:
             if args.augment:
                 x_batch = augment_batch(x_batch, rng)
 
-            current_lr = (
-                args.lr
-                if args.lr_schedule == "constant"
-                else cosine_lr(args.lr, global_step, total_steps, min_lr_ratio=args.min_lr_ratio)
-                if args.lr_schedule == "cosine"
-                else float(args.lr * (args.gamma ** max(0, epoch // max(1, args.step_size))))
+            current_lr = compute_phase_learning_rate(
+                base_lr=lr_values[current_phase_index],
+                schedule=args.lr_schedule,
+                min_lr_ratio=args.min_lr_ratio,
+                gamma=args.gamma,
+                step_size=args.step_size,
+                warmup_epochs=args.warmup_epochs,
+                epoch_index_in_phase=phase_config.epoch_index_in_phase,
+                epochs_in_phase=phase_config.epochs_in_phase,
+                batch_index=batch_index,
+                num_batches=num_batches,
             )
             _set_optimizer_lr(optimizer, current_lr)
 
@@ -492,12 +504,11 @@ def main() -> None:
             loss = criterion(logits, y_tensor)
             loss.backward()
             if args.grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                torch.nn.utils.clip_grad_norm_([parameter for parameter in model.parameters() if parameter.requires_grad], max_norm=args.grad_clip)
             optimizer.step()
 
             epoch_loss += float(loss.item())
             epoch_correct += int((torch.argmax(logits, dim=1) == y_tensor).sum().item())
-            global_step += 1
 
         avg_loss = epoch_loss / max(1, num_batches)
         train_acc = epoch_correct / max(1, y_train.size)
@@ -507,6 +518,7 @@ def main() -> None:
                 val_loss, val_acc = evaluate_streaming(model, val_paths, y_val, num_classes, batch_size, input_size, device)
             else:
                 val_loss, val_acc = evaluate_preloaded(model, x_val, y_val, batch_size, device)
+
             improved = (val_loss < (best_val_loss - args.min_delta)) if args.early_stop_metric == "val_loss" else (val_acc > (best_val_acc + args.min_delta))
             if improved:
                 if args.early_stop_metric == "val_loss":
@@ -518,14 +530,39 @@ def main() -> None:
                 bad_epochs = 0
             else:
                 bad_epochs += 1
+
+            if val_acc > (phase_best_val_acc + args.min_delta):
+                phase_best_val_acc = val_acc
+                phase_plateau_epochs = 0
+            else:
+                phase_plateau_epochs += 1
+                if (not backbone_frozen) and phase_plateau_epochs >= freeze_patience:
+                    backbone_frozen = True
+                    model.train()
+                    _apply_backbone_freeze_state(model, backbone_frozen=True, freeze_bn_affine=args.freeze_bn_affine)
+                    optimizer = _build_optimizer(args, model, lr_value=current_lr)
+                    print(
+                        f"Backbone frozen at epoch {epoch + 1}: val_acc plateaued for {freeze_patience} epochs; "
+                        "training the head until the next phase."
+                    )
+
             gap = train_acc - val_acc
             marker = " *" if improved else ""
-            print(f"Epoch {epoch + 1}/{args.epochs}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  val_loss={val_loss:.4f}  val_acc={val_acc:.3f}  gap={gap:.3f}{marker}")
+            mode_text = "head-only" if backbone_frozen else "full"
+            print(
+                f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
+                f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  "
+                f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}  gap={gap:.3f}{marker}"
+            )
             if args.early_stop and bad_epochs >= args.patience:
                 print(f"Early stopping at epoch {epoch + 1}: metric {args.early_stop_metric} did not improve by {args.min_delta} for {args.patience} epochs.")
                 break
         else:
-            print(f"Epoch {epoch + 1}/{args.epochs}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}")
+            mode_text = "head-only" if backbone_frozen else "full"
+            print(
+                f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
+                f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}"
+            )
 
     if y_val is None or len(val_paths) == 0:
         model.save_weights(args.checkpoint)
@@ -543,12 +580,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-

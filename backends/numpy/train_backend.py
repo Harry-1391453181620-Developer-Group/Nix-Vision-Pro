@@ -1,5 +1,4 @@
-"""
-Training script
+"""Training script
 - Streaming by default (load only current batch); optional preload via --no-streaming
 - Resume from checkpoint with forgiving load (skips mismatched classifier head)
 - Optional dataset partitioning across runs
@@ -21,8 +20,15 @@ import numpy as np
 
 import config
 from utils.safety import install_dataset_write_guard, tree_signature
+from utils.training import (
+    augment_batch,
+    build_epoch_phase_map,
+    compute_phase_learning_rate,
+    parse_bool_flag,
+    validate_phase_learning_rates,
+)
 from data.loaders import load_image
-from data.preprocessing import preprocess_image, resize
+from data.preprocessing import preprocess_image
 from backends.numpy.model import CNN
 from nn.losses import cross_entropy_loss, cross_entropy_loss_backward
 
@@ -92,7 +98,6 @@ if any(arg == "-help" for arg in sys.argv[1:]):
         sys.stdout.write(text.encode(enc, errors="replace").decode(enc, errors="replace"))
     raise SystemExit(0)
 
-# Utilities
 
 def one_hot(labels: np.ndarray, num_classes: int, label_smoothing: float = 0.0) -> np.ndarray:
     if not (0.0 <= label_smoothing < 1.0):
@@ -105,12 +110,6 @@ def one_hot(labels: np.ndarray, num_classes: int, label_smoothing: float = 0.0) 
     out[np.arange(N), labels] = on_value
     return out
 
-def cosine_lr(base_lr: float, step: int, total_steps: int, min_lr_ratio: float = 0.1) -> float:
-    if total_steps <= 1:
-        return base_lr
-    progress = min(max(step / max(1, (total_steps - 1)), 0.0), 1.0)
-    cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
-    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
 def clip_gradients(parameters: List[Tuple[np.ndarray, np.ndarray]], max_norm: float) -> float:
     if max_norm <= 0.0:
@@ -127,69 +126,6 @@ def clip_gradients(parameters: List[Tuple[np.ndarray, np.ndarray]], max_norm: fl
                 g *= scale
     return total
 
-
-def random_resized_crop_batch(x: np.ndarray, rng: np.random.Generator, scale: tuple[float, float] = (0.6, 1.0), ratio: tuple[float, float] = (3/4, 4/3)) -> np.ndarray:
-    """Apply torchvision-style RandomResizedCrop to each image and resize back to original size.
-    x: (N, H, W, 3) in [0,1]. Returns same shape.
-    """
-    N, H, W, C = x.shape
-    out = np.empty_like(x)
-    for i in range(N):
-        area = H * W
-        ok = False
-        for _ in range(10):  # try up to 10 samples
-            target_area = float(area) * float(rng.uniform(scale[0], scale[1]))
-            log_ratio = (np.log(ratio[0]), np.log(ratio[1]))
-            aspect = float(np.exp(rng.uniform(*log_ratio)))
-            h = int(round(np.sqrt(target_area * aspect)))
-            w = int(round(np.sqrt(target_area / aspect)))
-            if 1 <= h <= H and 1 <= w <= W:
-                y0 = int(rng.integers(0, max(1, H - h + 1)))
-                x0 = int(rng.integers(0, max(1, W - w + 1)))
-                crop = x[i, y0:y0+h, x0:x0+w, :]
-                crop_u8 = (np.clip(crop * 255.0, 0, 255)).astype(np.uint8)
-                resized = resize(crop_u8, (H, W))
-                out[i] = np.asarray(resized, dtype=np.float64) / 255.0
-                ok = True
-                break
-        if not ok:
-            out[i] = x[i]
-    return out
-
-
-def augment_batch(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    out = x.copy()
-    N, h, w, _ = out.shape
-    # RandomResizedCrop then HorizontalFlip
-    if rng.random() < 0.9:
-        out = random_resized_crop_batch(out, rng)
-    flip = rng.random(N) < 0.5
-    out[flip] = out[flip, :, ::-1, :]
-    # Light color jitter
-    brightness = 1.0 + rng.uniform(-0.12, 0.12, size=(N, 1, 1, 1))
-    contrast = 1.0 + rng.uniform(-0.12, 0.12, size=(N, 1, 1, 1))
-    mean = np.mean(out, axis=(1, 2), keepdims=True)
-    out = (out - mean) * contrast + mean
-    out = out * brightness
-    # Random crop-with-pad fallback + Cutout
-    pad = 4
-    padded = np.pad(out, ((0, 0), (pad, pad), (pad, pad), (0, 0)), mode="reflect")
-    for i in range(N):
-        y0 = int(rng.integers(0, 2 * pad + 1))
-        x0 = int(rng.integers(0, 2 * pad + 1))
-        out[i] = padded[i, y0:y0 + h, x0:x0 + w, :]
-    for i in range(N):
-        if rng.random() < 0.3:
-            cut = int(rng.integers(max(2, h // 8), max(4, h // 4)))
-            cy = int(rng.integers(0, h))
-            cx = int(rng.integers(0, w))
-            y1 = max(0, cy - cut // 2)
-            y2 = min(h, cy + cut // 2)
-            x1 = max(0, cx - cut // 2)
-            x2 = min(w, cx + cut // 2)
-            out[i, y1:y2, x1:x2, :] = 0.0
-    return np.clip(out, 0.0, 1.0)
-# Data listing (no loads)
 
 def list_labeled_paths(
     data_dir: Path,
@@ -226,8 +162,10 @@ def list_labeled_paths(
     class_names = [str(i) for i in range(fallback_num_classes)]
     return paths, labels, class_names, True
 
+
 def class_distribution(labels: np.ndarray, num_classes: int) -> np.ndarray:
     return np.bincount(labels, minlength=num_classes).astype(np.int64)
+
 
 def make_class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
     counts = class_distribution(labels, num_classes).astype(np.float64)
@@ -239,6 +177,7 @@ def make_class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
     weights[nz] /= np.mean(weights[nz])
     return weights
 
+
 def build_balanced_epoch_indices(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     counts = np.bincount(y).astype(np.float64)
     class_prob = np.zeros_like(counts)
@@ -248,7 +187,6 @@ def build_balanced_epoch_indices(y: np.ndarray, rng: np.random.Generator) -> np.
     sample_prob /= np.sum(sample_prob)
     return rng.choice(y.size, size=y.size, replace=True, p=sample_prob)
 
-# Evaluation
 
 def evaluate_streaming(model: CNN, paths: list[Path], labels: np.ndarray, num_classes: int, batch_size: int, input_size: tuple[int, int]) -> tuple[float, float]:
     n = len(paths)
@@ -257,6 +195,7 @@ def evaluate_streaming(model: CNN, paths: list[Path], labels: np.ndarray, num_cl
     total_loss = 0.0
     total_correct = 0
     n_batches = 0
+    model.eval()
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         batch_paths = paths[start:end]
@@ -273,11 +212,13 @@ def evaluate_streaming(model: CNN, paths: list[Path], labels: np.ndarray, num_cl
         n_batches += 1
     return total_loss / max(1, n_batches), total_correct / max(1, n)
 
+
 def evaluate_preloaded(model: CNN, X: np.ndarray, labels: np.ndarray, num_classes: int, batch_size: int) -> tuple[float, float]:
     n = labels.size
     total_loss = 0.0
     total_correct = 0
     n_batches = 0
+    model.eval()
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         x = X[start:end]
@@ -290,13 +231,13 @@ def evaluate_preloaded(model: CNN, X: np.ndarray, labels: np.ndarray, num_classe
         n_batches += 1
     return total_loss / max(1, n_batches), total_correct / max(1, n)
 
-# Partition helpers
 
 def stable_partition_index(p: Path, num_parts: int) -> int:
     if num_parts <= 1:
         return 0
     h = hashlib.md5(str(p.resolve()).lower().encode("utf-8")).hexdigest()
     return int(h[:8], 16) % num_parts
+
 
 def choose_partition(args) -> int:
     if not args.auto_next_partition:
@@ -320,7 +261,6 @@ def choose_partition(args) -> int:
         pass
     return part
 
-# Forgiving load
 
 def load_weights_forgiving(model: CNN, npz_path: str | Path, skip_prefixes: tuple[str, ...] = ("fc2.",)) -> tuple[list[str], list[str]]:
     npz_path = str(npz_path)
@@ -353,7 +293,13 @@ def load_weights_forgiving(model: CNN, npz_path: str | Path, skip_prefixes: tupl
         except Exception:
             pass
 
-# Main
+
+def _build_optimizer(args: argparse.Namespace, parameters: List[Tuple[np.ndarray, np.ndarray]], lr_value: float):
+    """Recreate the NumPy optimizer when the active parameter set changes."""
+    if args.optimizer == "adamw":
+        return AdamWImpl(parameters=parameters, lr=lr_value, weight_decay=args.weight_decay)
+    return SGDImpl(parameters=parameters, lr=lr_value, momentum=args.momentum, weight_decay=args.weight_decay)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train NumPy-only CNN image classifier (streaming or preload)")
@@ -361,7 +307,9 @@ def main() -> None:
     parser.add_argument("--data-dir", type=str, default=None, help="Directory with train images")
     parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, nargs="+", default=[1e-3], help="One learning rate per phase")
+    parser.add_argument("--phase-count", type=int, default=1, help="Number of contiguous training phases")
+    parser.add_argument("--warmup-epochs", type=int, default=0, help="Warmup epochs at the start of each phase")
     parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw", help="Optimizer type")
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum (for SGD)")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay")
@@ -370,7 +318,7 @@ def main() -> None:
     parser.add_argument("--val-split", type=float, default=0.2, help="Validation split ratio")
     parser.add_argument("--min-lr-ratio", type=float, default=0.2, help="Minimum LR ratio for cosine schedule")
     parser.add_argument("--lr-schedule", choices=["cosine", "step", "constant"], default="cosine", help="LR schedule type")
-    parser.add_argument("--step-size", type=int, default=10, help="StepLR epoch interval")
+    parser.add_argument("--step-size", type=int, default=10, help="StepLR epoch interval inside each phase")
     parser.add_argument("--gamma", type=float, default=0.5, help="StepLR decay factor")
     parser.add_argument("--early-stop-metric", choices=["val_loss", "val_acc"], default="val_loss", help="Metric for early stopping")
     parser.add_argument("--grad-clip", type=float, default=5.0, help="Global gradient clip norm (0 disables)")
@@ -378,7 +326,7 @@ def main() -> None:
     parser.add_argument("--balance-sampling", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
-    parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum val_loss improvement")
+    parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
     parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "best_model.npz"))
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
@@ -391,15 +339,18 @@ def main() -> None:
                         help="Rotate partition id across runs and save state to --partition-state")
     parser.add_argument("--partition-state", type=str, default=str(config.CHECKPOINT_DIR / "partition_state.json"),
                         help="State file for --auto-next-partition")
-    parser.add_argument(
-        "--class-count",
-        type=int,
-        default=None,
-        help="Total number of classes. Defaults to the detected dataset class count.",
-    )
+    parser.add_argument("--class-count", type=int, default=None, help="Total number of classes. Defaults to the detected dataset class count.")
     parser.add_argument("--enforce-readonly-dataset", action=argparse.BooleanOptionalAction, default=True,
                         help="Verify Dataset unchanged before/after run")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--freeze-bn-affine",
+        type=parse_bool_flag,
+        nargs="?",
+        const=True,
+        default=True,
+        help="When false, keep BN affine parameters trainable during backbone freeze",
+    )
     args = parser.parse_args()
 
     if args.help_md:
@@ -415,11 +366,17 @@ def main() -> None:
             sys.stdout.write(text.encode(enc, errors="replace").decode(enc, errors="replace"))
         return
 
+    if args.phase_count > args.epochs:
+        raise SystemExit("--phase-count cannot be greater than --epochs")
+    try:
+        lr_values = validate_phase_learning_rates(args.lr, args.phase_count)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     data_dir = Path(args.data_dir) if args.data_dir else Path(config.DATA_DIR)
     data_dir = data_dir.resolve()
 
     pre_sig = tree_signature(data_dir) if args.enforce_readonly_dataset else None
-
     rng = np.random.default_rng(args.seed)
 
     fallback_num_classes = (
@@ -445,7 +402,6 @@ def main() -> None:
     print(f"Using num_classes={num_classes} (detected={detected_classes})")
     print(f"Using classes={resolved_class_names}")
 
-    # Train/Val split
     n_samples = len(paths)
     idx = rng.permutation(n_samples)
     n_val = int(max(0, min(0.9, args.val_split)) * n_samples)
@@ -456,7 +412,6 @@ def main() -> None:
     y_train_all = labels[train_idx]
     y_val = labels[val_idx] if n_val > 0 else None
 
-    # Partitioning
     P = max(1, int(args.num_partitions))
     part = choose_partition(args)
     if part < 0 or part >= P:
@@ -472,7 +427,6 @@ def main() -> None:
         train_paths = train_paths_all
         y_train = y_train_all
 
-    # Stats
     train_counts = class_distribution(y_train, num_classes)
     print("Train samples:", y_train.size, " class_counts=", train_counts.tolist())
     if y_val is not None:
@@ -480,11 +434,10 @@ def main() -> None:
         print("Val samples:", y_val.size, " class_counts=", val_counts.tolist())
 
     class_weights = make_class_weights(y_train, num_classes) if args.class_weighting else None
-
     input_size = config.INPUT_SIZE
 
-    # Model & optimizer
     model = CNN(input_size=input_size, num_classes=num_classes, seed=args.seed, dropout_p=args.dropout)
+    model.set_backbone_frozen(False, freeze_bn_affine=args.freeze_bn_affine)
     if args.init_from:
         try:
             model.load_weights(args.init_from)
@@ -494,14 +447,7 @@ def main() -> None:
             loaded, skipped = load_weights_forgiving(model, args.init_from, skip_prefixes=("fc2.",))
             print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (e.g., classifier head)")
 
-    if args.optimizer == "adamw":
-        optimizer = AdamWImpl(parameters=model.get_parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        optimizer = SGDImpl(parameters=model.get_parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-
     batch_size = int(max(1, args.batch_size))
-
-    # Optional preload
     X_train = None
     X_val = None
     if not args.streaming:
@@ -517,16 +463,39 @@ def main() -> None:
             X_val = load_and_preprocess(val_paths)
 
     n_batches = (y_train.size + batch_size - 1) // batch_size
-    total_steps = max(1, args.epochs * n_batches)
-    global_step = 0
+    phase_map = build_epoch_phase_map(args.epochs, args.phase_count)
+    current_phase_index = -1
+    phase_best_val_acc = -float("inf")
+    phase_plateau_epochs = 0
+    freeze_patience = 5
+    backbone_frozen = False
 
     best_val_loss = float("inf")
     best_val_acc = 0.0
     best_saved = False
     bad_epochs = 0
+    current_lr = lr_values[0]
+    optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_lr)
 
     for epoch in range(args.epochs):
+        phase_config = phase_map[epoch]
+        if phase_config.phase_index != current_phase_index:
+            current_phase_index = phase_config.phase_index
+            phase_best_val_acc = -float("inf")
+            phase_plateau_epochs = 0
+            backbone_frozen = False
+            model.train()
+            model.set_backbone_frozen(False, freeze_bn_affine=args.freeze_bn_affine)
+            optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=lr_values[current_phase_index])
+            print(
+                f"Phase {current_phase_index + 1}/{args.phase_count}  "
+                f"base_lr={lr_values[current_phase_index]:.6f}  "
+                f"epochs={phase_config.epochs_in_phase}  "
+                "cosine_restarts_per_phase=yes"
+            )
+
         model.train()
+        model.set_backbone_frozen(backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
         perm = build_balanced_epoch_indices(y_train, rng) if args.balance_sampling else rng.permutation(y_train.size)
         epoch_loss = 0.0
         epoch_correct = 0
@@ -547,10 +516,22 @@ def main() -> None:
                 x_batch = X_train[idx_b]
 
             if args.augment:
-                x_batch = augment_batch(x_batch, rng)
+                x_batch = augment_batch(x_batch, rng).astype(np.float64, copy=False)
             y_batch = one_hot(y_batch_idx, num_classes, label_smoothing=args.label_smoothing)
 
-            optimizer.lr = (args.lr if args.lr_schedule == "constant" else (cosine_lr(args.lr, global_step, total_steps, min_lr_ratio=args.min_lr_ratio) if args.lr_schedule == "cosine" else (args.lr * (args.gamma ** max(0, (epoch // max(1, args.step_size)))))))
+            current_lr = compute_phase_learning_rate(
+                base_lr=lr_values[current_phase_index],
+                schedule=args.lr_schedule,
+                min_lr_ratio=args.min_lr_ratio,
+                gamma=args.gamma,
+                step_size=args.step_size,
+                warmup_epochs=args.warmup_epochs,
+                epoch_index_in_phase=phase_config.epoch_index_in_phase,
+                epochs_in_phase=phase_config.epochs_in_phase,
+                batch_index=b,
+                num_batches=n_batches,
+            )
+            optimizer.lr = current_lr
 
             logits = model.forward(x_batch)
             loss = cross_entropy_loss(logits, y_batch, class_weights=class_weights)
@@ -560,13 +541,11 @@ def main() -> None:
 
             dlogits = cross_entropy_loss_backward(logits, y_batch, class_weights=class_weights)
             model.backward(dlogits)
-            params = model.get_parameters()
+            params = model.get_trainable_parameters()
             if args.grad_clip > 0.0:
                 clip_gradients(params, args.grad_clip)
             optimizer.parameters = params
             optimizer.step()
-
-            global_step += 1
 
         avg_loss = epoch_loss / max(1, n_batches)
         train_acc = epoch_correct / max(1, y_train.size)
@@ -577,6 +556,7 @@ def main() -> None:
                 val_loss, val_acc = evaluate_streaming(model, val_paths, y_val, num_classes=num_classes, batch_size=batch_size, input_size=input_size)
             else:
                 val_loss, val_acc = evaluate_preloaded(model, X_val, y_val, num_classes=num_classes, batch_size=batch_size)
+
             improved = (val_loss < (best_val_loss - args.min_delta)) if args.early_stop_metric == "val_loss" else (val_acc > (best_val_acc + args.min_delta))
             if improved:
                 if args.early_stop_metric == "val_loss":
@@ -588,14 +568,39 @@ def main() -> None:
                 bad_epochs = 0
             else:
                 bad_epochs += 1
+
+            if val_acc > (phase_best_val_acc + args.min_delta):
+                phase_best_val_acc = val_acc
+                phase_plateau_epochs = 0
+            else:
+                phase_plateau_epochs += 1
+                if (not backbone_frozen) and phase_plateau_epochs >= freeze_patience:
+                    backbone_frozen = True
+                    model.train()
+                    model.set_backbone_frozen(True, freeze_bn_affine=args.freeze_bn_affine)
+                    optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_lr)
+                    print(
+                        f"Backbone frozen at epoch {epoch + 1}: val_acc plateaued for {freeze_patience} epochs; "
+                        "training the head until the next phase."
+                    )
+
             star = " *" if improved else ""
             gap = train_acc - val_acc
-            print(f"Epoch {epoch + 1}/{args.epochs}  lr={optimizer.lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  val_loss={val_loss:.4f}  val_acc={val_acc:.3f}  gap={gap:.3f}{star}")
+            mode_text = "head-only" if backbone_frozen else "full"
+            print(
+                f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
+                f"mode={mode_text}  lr={optimizer.lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  "
+                f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}  gap={gap:.3f}{star}"
+            )
             if args.early_stop and bad_epochs >= args.patience:
-                print(f"Early stopping at epoch {epoch + 1}: no val_loss improvement > {args.min_delta} for {args.patience} epochs.")
+                print(f"Early stopping at epoch {epoch + 1}: metric {args.early_stop_metric} did not improve by {args.min_delta} for {args.patience} epochs.")
                 break
         else:
-            print(f"Epoch {epoch + 1}/{args.epochs}  lr={optimizer.lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}")
+            mode_text = "head-only" if backbone_frozen else "full"
+            print(
+                f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
+                f"mode={mode_text}  lr={optimizer.lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}"
+            )
 
     if y_val is None or len(val_paths) == 0:
         model.save_weights(args.checkpoint)
@@ -612,11 +617,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-

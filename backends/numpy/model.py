@@ -59,6 +59,8 @@ class CNN:
         self._num_classes = num_classes
         self._training = True
         self._feature_shape = None
+        self._backbone_frozen = False
+        self._freeze_bn_affine = True
 
     def train(self) -> None:
         self._training = True
@@ -66,36 +68,47 @@ class CNN:
     def eval(self) -> None:
         self._training = False
 
+    def set_backbone_frozen(self, frozen: bool, freeze_bn_affine: bool = True) -> None:
+        """Store backbone-freeze policy so forward/backward honor BN freeze semantics."""
+        self._backbone_frozen = bool(frozen)
+        self._freeze_bn_affine = bool(freeze_bn_affine)
+
+    def _backbone_bn_training(self) -> bool:
+        """Backbone BN layers stop updating running stats while the backbone is frozen."""
+        return bool(self._training and not self._backbone_frozen)
+
     def forward(self, x: np.ndarray) -> np.ndarray:
         """x: (N, H, W, 3). Returns logits (N, num_classes)."""
+        backbone_bn_training = self._backbone_bn_training()
+
         x = self.conv1.forward(x)
-        x = self.bn1.forward(x, training=self._training)
+        x = self.bn1.forward(x, training=backbone_bn_training)
         self._pre_relu1 = x
         x = relu(x)
         x = self.conv2.forward(x)
-        x = self.bn2.forward(x, training=self._training)
+        x = self.bn2.forward(x, training=backbone_bn_training)
         self._pre_relu2 = x
         x = relu(x)
         x = self.se1.forward(x)
         x = self.pool1.forward(x)
 
         x = self.conv3.forward(x)
-        x = self.bn3.forward(x, training=self._training)
+        x = self.bn3.forward(x, training=backbone_bn_training)
         self._pre_relu3 = x
         x = relu(x)
         x = self.conv4.forward(x)
-        x = self.bn4.forward(x, training=self._training)
+        x = self.bn4.forward(x, training=backbone_bn_training)
         self._pre_relu4 = x
         x = relu(x)
         x = self.se2.forward(x)
         x = self.pool2.forward(x)
 
         x = self.conv5.forward(x)
-        x = self.bn5.forward(x, training=self._training)
+        x = self.bn5.forward(x, training=backbone_bn_training)
         self._pre_relu5 = x
         x = relu(x)
         x = self.conv6.forward(x)
-        x = self.bn6.forward(x, training=self._training)
+        x = self.bn6.forward(x, training=backbone_bn_training)
         self._pre_relu6 = x
         x = relu(x)
         x = self.se3.forward(x)
@@ -144,29 +157,60 @@ class CNN:
         dx = self.bn1.backward(dx)
         self.conv1.backward(dx)
 
-    def get_parameters(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+    def get_backbone_parameters(self, include_bn_affine: bool = True) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Return feature-extractor parameters, optionally excluding BN affine terms."""
         params: List[Tuple[np.ndarray, np.ndarray]] = []
-        for layer in [
-            self.conv1,
-            self.bn1,
-            self.conv2,
-            self.bn2,
-            self.se1,
-            self.conv3,
-            self.bn3,
-            self.conv4,
-            self.bn4,
-            self.se2,
-            self.conv5,
-            self.bn5,
-            self.conv6,
-            self.bn6,
-            self.se3,
-            self.fc1,
-            self.fc2,
-        ]:
-            params.extend(layer.get_params())
+        params.extend(self.conv1.get_params())
+        if include_bn_affine:
+            params.extend(self.bn1.get_params())
+        params.extend(self.conv2.get_params())
+        if include_bn_affine:
+            params.extend(self.bn2.get_params())
+        params.extend(self.se1.get_params())
+
+        params.extend(self.conv3.get_params())
+        if include_bn_affine:
+            params.extend(self.bn3.get_params())
+        params.extend(self.conv4.get_params())
+        if include_bn_affine:
+            params.extend(self.bn4.get_params())
+        params.extend(self.se2.get_params())
+
+        params.extend(self.conv5.get_params())
+        if include_bn_affine:
+            params.extend(self.bn5.get_params())
+        params.extend(self.conv6.get_params())
+        if include_bn_affine:
+            params.extend(self.bn6.get_params())
+        params.extend(self.se3.get_params())
         return params
+
+    def get_backbone_bn_affine_parameters(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Return only backbone BN affine parameters for adaptive-freeze mode."""
+        params: List[Tuple[np.ndarray, np.ndarray]] = []
+        for bn_layer in [self.bn1, self.bn2, self.bn3, self.bn4, self.bn5, self.bn6]:
+            params.extend(bn_layer.get_params())
+        return params
+
+    def get_head_parameters(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Return classifier-head parameters that stay trainable during backbone freeze."""
+        params: List[Tuple[np.ndarray, np.ndarray]] = []
+        params.extend(self.fc1.get_params())
+        params.extend(self.fc2.get_params())
+        return params
+
+    def get_trainable_parameters(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Return the active optimizer parameter list for the current freeze state."""
+        if not self._backbone_frozen:
+            return self.get_backbone_parameters(include_bn_affine=True) + self.get_head_parameters()
+        params = self.get_head_parameters()
+        if not self._freeze_bn_affine:
+            params = self.get_backbone_bn_affine_parameters() + params
+        return params
+
+    def get_parameters(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Return every parameter so checkpoints and legacy callers still see the full model."""
+        return self.get_backbone_parameters(include_bn_affine=True) + self.get_head_parameters()
 
     def state_dict(self) -> Dict[str, np.ndarray]:
         return {

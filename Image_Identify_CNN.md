@@ -1,6 +1,6 @@
 # Image_Identify_CNN Training Guide
 
-The project now uses `PyTorch` as the default backend and keeps the original `NumPy` structure intact. The active architecture in both backends is now a three-stage CNN + SE classifier with a flattened dense head.
+The project uses `PyTorch` as the default backend and keeps the original `NumPy` structure intact. The active architecture in both backends is a three-stage CNN + SE classifier with a flattened dense head.
 
 ## Current Runtime
 
@@ -13,11 +13,8 @@ The project now uses `PyTorch` as the default backend and keeps the original `Nu
 
 Both backends now use:
 - Stage 1: `Conv(3->32) -> BN -> ReLU -> Conv(32->32) -> BN -> ReLU -> SE(32) -> MaxPool`
-
 - Stage 2: `Conv(32->64) -> BN -> ReLU -> Conv(64->64) -> BN -> ReLU -> SE(64) -> MaxPool`
-
 - Stage 3: `Conv(64->128) -> BN -> ReLU -> Conv(128->128) -> BN -> ReLU -> SE(128) -> MaxPool`
-
 - Head: `Flatten -> FC(256) -> ReLU -> Dropout(0.5) -> FC(num_classes)`
 
 `Mamba` is no longer used by the active model paths.
@@ -44,7 +41,7 @@ Dataset/
   ship/
 ```
 
-Each class should be a directory. Training now auto-detects the class count from `Dataset/`; use `--class-count` only when you need to override the detected output size.
+Each class should be a directory. Training auto-detects the class count from `Dataset/`; use `--class-count` only when you need to override the detected output size.
 
 ## Global Backend Switch
 
@@ -52,16 +49,72 @@ Each class should be a directory. Training now auto-detects the class count from
 --backend {torch,numpy}
 ```
 
+## New Training Behavior
+
+### Augmentation
+
+When `--augment` is enabled, both backends now apply the same transform order:
+
+```text
+crop -> flip -> rotation -> color jitter -> cutout
+```
+
+Policy details:
+- random resized crop remains the first geometry transform
+- horizontal flip uses `p=0.5`
+- rotation uses reflection padding, centered rotation, bilinear interpolation, `p=0.5`, and `+-10°`
+- color jitter uses `p=0.5` with:
+  - brightness: `+-0.2`
+  - contrast: `+-0.2`
+  - saturation: `+-0.2`
+- cutout remains the final destructive transform
+
+### Multiphase LR
+
+New arguments:
+- `--phase-count`
+- `--lr` with one value per phase
+- `--warmup-epochs`
+
+Phase epochs are assigned with:
+
+```python
+np.array_split(range(epochs), phase_count)
+```
+
+Rules:
+- the number of `--lr` values must equal `--phase-count`
+- the LR list must be monotonically non-increasing
+- cosine scheduling now intentionally restarts per phase
+- warmup ramps from `0.1 * base_lr` to `base_lr` at the start of each phase
+
+### Temporary Backbone Freeze
+
+If `val_acc` does not improve for 5 consecutive epochs inside the current phase:
+- the backbone freezes temporarily
+- only the classifier head keeps training for the rest of that phase
+- the backbone automatically unfreezes at the next phase boundary
+
+By default, BN affine parameters freeze with the backbone.
+
+Optional advanced mode:
+
+```text
+--freeze-bn-affine false
+```
+
+That keeps BN affine parameters trainable while BN running statistics remain frozen.
+
 ## Recommended PyTorch Training Command
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --batch-size 64 --streaming --optimizer adamw --lr 3e-3 --weight-decay 1e-4 --dropout 0.3 --label-smoothing 0.05 --class-weighting --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.05 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 50 --min-delta 0.002 --device cuda --checkpoint checkpoints/best_torch_model.pt
+python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.5 --label-smoothing 0.1 --class-weighting --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 5 --min-delta 0.001 --freeze-bn-affine false --device cuda --checkpoint checkpoints/best_torch_model.pt
 ```
 
 ## NumPy Training Command
 
 ```powershell
-python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --batch-size 64 --streaming --optimizer adamw --lr 3e-3 --weight-decay 1e-4 --dropout 0.3 --label-smoothing 0.05 --class-weighting --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.05 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 50 --min-delta 0.002 --checkpoint checkpoints/best_numpy_model.npz
+python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.5 --label-smoothing 0.1 --class-weighting --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 5 --min-delta 0.001 --freeze-bn-affine false --checkpoint checkpoints/best_numpy_model.npz
 ```
 
 ## Key Training Arguments
@@ -69,7 +122,9 @@ python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --batch-size
 - `--data-dir`
 - `--epochs`
 - `--batch-size`
-- `--lr`
+- `--phase-count`
+- `--lr` (one value per phase)
+- `--warmup-epochs`
 - `--optimizer {adamw,sgd}`
 - `--momentum`
 - `--weight-decay`
@@ -88,6 +143,7 @@ python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --batch-size
 - `--early-stop-metric {val_loss,val_acc}`
 - `--patience`
 - `--min-delta`
+- `--freeze-bn-affine false`
 - `--checkpoint`
 - `--streaming / --no-streaming`
 - `--init-from`
@@ -105,7 +161,3 @@ python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --batch-size
 ```powershell
 python.exe -m pytest tests -v
 ```
-
-
-
-

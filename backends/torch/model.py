@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
+from typing import Iterable, Tuple
 
 import numpy as np
 import torch
@@ -66,13 +66,59 @@ class TorchCNN(nn.Module):
         self.se3 = SqueezeExcitation(128, reduction=4)
         self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        feat_h, feat_w = height // 8, width // 8       
+        feat_h, feat_w = height // 8, width // 8
         self.fc1 = nn.Linear(feat_h * feat_w * 128, 256)
         self.dropout = nn.Dropout(p=dropout_p)
         self.fc2 = nn.Linear(256, num_classes)
 
         self._input_size = tuple(input_size)
         self._num_classes = int(num_classes)
+
+    def backbone_modules(self) -> tuple[nn.Module, ...]:
+        """Return the feature extractor modules affected by temporary freezing."""
+        return (
+            self.conv1,
+            self.bn1,
+            self.conv2,
+            self.bn2,
+            self.se1,
+            self.conv3,
+            self.bn3,
+            self.conv4,
+            self.bn4,
+            self.se2,
+            self.conv5,
+            self.bn5,
+            self.conv6,
+            self.bn6,
+            self.se3,
+        )
+
+    def backbone_batchnorm_layers(self) -> tuple[nn.BatchNorm2d, ...]:
+        """Return backbone BN layers so the trainer can control stats during freeze."""
+        return (self.bn1, self.bn2, self.bn3, self.bn4, self.bn5, self.bn6)
+
+    def head_modules(self) -> tuple[nn.Module, ...]:
+        """Return the classifier head modules that stay trainable during freeze."""
+        return (self.fc1, self.fc2)
+
+    def iter_head_parameters(self) -> Iterable[nn.Parameter]:
+        """Yield classifier head parameters in a stable order."""
+        for module in self.head_modules():
+            yield from module.parameters()
+
+    def iter_backbone_parameters(self) -> Iterable[nn.Parameter]:
+        """Yield all backbone parameters in a stable order."""
+        for module in self.backbone_modules():
+            yield from module.parameters()
+
+    def iter_backbone_bn_affine_parameters(self) -> Iterable[nn.Parameter]:
+        """Yield only BN affine parameters for the optional adaptive-freeze mode."""
+        for bn_layer in self.backbone_batchnorm_layers():
+            if bn_layer.weight is not None:
+                yield bn_layer.weight
+            if bn_layer.bias is not None:
+                yield bn_layer.bias
 
     def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.relu(self.bn1(self.conv1(x)))
@@ -139,4 +185,3 @@ class TorchCNN(nn.Module):
 CNN = TorchCNN
 
 __all__ = ["TorchCNN", "CNN"]
-

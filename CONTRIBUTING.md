@@ -18,6 +18,7 @@ python -m pip install -r requirements.txt
 
 - `backends/torch/` contains the active PyTorch backend.
 - `backends/numpy/` contains the preserved legacy NumPy backend.
+- `utils/training.py` contains shared augmentation and phase-schedule policy.
 - Top-level `train.py`, `predict.py`, `gui.py`, and `model.py` are compatibility and dispatch entrypoints.
 
 ## Contribution Rules
@@ -33,10 +34,9 @@ python -m pip install -r requirements.txt
 
 - PyTorch is the default backend for new training and inference work.
 - NumPy remains available for regression checks, legacy checkpoints, and architecture comparison.
-- When adding features, decide explicitly whether they belong in:
-  - both backends,
-  - PyTorch only,
-  - or compatibility wrappers.
+- Shared training policy should stay aligned across both backends unless a backend-specific deviation is explicitly required.
+- Temporary backbone freeze must unfreeze automatically at the next phase boundary.
+- Cosine scheduling restarts per phase by design and should stay documented when changed.
 
 ## Dependencies
 
@@ -66,6 +66,7 @@ Examples:
 If you change behavior, update the relevant documents:
 - `README.md`
 - `Image_Identify_CNN.md`
+- `docs/plans/YYYY-MM-DD-*.md` when a design is approved
 - `Agent_History/Daily/YYYY/MM/DD_history.md`
 
 Keep instruction documents unchanged unless the project owner explicitly changes project policy.
