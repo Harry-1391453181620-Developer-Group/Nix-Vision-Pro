@@ -117,7 +117,7 @@ The post-unfreeze LR rule now works on the current effective LR, not the phase b
 ## Recommended PyTorch Training Command
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0001 --warmup-epochs 3 --batch-size 64 --streaming --optimizer adamw --weight-decay 2e-4 --dropout 0.3 --label-smoothing 0.05 --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.05 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.0001 --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt
+python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0001 --warmup-epochs 3 --batch-size 64 --streaming --optimizer adamw --weight-decay 2e-4 --dropout 0.35 --label-smoothing 0.05 --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.05 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 8 --after-unfreeze-lr-change 0.00005 --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt
 ```
 
 ## NumPy Training Command
