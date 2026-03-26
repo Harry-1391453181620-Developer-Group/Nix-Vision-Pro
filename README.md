@@ -47,7 +47,7 @@ The current dependency set covers the whole project:
 - Optional warmup uses `--warmup-epochs` and ramps from `0.1 * base_lr` to `base_lr` at each phase start.
 - If `val_acc` stalls for 8 epochs inside a phase, the backbone freezes temporarily for 10 epochs, then unfreezes inside the same phase.
 - `--freeze-bn-affine false` keeps BN affine parameters trainable while BN running stats stay frozen.
-- `--after-unfreeze-lr-change` applies an additive LR drop after unfreeze only when the resulting LR stays positive and does not go below the next phase start LR.
+- `--after-unfreeze-lr-change` now builds a cumulative within-phase LR offset from the current effective LR, clamped to the scheduler floor and capped so it never undercuts the next phase start LR.
 
 ## Training
 

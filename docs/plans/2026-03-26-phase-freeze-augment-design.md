@@ -83,17 +83,23 @@ the current phase:
 
 After unfreeze:
 
-- compute `candidate_lr = current_phase_base_lr - after_unfreeze_lr_change`
-- if a next phase exists, apply the deduction only when:
-  - `candidate_lr >= next_phase_start_lr`
+- keep the phase base LR fixed as the scheduler anchor
+- track a cumulative `phase_lr_offset` inside the phase
+- compute `effective_lr = max(scheduled_lr - phase_lr_offset, min_lr)` where
+  `min_lr = phase_base_lr * min_lr_ratio`
+- compute the unfreeze candidate from the current effective LR, not the phase
+  base LR
+- apply a new deduction only when:
   - `candidate_lr > 0`
-- otherwise keep the current phase base LR unchanged
-- in the final phase, apply the deduction only when `candidate_lr > 0`
+  - if a next phase exists: `candidate_lr >= next_phase_lr - 1e-12`
+  - `current_effective_lr > 2 * min_lr`
+- cap the cumulative offset so the effective LR can never undercut the next
+  phase start LR, or the scheduler floor in the final phase
 
 At the next phase boundary:
 
-- reset the current phase base LR to the explicit value from `--lr`
-- clear any temporary post-unfreeze deduction from the previous phase
+- reset `phase_lr_offset = 0`
+- keep using the explicit value from `--lr` as the new phase scheduler anchor
 
 Backbone means convolution, SE, and BatchNorm feature layers.
 Head means `fc1`, dropout, and `fc2`.
@@ -124,7 +130,9 @@ Add focused tests for:
 - BN running-stat stability during freeze
 - freeze -> unfreeze -> freeze transition correctness
 - phase assignment, LR validation, and per-phase warmup/cosine behavior
-- post-unfreeze LR deduction guards against crossing the next phase start LR
+- effective LR clamp to the scheduler floor
+- post-unfreeze cumulative offset with next-phase and final-phase caps
+- epsilon-safe next-phase LR comparison
 
 ## Documentation
 

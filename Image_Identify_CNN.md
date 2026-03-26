@@ -94,7 +94,7 @@ If `val_acc` does not improve for `--freeze-patience` consecutive epochs inside 
 - the backbone freezes temporarily
 - the classifier head trains alone for exactly `--freeze-epoch-num` epochs
 - the backbone then unfreezes automatically inside the same phase
-- after unfreeze, the phase base LR may decrease by `--after-unfreeze-lr-change` when that deduction stays above the next phase start LR
+- after unfreeze, the effective LR may gain an extra cumulative downward offset from `--after-unfreeze-lr-change`, while staying above the scheduler floor and the next phase start LR
 - entering the next phase always resets LR to the explicit value from `--lr`
 
 By default, BN affine parameters freeze with the backbone.
@@ -112,10 +112,12 @@ Optional advanced mode:
 
 That keeps BN affine parameters trainable while BN running statistics remain frozen.
 
+The post-unfreeze LR rule now works on the current effective LR, not the phase base LR, so cosine decay is preserved and the deduction remains cumulative inside the phase.
+
 ## Recommended PyTorch Training Command
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0001 --warmup-epochs 3 --batch-size 64 --streaming --optimizer adamw --weight-decay 2e-4 --dropout 0.3 --label-smoothing 0.05 --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.05 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt
+python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0001 --warmup-epochs 3 --batch-size 64 --streaming --optimizer adamw --weight-decay 2e-4 --dropout 0.3 --label-smoothing 0.05 --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.05 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.0001 --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt
 ```
 
 ## NumPy Training Command

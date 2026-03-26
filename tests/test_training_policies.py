@@ -7,9 +7,10 @@ import pytest
 
 from backends.numpy.model import CNN
 from utils.training import (
-    adjust_phase_base_lr_after_unfreeze,
+    adjust_phase_lr_offset_after_unfreeze,
     augment_batch,
     build_epoch_phase_map,
+    compute_effective_learning_rate,
     compute_phase_learning_rate,
     validate_freeze_cycle_args,
     validate_phase_learning_rates,
@@ -93,7 +94,17 @@ def test_phase_schedule_validation_and_warmup_restart_shape():
     assert phase_restart_lr == pytest.approx(0.0005, rel=1e-6)
 
 
-def test_freeze_cycle_validation_and_post_unfreeze_lr_rules():
+def test_effective_lr_clamps_to_phase_floor():
+    effective_lr = compute_effective_learning_rate(
+        scheduled_lr=0.00005,
+        phase_lr_offset=0.0002,
+        phase_base_lr=0.002,
+        min_lr_ratio=0.1,
+    )
+    assert effective_lr == pytest.approx(0.0002)
+
+
+def test_freeze_cycle_validation_and_post_unfreeze_offset_rules():
     freeze_patience, freeze_epoch_num, after_unfreeze_lr_change = validate_freeze_cycle_args(8, 10, 1e-4)
     assert freeze_patience == 8
     assert freeze_epoch_num == 10
@@ -106,21 +117,65 @@ def test_freeze_cycle_validation_and_post_unfreeze_lr_rules():
     with pytest.raises(ValueError):
         validate_freeze_cycle_args(8, 10, -1e-4)
 
-    reduced_lr, reduced = adjust_phase_base_lr_after_unfreeze(0.002, 0.0001, 0.0005)
-    assert reduced
-    assert reduced_lr == pytest.approx(0.0019)
+    new_offset, applied = adjust_phase_lr_offset_after_unfreeze(
+        current_effective_lr=0.0018,
+        phase_lr_offset=0.0,
+        after_unfreeze_lr_change=0.0001,
+        phase_base_lr=0.002,
+        min_lr_ratio=0.1,
+        next_phase_start_lr=0.0005,
+    )
+    assert applied
+    assert new_offset == pytest.approx(0.0001)
 
-    kept_lr, reduced = adjust_phase_base_lr_after_unfreeze(0.00055, 0.0001, 0.0005)
-    assert not reduced
-    assert kept_lr == pytest.approx(0.00055)
+    # EPS guard: this should still pass even though the candidate is smaller than
+    # the next phase LR by a tiny floating-point residue.
+    new_offset, applied = adjust_phase_lr_offset_after_unfreeze(
+        current_effective_lr=0.0006,
+        phase_lr_offset=0.0,
+        after_unfreeze_lr_change=0.0001000000000005,
+        phase_base_lr=0.002,
+        min_lr_ratio=0.1,
+        next_phase_start_lr=0.0005,
+    )
+    assert applied
+    assert new_offset == pytest.approx(0.0001000000000005)
 
-    final_phase_lr, reduced = adjust_phase_base_lr_after_unfreeze(0.0003, 0.0001, None)
-    assert reduced
-    assert final_phase_lr == pytest.approx(0.0002)
+    # Do not deduct when the effective LR is already too close to the floor.
+    same_offset, applied = adjust_phase_lr_offset_after_unfreeze(
+        current_effective_lr=0.00039,
+        phase_lr_offset=0.0001,
+        after_unfreeze_lr_change=0.0001,
+        phase_base_lr=0.002,
+        min_lr_ratio=0.1,
+        next_phase_start_lr=0.0005,
+    )
+    assert not applied
+    assert same_offset == pytest.approx(0.0001)
 
-    unchanged_lr, reduced = adjust_phase_base_lr_after_unfreeze(0.00005, 0.0001, None)
-    assert not reduced
-    assert unchanged_lr == pytest.approx(0.00005)
+    # Cap cumulative offset so it never undercuts the next phase LR.
+    capped_offset, applied = adjust_phase_lr_offset_after_unfreeze(
+        current_effective_lr=0.0017,
+        phase_lr_offset=0.00145,
+        after_unfreeze_lr_change=0.0002,
+        phase_base_lr=0.002,
+        min_lr_ratio=0.1,
+        next_phase_start_lr=0.0005,
+    )
+    assert applied
+    assert capped_offset == pytest.approx(0.0015)
+
+    # Final phase cap falls back to the scheduler floor.
+    final_offset, applied = adjust_phase_lr_offset_after_unfreeze(
+        current_effective_lr=0.0012,
+        phase_lr_offset=0.0016,
+        after_unfreeze_lr_change=0.0004,
+        phase_base_lr=0.002,
+        min_lr_ratio=0.1,
+        next_phase_start_lr=None,
+    )
+    assert applied
+    assert final_offset == pytest.approx(0.0018)
 
 
 def test_numpy_freeze_keeps_bn_running_stats_fixed():

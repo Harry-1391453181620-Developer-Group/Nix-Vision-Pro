@@ -50,3 +50,11 @@ Added controlled augmentation, temporary backbone freeze, and multiphase LR trai
 - Increased training rotation range from `+-10°` to `+-12°` in the shared augmentation policy.
 - Updated `Image_Identify_CNN.md`, `README.md`, `CONTRIBUTING.md`, and the design note to document the new behavior.
 - Preserved the existing numeric values already present in the example training commands inside `Image_Identify_CNN.md` and only appended the new flags there.
+
+## Second follow-up update
+
+- Replaced the old post-unfreeze phase-base-LR rewrite with a cumulative effective-LR offset policy.
+- Effective LR is now computed as `max(scheduled_lr - phase_lr_offset, min_lr)` so the optimizer never drops below the scheduler floor.
+- Post-unfreeze deductions now use the current effective LR, not the phase base LR, and only apply when the LR is still meaningfully above the floor.
+- Added a small epsilon guard for next-phase LR comparisons and capped the cumulative offset so it never undercuts the next phase start LR.
+- Updated focused tests and documentation to match the refined cumulative deduction policy.

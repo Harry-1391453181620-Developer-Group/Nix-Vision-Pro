@@ -20,9 +20,10 @@ from data.loaders import load_image
 from data.preprocessing import preprocess_image
 from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
-    adjust_phase_base_lr_after_unfreeze,
+    adjust_phase_lr_offset_after_unfreeze,
     augment_batch,
     build_epoch_phase_map,
+    compute_effective_learning_rate,
     compute_phase_learning_rate,
     parse_bool_flag,
     validate_freeze_cycle_args,
@@ -444,6 +445,7 @@ def main() -> None:
     phase_map = build_epoch_phase_map(args.epochs, args.phase_count)
     current_phase_index = -1
     current_phase_base_lr = lr_values[0]
+    phase_lr_offset = 0.0
     phase_best_val_acc = -float("inf")
     phase_plateau_epochs = 0
     freeze_epochs_remaining = 0
@@ -463,6 +465,7 @@ def main() -> None:
         if phase_config.phase_index != current_phase_index:
             current_phase_index = phase_config.phase_index
             current_phase_base_lr = lr_values[current_phase_index]
+            phase_lr_offset = 0.0
             phase_best_val_acc = -float("inf")
             phase_plateau_epochs = 0
             freeze_epochs_remaining = 0
@@ -497,7 +500,7 @@ def main() -> None:
             if args.augment:
                 x_batch = augment_batch(x_batch, rng)
 
-            current_lr = compute_phase_learning_rate(
+            scheduled_lr = compute_phase_learning_rate(
                 base_lr=current_phase_base_lr,
                 schedule=args.lr_schedule,
                 min_lr_ratio=args.min_lr_ratio,
@@ -508,6 +511,12 @@ def main() -> None:
                 epochs_in_phase=phase_config.epochs_in_phase,
                 batch_index=batch_index,
                 num_batches=num_batches,
+            )
+            current_lr = compute_effective_learning_rate(
+                scheduled_lr,
+                phase_lr_offset,
+                current_phase_base_lr,
+                args.min_lr_ratio,
             )
             _set_optimizer_lr(optimizer, current_lr)
 
@@ -554,19 +563,22 @@ def main() -> None:
                 freeze_epochs_remaining -= 1
                 if freeze_epochs_remaining <= 0:
                     next_phase_start_lr = lr_values[current_phase_index + 1] if current_phase_index + 1 < len(lr_values) else None
-                    current_phase_base_lr, deduction_applied = adjust_phase_base_lr_after_unfreeze(
-                        current_phase_base_lr,
-                        after_unfreeze_lr_change,
-                        next_phase_start_lr,
+                    phase_lr_offset, deduction_applied = adjust_phase_lr_offset_after_unfreeze(
+                        current_effective_lr=current_lr,
+                        phase_lr_offset=phase_lr_offset,
+                        after_unfreeze_lr_change=after_unfreeze_lr_change,
+                        phase_base_lr=current_phase_base_lr,
+                        min_lr_ratio=args.min_lr_ratio,
+                        next_phase_start_lr=next_phase_start_lr,
                     )
                     backbone_frozen = False
                     phase_plateau_epochs = 0
                     model.train()
                     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
-                    optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
+                    optimizer = _build_optimizer(args, model, lr_value=current_lr)
                     lr_message = "reduced" if deduction_applied else "kept"
                     print(
-                        f"Backbone unfrozen at epoch {epoch + 1}: phase base lr {lr_message} at {current_phase_base_lr:.6f}."
+                        f"Backbone unfrozen at epoch {epoch + 1}: cumulative lr offset {lr_message} at {phase_lr_offset:.6f}."
                     )
             else:
                 if val_acc > (phase_best_val_acc + args.min_delta):
@@ -580,7 +592,7 @@ def main() -> None:
                         phase_plateau_epochs = 0
                         model.train()
                         _apply_backbone_freeze_state(model, backbone_frozen=True, freeze_bn_affine=args.freeze_bn_affine)
-                        optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
+                        optimizer = _build_optimizer(args, model, lr_value=current_lr)
                         print(
                             f"Backbone frozen at epoch {epoch + 1}: val_acc plateaued for {freeze_patience} epochs; "
                             f"training the head for {freeze_epoch_num} epochs."
@@ -599,24 +611,22 @@ def main() -> None:
                 break
         else:
             if epoch_backbone_frozen:
-                # Even during frozen epochs, keep tracking the best validation
-                # accuracy reached in this phase so later plateau checks compare
-                # against the strongest result already achieved.
-                if val_acc > (phase_best_val_acc + args.min_delta):
-                    phase_best_val_acc = val_acc
                 freeze_epochs_remaining -= 1
                 if freeze_epochs_remaining <= 0:
                     next_phase_start_lr = lr_values[current_phase_index + 1] if current_phase_index + 1 < len(lr_values) else None
-                    current_phase_base_lr, _ = adjust_phase_base_lr_after_unfreeze(
-                        current_phase_base_lr,
-                        after_unfreeze_lr_change,
-                        next_phase_start_lr,
+                    phase_lr_offset, _ = adjust_phase_lr_offset_after_unfreeze(
+                        current_effective_lr=current_lr,
+                        phase_lr_offset=phase_lr_offset,
+                        after_unfreeze_lr_change=after_unfreeze_lr_change,
+                        phase_base_lr=current_phase_base_lr,
+                        min_lr_ratio=args.min_lr_ratio,
+                        next_phase_start_lr=next_phase_start_lr,
                     )
                     backbone_frozen = False
                     phase_plateau_epochs = 0
                     model.train()
                     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
-                    optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
+                    optimizer = _build_optimizer(args, model, lr_value=current_lr)
             mode_text = "head-only" if epoch_backbone_frozen else "full"
             print(
                 f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "

@@ -16,6 +16,9 @@ from PIL import Image
 from data.preprocessing import resize
 
 
+EPS = 1e-12
+
+
 def parse_bool_flag(value: bool | str) -> bool:
     """Parse flexible boolean CLI values such as `true`, `false`, `1`, or `0`."""
     if isinstance(value, bool):
@@ -60,8 +63,8 @@ def validate_freeze_cycle_args(
     """Validate the timed-freeze configuration before training starts.
 
     The LR decrement is additive, so only non-negative values are allowed. The
-    actual deduction is guarded separately to ensure the resulting phase base LR
-    never crosses the next phase start LR and never becomes non-positive.
+    actual deduction is guarded separately to ensure the resulting effective LR
+    stays above the scheduler floor and the next phase LR when that bound exists.
     """
     freeze_patience = int(freeze_patience)
     freeze_epoch_num = int(freeze_epoch_num)
@@ -75,30 +78,72 @@ def validate_freeze_cycle_args(
     return freeze_patience, freeze_epoch_num, after_unfreeze_lr_change
 
 
-def adjust_phase_base_lr_after_unfreeze(
-    current_phase_base_lr: float,
+def compute_effective_learning_rate(
+    scheduled_lr: float,
+    phase_lr_offset: float,
+    phase_base_lr: float,
+    min_lr_ratio: float,
+) -> float:
+    """Convert the scheduler LR into the effective optimizer LR.
+
+    Cosine or step scheduling still operates on the configured phase base LR.
+    Temporary post-unfreeze deductions are represented as a cumulative offset and
+    are applied after scheduling, with a floor at `phase_base_lr * min_lr_ratio`.
+    """
+    scheduled_lr = float(scheduled_lr)
+    phase_lr_offset = float(phase_lr_offset)
+    phase_base_lr = float(phase_base_lr)
+    min_lr = phase_base_lr * float(min_lr_ratio)
+    return float(max(scheduled_lr - phase_lr_offset, min_lr))
+
+
+def adjust_phase_lr_offset_after_unfreeze(
+    *,
+    current_effective_lr: float,
+    phase_lr_offset: float,
     after_unfreeze_lr_change: float,
+    phase_base_lr: float,
+    min_lr_ratio: float,
     next_phase_start_lr: float | None,
+    eps: float = EPS,
 ) -> tuple[float, bool]:
-    """Apply the additive post-unfreeze LR deduction when it is allowed.
+    """Apply the additive post-unfreeze LR deduction when it is still useful.
 
     Rules:
-    - if the candidate LR is not strictly positive, keep the current phase LR
-    - if a next phase exists and the candidate LR would go below that phase's
-      configured start LR, keep the current phase LR
-    - otherwise apply the deduction
+    - only deduct when the current effective LR is still meaningfully above the
+      scheduler floor (`> 2 * min_lr`)
+    - the candidate LR after deduction must stay strictly positive
+    - if a next phase exists, the candidate LR must stay at or above the next
+      phase start LR, with a small epsilon for float robustness
+    - the cumulative offset is capped so the effective LR can never undercut the
+      next phase start LR, or the scheduler floor in the final phase
     """
-    current_phase_base_lr = float(current_phase_base_lr)
+    current_effective_lr = float(current_effective_lr)
+    phase_lr_offset = float(phase_lr_offset)
     after_unfreeze_lr_change = float(after_unfreeze_lr_change)
-    if after_unfreeze_lr_change <= 0.0:
-        return current_phase_base_lr, False
+    phase_base_lr = float(phase_base_lr)
+    min_lr = phase_base_lr * float(min_lr_ratio)
 
-    candidate_lr = current_phase_base_lr - after_unfreeze_lr_change
-    if candidate_lr <= 0.0:
-        return current_phase_base_lr, False
-    if next_phase_start_lr is not None and candidate_lr < float(next_phase_start_lr):
-        return current_phase_base_lr, False
-    return float(candidate_lr), True
+    if after_unfreeze_lr_change <= 0.0:
+        return phase_lr_offset, False
+    if current_effective_lr <= (2.0 * min_lr + eps):
+        return phase_lr_offset, False
+
+    candidate_lr = current_effective_lr - after_unfreeze_lr_change
+    if candidate_lr <= eps:
+        return phase_lr_offset, False
+    if next_phase_start_lr is not None and candidate_lr < (float(next_phase_start_lr) - eps):
+        return phase_lr_offset, False
+
+    if next_phase_start_lr is not None:
+        max_offset = max(0.0, phase_base_lr - float(next_phase_start_lr))
+    else:
+        max_offset = max(0.0, phase_base_lr - min_lr)
+
+    new_offset = min(phase_lr_offset + after_unfreeze_lr_change, max_offset)
+    if new_offset <= (phase_lr_offset + eps):
+        return phase_lr_offset, False
+    return float(new_offset), True
 
 
 def build_epoch_phase_map(epochs: int, phase_count: int) -> list[PhaseConfig]:
