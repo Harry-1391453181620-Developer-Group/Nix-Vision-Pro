@@ -21,10 +21,12 @@ import numpy as np
 import config
 from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
+    adjust_phase_base_lr_after_unfreeze,
     augment_batch,
     build_epoch_phase_map,
     compute_phase_learning_rate,
     parse_bool_flag,
+    validate_freeze_cycle_args,
     validate_phase_learning_rates,
 )
 from data.loaders import load_image
@@ -310,6 +312,9 @@ def main() -> None:
     parser.add_argument("--lr", type=float, nargs="+", default=[1e-3], help="One learning rate per phase")
     parser.add_argument("--phase-count", type=int, default=1, help="Number of contiguous training phases")
     parser.add_argument("--warmup-epochs", type=int, default=0, help="Warmup epochs at the start of each phase")
+    parser.add_argument("--freeze-patience", type=int, default=8, help="Epochs without val_acc improvement before freezing the backbone")
+    parser.add_argument("--freeze-epoch-num", type=int, default=10, help="How many epochs each temporary freeze window lasts")
+    parser.add_argument("--after-unfreeze-lr-change", type=float, default=1e-4, help="Additive LR decrement applied after unfreeze when allowed")
     parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw", help="Optimizer type")
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum (for SGD)")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay")
@@ -370,6 +375,11 @@ def main() -> None:
         raise SystemExit("--phase-count cannot be greater than --epochs")
     try:
         lr_values = validate_phase_learning_rates(args.lr, args.phase_count)
+        freeze_patience, freeze_epoch_num, after_unfreeze_lr_change = validate_freeze_cycle_args(
+            args.freeze_patience,
+            args.freeze_epoch_num,
+            args.after_unfreeze_lr_change,
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -465,37 +475,41 @@ def main() -> None:
     n_batches = (y_train.size + batch_size - 1) // batch_size
     phase_map = build_epoch_phase_map(args.epochs, args.phase_count)
     current_phase_index = -1
+    current_phase_base_lr = lr_values[0]
     phase_best_val_acc = -float("inf")
     phase_plateau_epochs = 0
-    freeze_patience = 5
+    freeze_epochs_remaining = 0
     backbone_frozen = False
 
     best_val_loss = float("inf")
     best_val_acc = 0.0
     best_saved = False
     bad_epochs = 0
-    current_lr = lr_values[0]
-    optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_lr)
+    current_lr = current_phase_base_lr
+    optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_phase_base_lr)
 
     for epoch in range(args.epochs):
         phase_config = phase_map[epoch]
         if phase_config.phase_index != current_phase_index:
             current_phase_index = phase_config.phase_index
+            current_phase_base_lr = lr_values[current_phase_index]
             phase_best_val_acc = -float("inf")
             phase_plateau_epochs = 0
+            freeze_epochs_remaining = 0
             backbone_frozen = False
             model.train()
             model.set_backbone_frozen(False, freeze_bn_affine=args.freeze_bn_affine)
-            optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=lr_values[current_phase_index])
+            optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_phase_base_lr)
             print(
                 f"Phase {current_phase_index + 1}/{args.phase_count}  "
-                f"base_lr={lr_values[current_phase_index]:.6f}  "
+                f"base_lr={current_phase_base_lr:.6f}  "
                 f"epochs={phase_config.epochs_in_phase}  "
                 "cosine_restarts_per_phase=yes"
             )
 
         model.train()
-        model.set_backbone_frozen(backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
+        epoch_backbone_frozen = backbone_frozen
+        model.set_backbone_frozen(epoch_backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
         perm = build_balanced_epoch_indices(y_train, rng) if args.balance_sampling else rng.permutation(y_train.size)
         epoch_loss = 0.0
         epoch_correct = 0
@@ -520,7 +534,7 @@ def main() -> None:
             y_batch = one_hot(y_batch_idx, num_classes, label_smoothing=args.label_smoothing)
 
             current_lr = compute_phase_learning_rate(
-                base_lr=lr_values[current_phase_index],
+                base_lr=current_phase_base_lr,
                 schedule=args.lr_schedule,
                 min_lr_ratio=args.min_lr_ratio,
                 gamma=args.gamma,
@@ -569,37 +583,82 @@ def main() -> None:
             else:
                 bad_epochs += 1
 
-            if val_acc > (phase_best_val_acc + args.min_delta):
-                phase_best_val_acc = val_acc
-                phase_plateau_epochs = 0
-            else:
-                phase_plateau_epochs += 1
-                if (not backbone_frozen) and phase_plateau_epochs >= freeze_patience:
-                    backbone_frozen = True
-                    model.train()
-                    model.set_backbone_frozen(True, freeze_bn_affine=args.freeze_bn_affine)
-                    optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_lr)
-                    print(
-                        f"Backbone frozen at epoch {epoch + 1}: val_acc plateaued for {freeze_patience} epochs; "
-                        "training the head until the next phase."
+            if epoch_backbone_frozen:
+                # Even during frozen epochs, keep tracking the best validation
+                # accuracy reached in this phase so later plateau checks compare
+                # against the strongest result already achieved.
+                if val_acc > (phase_best_val_acc + args.min_delta):
+                    phase_best_val_acc = val_acc
+                freeze_epochs_remaining -= 1
+                if freeze_epochs_remaining <= 0:
+                    next_phase_start_lr = lr_values[current_phase_index + 1] if current_phase_index + 1 < len(lr_values) else None
+                    current_phase_base_lr, deduction_applied = adjust_phase_base_lr_after_unfreeze(
+                        current_phase_base_lr,
+                        after_unfreeze_lr_change,
+                        next_phase_start_lr,
                     )
+                    backbone_frozen = False
+                    phase_plateau_epochs = 0
+                    model.train()
+                    model.set_backbone_frozen(False, freeze_bn_affine=args.freeze_bn_affine)
+                    optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_phase_base_lr)
+                    lr_message = "reduced" if deduction_applied else "kept"
+                    print(
+                        f"Backbone unfrozen at epoch {epoch + 1}: phase base lr {lr_message} at {current_phase_base_lr:.6f}."
+                    )
+            else:
+                if val_acc > (phase_best_val_acc + args.min_delta):
+                    phase_best_val_acc = val_acc
+                    phase_plateau_epochs = 0
+                else:
+                    phase_plateau_epochs += 1
+                    if phase_plateau_epochs >= freeze_patience:
+                        backbone_frozen = True
+                        freeze_epochs_remaining = freeze_epoch_num
+                        phase_plateau_epochs = 0
+                        model.train()
+                        model.set_backbone_frozen(True, freeze_bn_affine=args.freeze_bn_affine)
+                        optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_phase_base_lr)
+                        print(
+                            f"Backbone frozen at epoch {epoch + 1}: val_acc plateaued for {freeze_patience} epochs; "
+                            f"training the head for {freeze_epoch_num} epochs."
+                        )
 
             star = " *" if improved else ""
             gap = train_acc - val_acc
-            mode_text = "head-only" if backbone_frozen else "full"
+            mode_text = "head-only" if epoch_backbone_frozen else "full"
             print(
                 f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
-                f"mode={mode_text}  lr={optimizer.lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  "
+                f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  "
                 f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}  gap={gap:.3f}{star}"
             )
             if args.early_stop and bad_epochs >= args.patience:
                 print(f"Early stopping at epoch {epoch + 1}: metric {args.early_stop_metric} did not improve by {args.min_delta} for {args.patience} epochs.")
                 break
         else:
-            mode_text = "head-only" if backbone_frozen else "full"
+            if epoch_backbone_frozen:
+                # Even during frozen epochs, keep tracking the best validation
+                # accuracy reached in this phase so later plateau checks compare
+                # against the strongest result already achieved.
+                if val_acc > (phase_best_val_acc + args.min_delta):
+                    phase_best_val_acc = val_acc
+                freeze_epochs_remaining -= 1
+                if freeze_epochs_remaining <= 0:
+                    next_phase_start_lr = lr_values[current_phase_index + 1] if current_phase_index + 1 < len(lr_values) else None
+                    current_phase_base_lr, _ = adjust_phase_base_lr_after_unfreeze(
+                        current_phase_base_lr,
+                        after_unfreeze_lr_change,
+                        next_phase_start_lr,
+                    )
+                    backbone_frozen = False
+                    phase_plateau_epochs = 0
+                    model.train()
+                    model.set_backbone_frozen(False, freeze_bn_affine=args.freeze_bn_affine)
+                    optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_phase_base_lr)
+            mode_text = "head-only" if epoch_backbone_frozen else "full"
             print(
                 f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
-                f"mode={mode_text}  lr={optimizer.lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}"
+                f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}"
             )
 
     if y_val is None or len(val_paths) == 0:

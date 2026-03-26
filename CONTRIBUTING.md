@@ -35,7 +35,7 @@ python -m pip install -r requirements.txt
 - PyTorch is the default backend for new training and inference work.
 - NumPy remains available for regression checks, legacy checkpoints, and architecture comparison.
 - Shared training policy should stay aligned across both backends unless a backend-specific deviation is explicitly required.
-- Temporary backbone freeze must unfreeze automatically at the next phase boundary.
+- Temporary backbone freeze now uses a timed freeze window and may reduce the current phase base LR after unfreeze, but it must never undercut the next phase start LR.
 - Cosine scheduling restarts per phase by design and should stay documented when changed.
 
 ## Dependencies

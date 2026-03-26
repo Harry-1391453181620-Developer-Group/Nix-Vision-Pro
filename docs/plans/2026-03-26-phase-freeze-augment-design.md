@@ -25,7 +25,7 @@ The transform order is fixed to:
 
 Rotation uses reflection padding before rotation, centered rotation, and
 bilinear interpolation. Rotation probability is `0.5` and the angle range is
-`[-10°, +10°]`.
+`[-12°, +12°]`.
 
 Color jitter probability is `0.5` with safe ranges:
 
@@ -68,15 +68,32 @@ start of each phase.
 
 ## Temporary Backbone Freeze
 
-If `val_acc` fails to improve for 5 consecutive epochs inside the current phase:
+Add:
+
+- `--freeze-patience` with default `8`
+- `--freeze-epoch-num` with default `10`
+- `--after-unfreeze-lr-change` as an additive LR decrement
+
+If `val_acc` fails to improve for `freeze-patience` consecutive epochs inside
+the current phase:
 
 - freeze the backbone temporarily
-- keep training the head until the next phase boundary
+- keep training the head for exactly `freeze-epoch-num` epochs
+- unfreeze automatically after that timed window
+
+After unfreeze:
+
+- compute `candidate_lr = current_phase_base_lr - after_unfreeze_lr_change`
+- if a next phase exists, apply the deduction only when:
+  - `candidate_lr >= next_phase_start_lr`
+  - `candidate_lr > 0`
+- otherwise keep the current phase base LR unchanged
+- in the final phase, apply the deduction only when `candidate_lr > 0`
 
 At the next phase boundary:
 
-- unfreeze the backbone
-- reset the plateau state for the new phase
+- reset the current phase base LR to the explicit value from `--lr`
+- clear any temporary post-unfreeze deduction from the previous phase
 
 Backbone means convolution, SE, and BatchNorm feature layers.
 Head means `fc1`, dropout, and `fc2`.
@@ -107,6 +124,7 @@ Add focused tests for:
 - BN running-stat stability during freeze
 - freeze -> unfreeze -> freeze transition correctness
 - phase assignment, LR validation, and per-phase warmup/cosine behavior
+- post-unfreeze LR deduction guards against crossing the next phase start LR
 
 ## Documentation
 

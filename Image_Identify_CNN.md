@@ -62,7 +62,7 @@ crop -> flip -> rotation -> color jitter -> cutout
 Policy details:
 - random resized crop remains the first geometry transform
 - horizontal flip uses `p=0.5`
-- rotation uses reflection padding, centered rotation, bilinear interpolation, `p=0.5`, and `+-10°`
+- rotation uses reflection padding, centered rotation, bilinear interpolation, `p=0.5`, and `+-12°`
 - color jitter uses `p=0.5` with:
   - brightness: `+-0.2`
   - contrast: `+-0.2`
@@ -90,12 +90,19 @@ Rules:
 
 ### Temporary Backbone Freeze
 
-If `val_acc` does not improve for 5 consecutive epochs inside the current phase:
+If `val_acc` does not improve for `--freeze-patience` consecutive epochs inside the current phase:
 - the backbone freezes temporarily
-- only the classifier head keeps training for the rest of that phase
-- the backbone automatically unfreezes at the next phase boundary
+- the classifier head trains alone for exactly `--freeze-epoch-num` epochs
+- the backbone then unfreezes automatically inside the same phase
+- after unfreeze, the phase base LR may decrease by `--after-unfreeze-lr-change` when that deduction stays above the next phase start LR
+- entering the next phase always resets LR to the explicit value from `--lr`
 
 By default, BN affine parameters freeze with the backbone.
+
+Default timed-freeze settings:
+- `--freeze-patience 8`
+- `--freeze-epoch-num 10`
+- `--after-unfreeze-lr-change 0.0001`
 
 Optional advanced mode:
 
@@ -108,13 +115,13 @@ That keeps BN affine parameters trainable while BN running statistics remain fro
 ## Recommended PyTorch Training Command
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.5 --label-smoothing 0.1 --class-weighting --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 5 --min-delta 0.001 --freeze-bn-affine false --device cuda --checkpoint checkpoints/best_torch_model.pt
+python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0001 --warmup-epochs 3 --batch-size 64 --streaming --optimizer adamw --weight-decay 2e-4 --dropout 0.3 --label-smoothing 0.05 --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.05 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt
 ```
 
 ## NumPy Training Command
 
 ```powershell
-python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.5 --label-smoothing 0.1 --class-weighting --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 5 --min-delta 0.001 --freeze-bn-affine false --checkpoint checkpoints/best_numpy_model.npz
+python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.3 --label-smoothing 0.1 --class-weighting --balance-sampling --augment --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --checkpoint checkpoints/best_numpy_model.npz
 ```
 
 ## Key Training Arguments
@@ -144,6 +151,9 @@ python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-coun
 - `--patience`
 - `--min-delta`
 - `--freeze-bn-affine false`
+- `--freeze-patience`
+- `--freeze-epoch-num`
+- `--after-unfreeze-lr-change`
 - `--checkpoint`
 - `--streaming / --no-streaming`
 - `--init-from`

@@ -41,3 +41,12 @@ Added controlled augmentation, temporary backbone freeze, and multiphase LR trai
 
 - Pytest passed with one cache write warning because `.pytest_cache` is read-restricted in this environment.
 - The new cosine schedule intentionally restarts inside each training phase.
+
+## Follow-up update
+
+- Changed default temporary backbone freeze patience from `5` to `8` via the new `--freeze-patience` flag.
+- Changed temporary freeze behavior from "until next phase" to a timed window controlled by `--freeze-epoch-num`, with default `10` epochs.
+- Added `--after-unfreeze-lr-change` as an additive LR decrement applied after unfreeze only when the resulting LR stays positive and does not go below the next phase start LR.
+- Increased training rotation range from `+-10°` to `+-12°` in the shared augmentation policy.
+- Updated `Image_Identify_CNN.md`, `README.md`, `CONTRIBUTING.md`, and the design note to document the new behavior.
+- Preserved the existing numeric values already present in the example training commands inside `Image_Identify_CNN.md` and only appended the new flags there.

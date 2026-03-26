@@ -52,6 +52,55 @@ def validate_phase_learning_rates(lr_values: Sequence[float], phase_count: int) 
     return values
 
 
+def validate_freeze_cycle_args(
+    freeze_patience: int,
+    freeze_epoch_num: int,
+    after_unfreeze_lr_change: float,
+) -> tuple[int, int, float]:
+    """Validate the timed-freeze configuration before training starts.
+
+    The LR decrement is additive, so only non-negative values are allowed. The
+    actual deduction is guarded separately to ensure the resulting phase base LR
+    never crosses the next phase start LR and never becomes non-positive.
+    """
+    freeze_patience = int(freeze_patience)
+    freeze_epoch_num = int(freeze_epoch_num)
+    after_unfreeze_lr_change = float(after_unfreeze_lr_change)
+    if freeze_patience < 1:
+        raise ValueError("freeze_patience must be >= 1")
+    if freeze_epoch_num < 1:
+        raise ValueError("freeze_epoch_num must be >= 1")
+    if after_unfreeze_lr_change < 0.0:
+        raise ValueError("after_unfreeze_lr_change must be >= 0")
+    return freeze_patience, freeze_epoch_num, after_unfreeze_lr_change
+
+
+def adjust_phase_base_lr_after_unfreeze(
+    current_phase_base_lr: float,
+    after_unfreeze_lr_change: float,
+    next_phase_start_lr: float | None,
+) -> tuple[float, bool]:
+    """Apply the additive post-unfreeze LR deduction when it is allowed.
+
+    Rules:
+    - if the candidate LR is not strictly positive, keep the current phase LR
+    - if a next phase exists and the candidate LR would go below that phase's
+      configured start LR, keep the current phase LR
+    - otherwise apply the deduction
+    """
+    current_phase_base_lr = float(current_phase_base_lr)
+    after_unfreeze_lr_change = float(after_unfreeze_lr_change)
+    if after_unfreeze_lr_change <= 0.0:
+        return current_phase_base_lr, False
+
+    candidate_lr = current_phase_base_lr - after_unfreeze_lr_change
+    if candidate_lr <= 0.0:
+        return current_phase_base_lr, False
+    if next_phase_start_lr is not None and candidate_lr < float(next_phase_start_lr):
+        return current_phase_base_lr, False
+    return float(candidate_lr), True
+
+
 def build_epoch_phase_map(epochs: int, phase_count: int) -> list[PhaseConfig]:
     """Split epochs with `np.array_split` and map each epoch to its phase metadata."""
     if epochs <= 0:
@@ -206,7 +255,7 @@ def augment_batch(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     # Rotation is optional to avoid over-stacking geometric transforms.
     for index in range(batch_size):
         if rng.random() < 0.5:
-            angle = float(rng.uniform(-10.0, 10.0))
+            angle = float(rng.uniform(-12.0, 12.0))
             out[index] = _rotate_image_reflect(out[index], angle)
 
     # Photometric jitter is also optional to keep the augmented distribution stable.

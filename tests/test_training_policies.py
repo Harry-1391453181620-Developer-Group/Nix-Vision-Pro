@@ -6,7 +6,14 @@ import numpy as np
 import pytest
 
 from backends.numpy.model import CNN
-from utils.training import augment_batch, build_epoch_phase_map, compute_phase_learning_rate, validate_phase_learning_rates
+from utils.training import (
+    adjust_phase_base_lr_after_unfreeze,
+    augment_batch,
+    build_epoch_phase_map,
+    compute_phase_learning_rate,
+    validate_freeze_cycle_args,
+    validate_phase_learning_rates,
+)
 
 
 torch = pytest.importorskip("torch")
@@ -84,6 +91,36 @@ def test_phase_schedule_validation_and_warmup_restart_shape():
     assert warmup_lr < base_lr
     assert end_lr < base_lr
     assert phase_restart_lr == pytest.approx(0.0005, rel=1e-6)
+
+
+def test_freeze_cycle_validation_and_post_unfreeze_lr_rules():
+    freeze_patience, freeze_epoch_num, after_unfreeze_lr_change = validate_freeze_cycle_args(8, 10, 1e-4)
+    assert freeze_patience == 8
+    assert freeze_epoch_num == 10
+    assert after_unfreeze_lr_change == pytest.approx(1e-4)
+
+    with pytest.raises(ValueError):
+        validate_freeze_cycle_args(0, 10, 1e-4)
+    with pytest.raises(ValueError):
+        validate_freeze_cycle_args(8, 0, 1e-4)
+    with pytest.raises(ValueError):
+        validate_freeze_cycle_args(8, 10, -1e-4)
+
+    reduced_lr, reduced = adjust_phase_base_lr_after_unfreeze(0.002, 0.0001, 0.0005)
+    assert reduced
+    assert reduced_lr == pytest.approx(0.0019)
+
+    kept_lr, reduced = adjust_phase_base_lr_after_unfreeze(0.00055, 0.0001, 0.0005)
+    assert not reduced
+    assert kept_lr == pytest.approx(0.00055)
+
+    final_phase_lr, reduced = adjust_phase_base_lr_after_unfreeze(0.0003, 0.0001, None)
+    assert reduced
+    assert final_phase_lr == pytest.approx(0.0002)
+
+    unchanged_lr, reduced = adjust_phase_base_lr_after_unfreeze(0.00005, 0.0001, None)
+    assert not reduced
+    assert unchanged_lr == pytest.approx(0.00005)
 
 
 def test_numpy_freeze_keeps_bn_running_stats_fixed():
