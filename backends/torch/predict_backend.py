@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Inference device")
     parser.add_argument("--data-dir", type=str, default=None, help="Dataset root used to resolve class labels")
     parser.add_argument("--class-count", type=int, default=None, help="Optional class-count override for model output size")
+    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
     args = parser.parse_args()
 
     image_path = Path(args.image)
@@ -51,7 +52,7 @@ def main() -> None:
     num_classes = len(class_names)
 
     device = _resolve_device(args.device)
-    model = TorchCNN(input_size=config.INPUT_SIZE, num_classes=num_classes, seed=args.seed)
+    model = TorchCNN(input_size=config.INPUT_SIZE, num_classes=num_classes, seed=args.seed, width_scale=args.model_width_scale)
     model.to(device)
     if args.weights:
         weights_path = Path(args.weights)

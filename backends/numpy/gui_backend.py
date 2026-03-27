@@ -41,7 +41,7 @@ except Exception:
 
 
 class InferenceApp:
-    def __init__(self, root: tk.Tk, class_names: list[str]) -> None:
+    def __init__(self, root: tk.Tk, class_names: list[str], width_scale: float) -> None:
         self.root = root
         self.root.title("Image Identify CNN - Inference GUI")
         self.root.geometry("960x640")
@@ -49,6 +49,7 @@ class InferenceApp:
         self.input_size = config.INPUT_SIZE
         self.class_names = list(class_names)
         self.num_classes = len(self.class_names)
+        self.width_scale = float(width_scale)
 
         self.model: Optional[CNN] = None
         self.weights_path: Optional[Path] = None
@@ -97,7 +98,7 @@ class InferenceApp:
 
     def _init_model(self) -> None:
         # Initialize an untrained model first; user can load weights later.
-        self.model = CNN(input_size=self.input_size, num_classes=self.num_classes, seed=42)
+        self.model = CNN(input_size=self.input_size, num_classes=self.num_classes, seed=42, width_scale=self.width_scale)
         self.model.eval()
 
     def on_choose_weights(self) -> None:
@@ -109,7 +110,7 @@ class InferenceApp:
             return
         checkpoint = Path(path_str)
         try:
-            self.model = CNN(input_size=self.input_size, num_classes=self.num_classes, seed=42)
+            self.model = CNN(input_size=self.input_size, num_classes=self.num_classes, seed=42, width_scale=self.width_scale)
             self.model.load_weights(checkpoint)
             self.model.eval()
             self.weights_path = checkpoint
@@ -226,6 +227,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the NumPy inference GUI")
     parser.add_argument("--data-dir", type=str, default=None, help="Dataset root used to resolve class labels")
     parser.add_argument("--class-count", type=int, default=None, help="Optional class-count override for model output size")
+    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
     args = parser.parse_args()
 
     class_source_dir = Path(args.data_dir) if args.data_dir else None
@@ -235,7 +237,7 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
 
     root = tk.Tk()
-    InferenceApp(root, class_names=class_names)
+    InferenceApp(root, class_names=class_names, width_scale=args.model_width_scale)
     root.mainloop()
 
 

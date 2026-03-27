@@ -43,7 +43,7 @@ def _resolve_device() -> torch.device:
 
 
 class InferenceApp:
-    def __init__(self, root: tk.Tk, class_names: list[str]) -> None:
+    def __init__(self, root: tk.Tk, class_names: list[str], width_scale: float) -> None:
         self.root = root
         self.root.title("Image Identify CNN - PyTorch Inference GUI")
         self.root.geometry("960x640")
@@ -52,6 +52,7 @@ class InferenceApp:
         self.class_names = list(class_names)
         self.num_classes = len(self.class_names)
         self.device = _resolve_device()
+        self.width_scale = float(width_scale)
 
         self.model: Optional[TorchCNN] = None
         self.weights_path: Optional[Path] = None
@@ -94,7 +95,7 @@ class InferenceApp:
         self.pred_text.config(state=tk.DISABLED)
 
     def _init_model(self) -> None:
-        self.model = TorchCNN(input_size=self.input_size, num_classes=self.num_classes, seed=42)
+        self.model = TorchCNN(input_size=self.input_size, num_classes=self.num_classes, seed=42, width_scale=self.width_scale)
         self.model.to(self.device)
         self.model.eval()
 
@@ -107,7 +108,7 @@ class InferenceApp:
             return
         checkpoint = Path(path_str)
         try:
-            self.model = TorchCNN(input_size=self.input_size, num_classes=self.num_classes, seed=42)
+            self.model = TorchCNN(input_size=self.input_size, num_classes=self.num_classes, seed=42, width_scale=self.width_scale)
             self.model.load_weights(checkpoint, map_location=self.device)
             self.model.to(self.device)
             self.model.eval()
@@ -225,6 +226,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the PyTorch inference GUI")
     parser.add_argument("--data-dir", type=str, default=None, help="Dataset root used to resolve class labels")
     parser.add_argument("--class-count", type=int, default=None, help="Optional class-count override for model output size")
+    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
     args = parser.parse_args()
 
     class_source_dir = Path(args.data_dir) if args.data_dir else None
@@ -234,7 +236,7 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
 
     root = tk.Tk()
-    InferenceApp(root, class_names=class_names)
+    InferenceApp(root, class_names=class_names, width_scale=args.model_width_scale)
     root.mainloop()
 
 

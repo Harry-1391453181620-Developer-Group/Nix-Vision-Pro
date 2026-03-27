@@ -1,8 +1,9 @@
 """Shared training policies used by both NumPy and PyTorch backends.
 
-This module centralizes the augmentation and phase-based learning-rate logic so
-the two backends stay behaviorally aligned. The helpers are pure NumPy/Pillow
-operations and therefore run before any backend-specific tensor conversion.
+This module centralizes augmentation, argument validation, MixUp, and
+phase-based learning-rate logic so the two maintained backends stay aligned.
+The helpers intentionally stay in NumPy/Pillow space because the two trainers
+still load and preprocess images before backend-specific tensor conversion.
 """
 
 from __future__ import annotations
@@ -19,6 +20,34 @@ from data.preprocessing import resize
 EPS = 1e-12
 
 
+@dataclass(frozen=True)
+class PhaseConfig:
+    """Resolved phase metadata for one epoch.
+
+    Each epoch stores both its global phase membership and its local position
+    inside that phase so the scheduler can restart cleanly per phase.
+    """
+
+    phase_index: int
+    epoch_index_in_phase: int
+    epochs_in_phase: int
+
+
+@dataclass(frozen=True)
+class AugmentationConfig:
+    """Resolved augmentation strengths shared by both training backends.
+
+    The numeric values are strengths, not probabilities. When a strength is
+    zero, that transform is disabled. Otherwise the transform is applied with a
+    random factor sampled from the documented range for that strength.
+    """
+
+    rotation: float = 12.0
+    brightness: float = 0.2
+    contrast: float = 0.2
+    saturation: float = 0.2
+
+
 def parse_bool_flag(value: bool | str) -> bool:
     """Parse flexible boolean CLI values such as `true`, `false`, `1`, or `0`."""
     if isinstance(value, bool):
@@ -31,13 +60,55 @@ def parse_bool_flag(value: bool | str) -> bool:
     raise ValueError(f"Invalid boolean value: {value!r}")
 
 
-@dataclass(frozen=True)
-class PhaseConfig:
-    """Resolved phase metadata for one epoch."""
+def _validate_unit_interval(name: str, value: float) -> float:
+    """Validate a floating-point CLI strength that must stay within [0, 1]."""
+    value = float(value)
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(f"{name} must satisfy 0 <= value <= 1")
+    return value
 
-    phase_index: int
-    epoch_index_in_phase: int
-    epochs_in_phase: int
+
+def validate_augmentation_args(
+    rotation: float,
+    brightness: float,
+    contrast: float,
+    saturation: float,
+) -> AugmentationConfig:
+    """Validate user-facing augmentation strengths before training starts.
+
+    Rotation is an angle bound in degrees. The photometric values are strength
+    values inside [0, 1], where the runtime factor is sampled from [1-s, 1+s].
+    """
+    rotation = float(rotation)
+    if not (0.0 <= rotation < 180.0):
+        raise ValueError("rotation must satisfy 0 <= value < 180")
+    return AugmentationConfig(
+        rotation=rotation,
+        brightness=_validate_unit_interval("brightness", brightness),
+        contrast=_validate_unit_interval("contrast", contrast),
+        saturation=_validate_unit_interval("saturation", saturation),
+    )
+
+
+def validate_mixup_probability(mixup_prob: float) -> float:
+    """Validate the per-batch MixUp activation probability."""
+    return _validate_unit_interval("mixup_prob", mixup_prob)
+
+
+def validate_focal_gamma(focal_gamma: float) -> float:
+    """Validate focal-loss gamma before either backend builds its loss path."""
+    focal_gamma = float(focal_gamma)
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be >= 0")
+    return focal_gamma
+
+
+def validate_model_width_scale(width_scale: float) -> float:
+    """Validate the width multiplier used to shrink or grow stage 2 channels."""
+    width_scale = float(width_scale)
+    if width_scale <= 0.0:
+        raise ValueError("model_width_scale must be > 0")
+    return width_scale
 
 
 def validate_phase_learning_rates(lr_values: Sequence[float], phase_count: int) -> list[float]:
@@ -262,62 +333,125 @@ def _rotate_image_reflect(image: np.ndarray, angle_degrees: float) -> np.ndarray
         center=center,
     )
     rotated_arr = np.asarray(rotated, dtype=np.float32) / 255.0
-    y0 = pad
-    x0 = pad
-    return rotated_arr[y0 : y0 + height, x0 : x0 + width, :]
+    return rotated_arr[pad : pad + height, pad : pad + width, :]
 
 
-def _apply_color_jitter(image: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Apply brightness, contrast, and saturation jitter within safe ranges."""
-    brightness = 1.0 + float(rng.uniform(-0.2, 0.2))
-    contrast = 1.0 + float(rng.uniform(-0.2, 0.2))
-    saturation = 1.0 + float(rng.uniform(-0.2, 0.2))
+def _apply_color_jitter(image: np.ndarray, rng: np.random.Generator, config: AugmentationConfig) -> np.ndarray:
+    """Apply brightness, contrast, and saturation jitter from user-supplied strengths."""
+    out = image.copy()
 
-    # Brightness scales all channels uniformly.
-    out = image * brightness
+    if config.brightness > 0.0:
+        brightness = float(rng.uniform(1.0 - config.brightness, 1.0 + config.brightness))
+        out = out * brightness
 
-    # Contrast re-centers around the per-image mean to avoid channel drift.
-    mean = np.mean(out, axis=(0, 1), keepdims=True)
-    out = (out - mean) * contrast + mean
+    if config.contrast > 0.0:
+        contrast = float(rng.uniform(1.0 - config.contrast, 1.0 + config.contrast))
+        mean = np.mean(out, axis=(0, 1), keepdims=True)
+        out = (out - mean) * contrast + mean
 
-    # Saturation blends between grayscale and the current color image.
-    grayscale = np.mean(out, axis=2, keepdims=True)
-    out = grayscale + (out - grayscale) * saturation
+    if config.saturation > 0.0:
+        saturation = float(rng.uniform(1.0 - config.saturation, 1.0 + config.saturation))
+        grayscale = np.mean(out, axis=2, keepdims=True)
+        out = grayscale + (out - grayscale) * saturation
+
     return out
 
 
-def augment_batch(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Apply the approved training augmentation policy in a deterministic RNG order."""
-    out = x.copy()
-    batch_size, height, width, _ = out.shape
+def _apply_random_erasing(image: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Erase one random rectangle and fill it with the per-image channel mean.
 
-    # Geometry first: crop then flip, before any rotation or photometric changes.
+    Filling with the current image mean keeps the erased region neutral even if a
+    future preprocessing change makes zero a non-natural value.
+    """
+    height, width, _ = image.shape
+    total_area = float(height * width)
+    fill_value = np.mean(image, axis=(0, 1), keepdims=True)
+
+    for _ in range(10):
+        target_area = total_area * float(rng.uniform(0.10, 0.20))
+        aspect_ratio = float(np.exp(rng.uniform(np.log(0.5), np.log(2.0))))
+        erase_h = int(round(np.sqrt(target_area * aspect_ratio)))
+        erase_w = int(round(np.sqrt(target_area / aspect_ratio)))
+        erase_h = min(max(1, erase_h), height)
+        erase_w = min(max(1, erase_w), width)
+        if erase_h <= height and erase_w <= width:
+            y0 = int(rng.integers(0, max(1, height - erase_h + 1)))
+            x0 = int(rng.integers(0, max(1, width - erase_w + 1)))
+            out = image.copy()
+            out[y0 : y0 + erase_h, x0 : x0 + erase_w, :] = fill_value
+            return out
+    return image
+
+
+def augment_batch(
+    x: np.ndarray,
+    rng: np.random.Generator,
+    config: AugmentationConfig | None = None,
+) -> np.ndarray:
+    """Apply the shared training augmentation policy in a deterministic RNG order.
+
+    The transform order is fixed so both backends see the same data policy:
+    crop -> flip -> rotation -> color jitter -> random erasing.
+    """
+    config = config or AugmentationConfig()
+    out = x.copy()
+    batch_size = out.shape[0]
+
+    # Geometry first so later photometric changes operate on final spatial data.
     if rng.random() < 0.9:
         out = random_resized_crop_batch(out, rng)
     flip_mask = rng.random(batch_size) < 0.5
     out[flip_mask] = out[flip_mask, :, ::-1, :]
 
-    # Rotation is optional to avoid over-stacking geometric transforms.
-    for index in range(batch_size):
-        if rng.random() < 0.5:
-            angle = float(rng.uniform(-12.0, 12.0))
-            out[index] = _rotate_image_reflect(out[index], angle)
+    if config.rotation > 0.0:
+        for index in range(batch_size):
+            angle = float(rng.uniform(-config.rotation, config.rotation))
+            if abs(angle) > EPS:
+                out[index] = _rotate_image_reflect(out[index], angle)
 
-    # Photometric jitter is also optional to keep the augmented distribution stable.
-    for index in range(batch_size):
-        if rng.random() < 0.5:
-            out[index] = _apply_color_jitter(out[index], rng)
+    if config.brightness > 0.0 or config.contrast > 0.0 or config.saturation > 0.0:
+        for index in range(batch_size):
+            out[index] = _apply_color_jitter(out[index], rng, config)
 
-    # Cutout remains the final destructive transform in the stack.
+    # Random erasing stays last because it is the only intentionally destructive transform.
     for index in range(batch_size):
         if rng.random() < 0.3:
-            cut = int(rng.integers(max(2, height // 8), max(4, height // 4)))
-            cy = int(rng.integers(0, height))
-            cx = int(rng.integers(0, width))
-            y1 = max(0, cy - cut // 2)
-            y2 = min(height, cy + cut // 2)
-            x1 = max(0, cx - cut // 2)
-            x2 = min(width, cx + cut // 2)
-            out[index, y1:y2, x1:x2, :] = 0.0
+            out[index] = _apply_random_erasing(out[index], rng)
 
     return np.clip(out, 0.0, 1.0).astype(x.dtype, copy=False)
+
+
+def apply_mixup(
+    x: np.ndarray,
+    y: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    prob: float,
+    beta_alpha: float = 0.2,
+) -> tuple[np.ndarray, np.ndarray, bool, float]:
+    """Apply MixUp to a batch of inputs and labels using one shared lambda.
+
+    Returning the activation flag and lambda lets callers log or branch on the
+    exact behavior without trying to re-sample any RNG state.
+    """
+    prob = float(prob)
+    beta_alpha = float(beta_alpha)
+    if x.shape[0] != y.shape[0]:
+        raise ValueError("MixUp expects the same batch dimension for inputs and labels")
+    if prob <= 0.0 or x.shape[0] < 2:
+        return x, y, False, 1.0
+    if beta_alpha <= 0.0:
+        raise ValueError("beta_alpha must be > 0")
+    if rng.random() >= prob:
+        return x, y, False, 1.0
+
+    lam = float(rng.beta(beta_alpha, beta_alpha))
+    permutation = rng.permutation(x.shape[0])
+    mixed_x = lam * x + (1.0 - lam) * x[permutation]
+    mixed_y = lam * y + (1.0 - lam) * y[permutation]
+    return (
+        mixed_x.astype(x.dtype, copy=False),
+        mixed_y.astype(y.dtype, copy=False),
+        True,
+        lam,
+    )

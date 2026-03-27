@@ -1,0 +1,55 @@
+# 2026-03-27 History
+
+## Request
+
+Added configurable preprocessing strengths, random erasing, MixUp, focal loss, and width-scaled model construction across both training backends. Updated docs, tests, and checkpoint-loading compatibility, then committed the work.
+
+## Work completed
+
+- Wrote the approved design note to `docs/plans/2026-03-27-dual-backend-focal-mixup-design.md`.
+- Updated `utils/training.py` so both backends now share:
+  - validated augmentation strengths for rotation, brightness, contrast, and saturation
+  - random erasing with `10%-20%` area sampling and per-image mean fill
+  - MixUp with `Beta(0.2, 0.2)` and per-batch activation probability
+  - width-scale validation for the resized stage-2 block
+- Updated `backends/torch/model.py` and `backends/numpy/model.py` to support `width_scale`, with default stage-2 width `48` from `0.75 * 64`.
+- Updated `backends/torch/train_backend.py` and `backends/numpy/train_backend.py` to support:
+  - `--rotation`
+  - `--brightness`
+  - `--contrast`
+  - `--saturation`
+  - `--mixup / --no-mixup`
+  - `--mixup-prob`
+  - `--focal-loss / --no-focal-loss`
+  - `--focal-gamma`
+  - `--focal-alpha {auto,none}`
+  - `--model-width-scale`
+- Replaced the old balance-sampling path with focal-loss handling in both trainers.
+- Added automatic run-level fallback from focal loss to cross entropy when MixUp is enabled.
+- Updated `backends/numpy/nn/losses.py` with focal-loss forward and backward implementations.
+- Updated both predict backends and both GUI backends to accept `--model-width-scale` so inference can match the training-time checkpoint shape.
+- Added focused tests for:
+  - focal-loss equivalence at `gamma=0`
+  - focal-loss gradient shape
+  - MixUp soft-label behavior
+  - random-erasing mean fill
+  - width-scaled stage-2 channel counts
+  - forgiving checkpoint loading when width-scaled tensors differ
+- Updated `Image_Identify_CNN.md` and `README.md` to document the new behavior and example commands.
+
+## Validation
+
+- `python -m py_compile utils	raining.py backends	orch\model.py backends
+umpy\model.py backends	orch	rain_backend.py backends
+umpy	rain_backend.py backends	orch\predict_backend.py backends
+umpy\predict_backend.py backends	orch\gui_backend.py backends
+umpy\gui_backend.py backends
+umpy
+n\losses.py tests	est_losses.py tests	est_mixup_focal_width.py`
+- `.\.venv\Scripts\python.exe -m pytest tests	est_losses.py tests	est_training_policies.py tests	est_model.py tests	est_torch_model.py tests	est_mixup_focal_width.py -q`
+
+## Notes
+
+- The first test attempt used the wrong interpreter and failed because `pytest` was not installed there. The rerun used the project virtualenv and passed.
+- Pytest still reports a cache-write warning in this environment because `.pytest_cache` cannot create its nested cache directory cleanly here.
+- Passive security review: no new high-severity security issues were introduced in the added CLI, checkpoint-loading, or loss-selection paths. The checkpoint readers still use explicit extension checks and NumPy loading remains `allow_pickle=False`.

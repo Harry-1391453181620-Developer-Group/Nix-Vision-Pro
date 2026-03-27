@@ -22,18 +22,23 @@ import config
 from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
     adjust_phase_lr_offset_after_unfreeze,
+    apply_mixup,
     augment_batch,
     build_epoch_phase_map,
     compute_effective_learning_rate,
     compute_phase_learning_rate,
     parse_bool_flag,
+    validate_augmentation_args,
+    validate_focal_gamma,
     validate_freeze_cycle_args,
+    validate_mixup_probability,
+    validate_model_width_scale,
     validate_phase_learning_rates,
 )
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
 from backends.numpy.model import CNN
-from nn.losses import cross_entropy_loss, cross_entropy_loss_backward
+from nn.losses import cross_entropy_loss, cross_entropy_loss_backward, focal_loss, focal_loss_backward
 
 # Robust optimizers import with local AdamW fallback
 try:
@@ -181,17 +186,50 @@ def make_class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
     return weights
 
 
-def build_balanced_epoch_indices(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    counts = np.bincount(y).astype(np.float64)
-    class_prob = np.zeros_like(counts)
-    nz = counts > 0
-    class_prob[nz] = 1.0 / counts[nz]
-    sample_prob = class_prob[y]
-    sample_prob /= np.sum(sample_prob)
-    return rng.choice(y.size, size=y.size, replace=True, p=sample_prob)
+def _compute_batch_loss(
+    logits: np.ndarray,
+    labels_onehot: np.ndarray,
+    *,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: np.ndarray | None,
+    focal_alpha_weights: np.ndarray | None,
+) -> float:
+    """Select the correct loss path for the current run-level policy."""
+    if use_focal_loss:
+        return focal_loss(logits, labels_onehot, gamma=focal_gamma, alpha=focal_alpha_weights)
+    return cross_entropy_loss(logits, labels_onehot, class_weights=ce_class_weights)
 
 
-def evaluate_streaming(model: CNN, paths: list[Path], labels: np.ndarray, num_classes: int, batch_size: int, input_size: tuple[int, int]) -> tuple[float, float]:
+def _compute_batch_gradient(
+    logits: np.ndarray,
+    labels_onehot: np.ndarray,
+    *,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: np.ndarray | None,
+    focal_alpha_weights: np.ndarray | None,
+) -> np.ndarray:
+    """Select the correct backward path for the current run-level policy."""
+    if use_focal_loss:
+        return focal_loss_backward(logits, labels_onehot, gamma=focal_gamma, alpha=focal_alpha_weights)
+    return cross_entropy_loss_backward(logits, labels_onehot, class_weights=ce_class_weights)
+
+
+def evaluate_streaming(
+    model: CNN,
+    paths: list[Path],
+    labels: np.ndarray,
+    num_classes: int,
+    batch_size: int,
+    input_size: tuple[int, int],
+    *,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: np.ndarray | None,
+    focal_alpha_weights: np.ndarray | None,
+) -> tuple[float, float]:
+    """Evaluate a model while streaming validation images from disk."""
     n = len(paths)
     if n == 0:
         return float("nan"), float("nan")
@@ -209,14 +247,33 @@ def evaluate_streaming(model: CNN, paths: list[Path], labels: np.ndarray, num_cl
             x[j] = preprocess_image(img, target_size=input_size, normalize_to=config.NORMALIZE_TO, input_value_range=config.INPUT_VALUE_RANGE)
         y = one_hot(y_idx, num_classes, label_smoothing=0.0)
         logits = model.forward(x)
-        total_loss += cross_entropy_loss(logits, y)
+        total_loss += _compute_batch_loss(
+            logits,
+            y,
+            use_focal_loss=use_focal_loss,
+            focal_gamma=focal_gamma,
+            ce_class_weights=ce_class_weights,
+            focal_alpha_weights=focal_alpha_weights,
+        )
         preds = np.argmax(logits, axis=1)
         total_correct += int(np.sum(preds == y_idx))
         n_batches += 1
     return total_loss / max(1, n_batches), total_correct / max(1, n)
 
 
-def evaluate_preloaded(model: CNN, X: np.ndarray, labels: np.ndarray, num_classes: int, batch_size: int) -> tuple[float, float]:
+def evaluate_preloaded(
+    model: CNN,
+    X: np.ndarray,
+    labels: np.ndarray,
+    num_classes: int,
+    batch_size: int,
+    *,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: np.ndarray | None,
+    focal_alpha_weights: np.ndarray | None,
+) -> tuple[float, float]:
+    """Evaluate a model against a preloaded validation tensor."""
     n = labels.size
     total_loss = 0.0
     total_correct = 0
@@ -228,7 +285,14 @@ def evaluate_preloaded(model: CNN, X: np.ndarray, labels: np.ndarray, num_classe
         y_idx = labels[start:end]
         y = one_hot(y_idx, num_classes, label_smoothing=0.0)
         logits = model.forward(x)
-        total_loss += cross_entropy_loss(logits, y)
+        total_loss += _compute_batch_loss(
+            logits,
+            y,
+            use_focal_loss=use_focal_loss,
+            focal_gamma=focal_gamma,
+            ce_class_weights=ce_class_weights,
+            focal_alpha_weights=focal_alpha_weights,
+        )
         preds = np.argmax(logits, axis=1)
         total_correct += int(np.sum(preds == y_idx))
         n_batches += 1
@@ -329,12 +393,21 @@ def main() -> None:
     parser.add_argument("--early-stop-metric", choices=["val_loss", "val_acc"], default="val_loss", help="Metric for early stopping")
     parser.add_argument("--grad-clip", type=float, default=5.0, help="Global gradient clip norm (0 disables)")
     parser.add_argument("--class-weighting", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--balance-sampling", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--focal-loss", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--focal-gamma", type=float, default=1.5, help="Focal-loss gamma parameter")
+    parser.add_argument("--focal-alpha", choices=["auto", "none"], default="auto", help="Focal alpha weighting policy")
+    parser.add_argument("--mixup", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mixup-prob", type=float, default=0.5, help="Per-batch probability of applying MixUp")
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
     parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
     parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "best_model.npz"))
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rotation", type=float, default=12.0, help="Maximum absolute random rotation in degrees")
+    parser.add_argument("--brightness", type=float, default=0.2, help="Brightness jitter strength in [0, 1]")
+    parser.add_argument("--contrast", type=float, default=0.2, help="Contrast jitter strength in [0, 1]")
+    parser.add_argument("--saturation", type=float, default=0.2, help="Saturation jitter strength in [0, 1]")
+    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True,
                         help="If true, stream batches from disk; if false, preload all images into memory.")
@@ -374,6 +447,8 @@ def main() -> None:
 
     if args.phase_count > args.epochs:
         raise SystemExit("--phase-count cannot be greater than --epochs")
+    if not (0.0 <= float(args.label_smoothing) < 1.0):
+        raise SystemExit("--label-smoothing must satisfy 0 <= value < 1")
     try:
         lr_values = validate_phase_learning_rates(args.lr, args.phase_count)
         freeze_patience, freeze_epoch_num, after_unfreeze_lr_change = validate_freeze_cycle_args(
@@ -381,6 +456,15 @@ def main() -> None:
             args.freeze_epoch_num,
             args.after_unfreeze_lr_change,
         )
+        augment_config = validate_augmentation_args(
+            args.rotation,
+            args.brightness,
+            args.contrast,
+            args.saturation,
+        )
+        mixup_prob = validate_mixup_probability(args.mixup_prob)
+        focal_gamma = validate_focal_gamma(args.focal_gamma)
+        width_scale = validate_model_width_scale(args.model_width_scale)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -444,11 +528,22 @@ def main() -> None:
         val_counts = class_distribution(y_val, num_classes)
         print("Val samples:", y_val.size, " class_counts=", val_counts.tolist())
 
-    class_weights = make_class_weights(y_train, num_classes) if args.class_weighting else None
+    inverse_frequency_weights = None
+    if args.class_weighting or args.focal_alpha == "auto":
+        inverse_frequency_weights = make_class_weights(y_train, num_classes)
+    ce_class_weights = inverse_frequency_weights if args.class_weighting else None
+    focal_alpha_weights = inverse_frequency_weights if args.focal_alpha == "auto" else None
+
+    mixup_disables_focal = bool(args.mixup and mixup_prob > 0.0)
+    use_focal_loss = bool(args.focal_loss and not mixup_disables_focal)
+    if args.focal_loss and mixup_disables_focal:
+        print("[info] Focal loss disabled for this run because MixUp is enabled.")
+
     input_size = config.INPUT_SIZE
 
-    model = CNN(input_size=input_size, num_classes=num_classes, seed=args.seed, dropout_p=args.dropout)
+    model = CNN(input_size=input_size, num_classes=num_classes, seed=args.seed, dropout_p=args.dropout, width_scale=width_scale)
     model.set_backbone_frozen(False, freeze_bn_affine=args.freeze_bn_affine)
+    print(f"Using stage2_channels={model.stage2_channels} (width_scale={model.width_scale:.3f})")
     if args.init_from:
         try:
             model.load_weights(args.init_from)
@@ -456,7 +551,7 @@ def main() -> None:
         except (ValueError, KeyError) as e:
             print(f"[warn] Strict load failed: {e}")
             loaded, skipped = load_weights_forgiving(model, args.init_from, skip_prefixes=("fc2.",))
-            print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (e.g., classifier head)")
+            print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (for example, classifier or resized feature tensors)")
 
     batch_size = int(max(1, args.batch_size))
     X_train = None
@@ -513,7 +608,7 @@ def main() -> None:
         model.train()
         epoch_backbone_frozen = backbone_frozen
         model.set_backbone_frozen(epoch_backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
-        perm = build_balanced_epoch_indices(y_train, rng) if args.balance_sampling else rng.permutation(y_train.size)
+        perm = rng.permutation(y_train.size)
         epoch_loss = 0.0
         epoch_correct = 0
 
@@ -533,8 +628,18 @@ def main() -> None:
                 x_batch = X_train[idx_b]
 
             if args.augment:
-                x_batch = augment_batch(x_batch, rng).astype(np.float64, copy=False)
+                x_batch = augment_batch(x_batch, rng, augment_config).astype(np.float64, copy=False)
             y_batch = one_hot(y_batch_idx, num_classes, label_smoothing=args.label_smoothing)
+            if args.mixup:
+                x_batch, y_batch, _, _ = apply_mixup(
+                    x_batch,
+                    y_batch,
+                    rng,
+                    prob=mixup_prob,
+                    beta_alpha=0.2,
+                )
+                x_batch = x_batch.astype(np.float64, copy=False)
+                y_batch = y_batch.astype(np.float64, copy=False)
 
             scheduled_lr = compute_phase_learning_rate(
                 base_lr=current_phase_base_lr,
@@ -557,12 +662,27 @@ def main() -> None:
             optimizer.lr = current_lr
 
             logits = model.forward(x_batch)
-            loss = cross_entropy_loss(logits, y_batch, class_weights=class_weights)
+            loss = _compute_batch_loss(
+                logits,
+                y_batch,
+                use_focal_loss=use_focal_loss,
+                focal_gamma=focal_gamma,
+                ce_class_weights=ce_class_weights,
+                focal_alpha_weights=focal_alpha_weights,
+            )
             epoch_loss += loss
             preds = np.argmax(logits, axis=1)
-            epoch_correct += int(np.sum(preds == y_batch_idx))
+            metric_targets = np.argmax(y_batch, axis=1)
+            epoch_correct += int(np.sum(preds == metric_targets))
 
-            dlogits = cross_entropy_loss_backward(logits, y_batch, class_weights=class_weights)
+            dlogits = _compute_batch_gradient(
+                logits,
+                y_batch,
+                use_focal_loss=use_focal_loss,
+                focal_gamma=focal_gamma,
+                ce_class_weights=ce_class_weights,
+                focal_alpha_weights=focal_alpha_weights,
+            )
             model.backward(dlogits)
             params = model.get_trainable_parameters()
             if args.grad_clip > 0.0:
@@ -576,9 +696,30 @@ def main() -> None:
         if y_val is not None and len(val_paths) > 0:
             model.eval()
             if args.streaming or X_val is None:
-                val_loss, val_acc = evaluate_streaming(model, val_paths, y_val, num_classes=num_classes, batch_size=batch_size, input_size=input_size)
+                val_loss, val_acc = evaluate_streaming(
+                    model,
+                    val_paths,
+                    y_val,
+                    num_classes=num_classes,
+                    batch_size=batch_size,
+                    input_size=input_size,
+                    use_focal_loss=use_focal_loss,
+                    focal_gamma=focal_gamma,
+                    ce_class_weights=ce_class_weights,
+                    focal_alpha_weights=focal_alpha_weights,
+                )
             else:
-                val_loss, val_acc = evaluate_preloaded(model, X_val, y_val, num_classes=num_classes, batch_size=batch_size)
+                val_loss, val_acc = evaluate_preloaded(
+                    model,
+                    X_val,
+                    y_val,
+                    num_classes=num_classes,
+                    batch_size=batch_size,
+                    use_focal_loss=use_focal_loss,
+                    focal_gamma=focal_gamma,
+                    ce_class_weights=ce_class_weights,
+                    focal_alpha_weights=focal_alpha_weights,
+                )
 
             improved = (val_loss < (best_val_loss - args.min_delta)) if args.early_stop_metric == "val_loss" else (val_acc > (best_val_acc + args.min_delta))
             if improved:

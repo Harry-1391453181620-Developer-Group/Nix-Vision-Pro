@@ -21,12 +21,17 @@ from data.preprocessing import preprocess_image
 from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
     adjust_phase_lr_offset_after_unfreeze,
+    apply_mixup,
     augment_batch,
     build_epoch_phase_map,
     compute_effective_learning_rate,
     compute_phase_learning_rate,
     parse_bool_flag,
+    validate_augmentation_args,
+    validate_focal_gamma,
     validate_freeze_cycle_args,
+    validate_mixup_probability,
+    validate_model_width_scale,
     validate_phase_learning_rates,
 )
 
@@ -35,6 +40,7 @@ install_dataset_write_guard()
 try:
     import torch
     from torch import nn
+    import torch.nn.functional as F
 except Exception as exc:
     raise SystemExit(f"PyTorch backend is unavailable in this interpreter: {exc}") from exc
 
@@ -89,76 +95,67 @@ def make_class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
     return weights
 
 
-def build_balanced_epoch_indices(labels: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    counts = np.bincount(labels).astype(np.float64)
-    class_prob = np.zeros_like(counts)
-    non_zero = counts > 0
-    class_prob[non_zero] = 1.0 / counts[non_zero]
-    sample_prob = class_prob[labels]
-    sample_prob /= np.sum(sample_prob)
-    return rng.choice(labels.size, size=labels.size, replace=True, p=sample_prob)
+def _make_target_distribution(
+    labels: np.ndarray,
+    num_classes: int,
+    label_smoothing: float,
+) -> np.ndarray:
+    """Build one-hot or label-smoothed targets before tensor conversion."""
+    label_smoothing = float(label_smoothing)
+    if not (0.0 <= label_smoothing < 1.0):
+        raise ValueError("label_smoothing must satisfy 0 <= value < 1")
+    labels = np.asarray(labels, dtype=np.int64).ravel()
+    targets = np.full((labels.size, num_classes), label_smoothing / num_classes, dtype=np.float32)
+    targets[np.arange(labels.size), labels] = 1.0 - label_smoothing + (label_smoothing / num_classes)
+    return targets
 
 
-def stable_partition_index(path: Path, num_parts: int) -> int:
-    if num_parts <= 1:
-        return 0
-    digest = hashlib.md5(str(path.resolve()).lower().encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) % num_parts
+def _soft_cross_entropy_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    class_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute weighted soft-label cross entropy for hard, smoothed, or mixed labels."""
+    log_probs = F.log_softmax(logits, dim=1)
+    per_sample_nll = -(targets * log_probs).sum(dim=1)
+    if class_weights is None:
+        return per_sample_nll.mean()
+    sample_weights = (targets * class_weights.view(1, -1)).sum(dim=1)
+    return (sample_weights * per_sample_nll).sum() / sample_weights.sum().clamp_min(1e-12)
 
 
-def choose_partition(args) -> int:
-    if not args.auto_next_partition:
-        return max(0, min(args.partition, max(0, args.num_partitions - 1)))
-    state_path = Path(args.partition_state)
-    state = {"num_partitions": args.num_partitions, "next": 0}
-    try:
-        if state_path.is_file():
-            loaded = json.loads(state_path.read_text(encoding="utf-8"))
-            if int(loaded.get("num_partitions", -1)) == args.num_partitions:
-                state = loaded
-    except Exception:
-        pass
-    part = int(state.get("next", 0)) % max(1, args.num_partitions)
-    state["num_partitions"] = args.num_partitions
-    state["next"] = (part + 1) % max(1, args.num_partitions)
-    try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-    except Exception:
-        pass
-    return part
+def _focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float,
+    alpha_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute generalized focal loss for standard or label-smoothed targets."""
+    probs = torch.softmax(logits, dim=1)
+    log_probs = torch.log_softmax(logits, dim=1)
+    pt = (targets * probs).sum(dim=1)
+    ce = -(targets * log_probs).sum(dim=1)
+    focal_factor = torch.pow((1.0 - pt).clamp(min=0.0, max=1.0), float(gamma))
+    if alpha_weights is None:
+        sample_alpha = torch.ones_like(pt)
+    else:
+        sample_alpha = (targets * alpha_weights.view(1, -1)).sum(dim=1)
+    return (sample_alpha * focal_factor * ce).sum() / sample_alpha.sum().clamp_min(1e-12)
 
 
-def _resolve_device(device_arg: str) -> torch.device:
-    if device_arg == "cpu":
-        return torch.device("cpu")
-    if device_arg == "cuda":
-        if not torch.cuda.is_available():
-            raise SystemExit("--device=cuda requested, but CUDA is not available")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr_value: float) -> None:
-    for group in optimizer.param_groups:
-        group["lr"] = lr_value
-
-
-def _to_tensor_batch(x_batch: np.ndarray, device: torch.device) -> torch.Tensor:
-    return torch.from_numpy(np.ascontiguousarray(x_batch)).to(device=device, dtype=torch.float32)
-
-
-def _load_batch(paths: list[Path], input_size: tuple[int, int]) -> np.ndarray:
-    batch = np.empty((len(paths), input_size[0], input_size[1], 3), dtype=np.float32)
-    for index, image_path in enumerate(paths):
-        image = load_image(image_path)
-        batch[index] = preprocess_image(
-            image,
-            target_size=input_size,
-            normalize_to=config.NORMALIZE_TO,
-            input_value_range=config.INPUT_VALUE_RANGE,
-        ).astype(np.float32)
-    return batch
+def _compute_batch_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: torch.Tensor | None,
+    focal_alpha_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    """Select the correct loss path for the current run-level policy."""
+    if use_focal_loss:
+        return _focal_loss(logits, targets, gamma=focal_gamma, alpha_weights=focal_alpha_weights)
+    return _soft_cross_entropy_loss(logits, targets, class_weights=ce_class_weights)
 
 
 def evaluate_streaming(
@@ -169,10 +166,15 @@ def evaluate_streaming(
     batch_size: int,
     input_size: tuple[int, int],
     device: torch.device,
+    *,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: torch.Tensor | None,
+    focal_alpha_weights: torch.Tensor | None,
 ) -> tuple[float, float]:
+    """Evaluate a model while streaming validation images from disk."""
     if len(paths) == 0:
         return float("nan"), float("nan")
-    criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
     total_correct = 0
     num_batches = 0
@@ -181,10 +183,20 @@ def evaluate_streaming(
         for start in range(0, len(paths), batch_size):
             end = min(start + batch_size, len(paths))
             x_batch = _load_batch(paths[start:end], input_size)
-            y_batch = torch.as_tensor(labels[start:end], device=device, dtype=torch.long)
+            y_batch = labels[start:end]
+            targets = _make_target_distribution(y_batch, num_classes, label_smoothing=0.0)
+            y_tensor = torch.as_tensor(targets, device=device, dtype=torch.float32)
             logits = model(_to_tensor_batch(x_batch, device))
-            total_loss += float(criterion(logits, y_batch).item())
-            total_correct += int((torch.argmax(logits, dim=1) == y_batch).sum().item())
+            loss = _compute_batch_loss(
+                logits,
+                y_tensor,
+                use_focal_loss=use_focal_loss,
+                focal_gamma=focal_gamma,
+                ce_class_weights=ce_class_weights,
+                focal_alpha_weights=focal_alpha_weights,
+            )
+            total_loss += float(loss.item())
+            total_correct += int((torch.argmax(logits, dim=1) == torch.as_tensor(y_batch, device=device, dtype=torch.long)).sum().item())
             num_batches += 1
     return total_loss / max(1, num_batches), total_correct / max(1, len(paths))
 
@@ -193,10 +205,16 @@ def evaluate_preloaded(
     model: TorchCNN,
     x_data: np.ndarray,
     labels: np.ndarray,
+    num_classes: int,
     batch_size: int,
     device: torch.device,
+    *,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: torch.Tensor | None,
+    focal_alpha_weights: torch.Tensor | None,
 ) -> tuple[float, float]:
-    criterion = nn.CrossEntropyLoss()
+    """Evaluate a model against a preloaded validation tensor."""
     total_loss = 0.0
     total_correct = 0
     num_batches = 0
@@ -205,10 +223,20 @@ def evaluate_preloaded(
         for start in range(0, len(labels), batch_size):
             end = min(start + batch_size, len(labels))
             x_batch = _to_tensor_batch(x_data[start:end], device)
-            y_batch = torch.as_tensor(labels[start:end], device=device, dtype=torch.long)
+            y_batch = labels[start:end]
+            targets = _make_target_distribution(y_batch, num_classes, label_smoothing=0.0)
+            y_tensor = torch.as_tensor(targets, device=device, dtype=torch.float32)
             logits = model(x_batch)
-            total_loss += float(criterion(logits, y_batch).item())
-            total_correct += int((torch.argmax(logits, dim=1) == y_batch).sum().item())
+            loss = _compute_batch_loss(
+                logits,
+                y_tensor,
+                use_focal_loss=use_focal_loss,
+                focal_gamma=focal_gamma,
+                ce_class_weights=ce_class_weights,
+                focal_alpha_weights=focal_alpha_weights,
+            )
+            total_loss += float(loss.item())
+            total_correct += int((torch.argmax(logits, dim=1) == torch.as_tensor(y_batch, device=device, dtype=torch.long)).sum().item())
             num_batches += 1
     return total_loss / max(1, num_batches), total_correct / max(1, len(labels))
 
@@ -308,12 +336,21 @@ def main() -> None:
     parser.add_argument("--early-stop-metric", choices=["val_loss", "val_acc"], default="val_loss", help="Metric for early stopping")
     parser.add_argument("--grad-clip", type=float, default=5.0, help="Global gradient clip norm (0 disables)")
     parser.add_argument("--class-weighting", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--balance-sampling", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--focal-loss", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--focal-gamma", type=float, default=1.5, help="Focal-loss gamma parameter")
+    parser.add_argument("--focal-alpha", choices=["auto", "none"], default="auto", help="Focal alpha weighting policy")
+    parser.add_argument("--mixup", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mixup-prob", type=float, default=0.5, help="Per-batch probability of applying MixUp")
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
     parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
     parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "best_torch_model.pt"))
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rotation", type=float, default=12.0, help="Maximum absolute random rotation in degrees")
+    parser.add_argument("--brightness", type=float, default=0.2, help="Brightness jitter strength in [0, 1]")
+    parser.add_argument("--contrast", type=float, default=0.2, help="Contrast jitter strength in [0, 1]")
+    parser.add_argument("--saturation", type=float, default=0.2, help="Saturation jitter strength in [0, 1]")
+    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True, help="If true, stream batches from disk; if false, preload all images into memory.")
     parser.add_argument("--init-from", type=str, default=None, help="Path to checkpoint .pt/.pth to initialize weights")
@@ -345,6 +382,8 @@ def main() -> None:
 
     if args.phase_count > args.epochs:
         raise SystemExit("--phase-count cannot be greater than --epochs")
+    if not (0.0 <= float(args.label_smoothing) < 1.0):
+        raise SystemExit("--label-smoothing must satisfy 0 <= value < 1")
     try:
         lr_values = validate_phase_learning_rates(args.lr, args.phase_count)
         freeze_patience, freeze_epoch_num, after_unfreeze_lr_change = validate_freeze_cycle_args(
@@ -352,6 +391,15 @@ def main() -> None:
             args.freeze_epoch_num,
             args.after_unfreeze_lr_change,
         )
+        augment_config = validate_augmentation_args(
+            args.rotation,
+            args.brightness,
+            args.contrast,
+            args.saturation,
+        )
+        mixup_prob = validate_mixup_probability(args.mixup_prob)
+        focal_gamma = validate_focal_gamma(args.focal_gamma)
+        width_scale = validate_model_width_scale(args.model_width_scale)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -415,13 +463,32 @@ def main() -> None:
         val_counts = class_distribution(y_val, num_classes)
         print("Val samples:", y_val.size, " class_counts=", val_counts.tolist())
 
-    class_weights = make_class_weights(y_train, num_classes) if args.class_weighting else None
-    class_weights_tensor = None if class_weights is None else torch.as_tensor(class_weights, dtype=torch.float32, device=device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=float(args.label_smoothing))
+    inverse_frequency_weights = None
+    if args.class_weighting or args.focal_alpha == "auto":
+        inverse_frequency_weights = make_class_weights(y_train, num_classes)
+    ce_class_weights = None
+    if args.class_weighting and inverse_frequency_weights is not None:
+        ce_class_weights = torch.as_tensor(inverse_frequency_weights, dtype=torch.float32, device=device)
+    focal_alpha_weights = None
+    if args.focal_alpha == "auto" and inverse_frequency_weights is not None:
+        focal_alpha_weights = torch.as_tensor(inverse_frequency_weights, dtype=torch.float32, device=device)
+
+    mixup_disables_focal = bool(args.mixup and mixup_prob > 0.0)
+    use_focal_loss = bool(args.focal_loss and not mixup_disables_focal)
+    if args.focal_loss and mixup_disables_focal:
+        print("[info] Focal loss disabled for this run because MixUp is enabled.")
+
     input_size = config.INPUT_SIZE
 
-    model = TorchCNN(input_size=input_size, num_classes=num_classes, seed=args.seed, dropout_p=args.dropout)
+    model = TorchCNN(
+        input_size=input_size,
+        num_classes=num_classes,
+        seed=args.seed,
+        dropout_p=args.dropout,
+        width_scale=width_scale,
+    )
     model.to(device)
+    print(f"Using stage2_channels={model.stage2_channels} (width_scale={model.width_scale:.3f})")
     if args.init_from:
         try:
             model.load_weights(args.init_from, map_location=device)
@@ -429,7 +496,7 @@ def main() -> None:
         except Exception as exc:
             print(f"[warn] Strict load failed: {exc}")
             loaded, skipped = load_weights_forgiving(model, args.init_from, skip_prefixes=("fc2.",))
-            print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (e.g., classifier head)")
+            print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (for example, classifier or resized feature tensors)")
             model.to(device)
 
     batch_size = max(1, int(args.batch_size))
@@ -483,7 +550,7 @@ def main() -> None:
         model.train()
         epoch_backbone_frozen = backbone_frozen
         _apply_backbone_freeze_state(model, backbone_frozen=epoch_backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
-        permutation = build_balanced_epoch_indices(y_train, rng) if args.balance_sampling else rng.permutation(y_train.size)
+        permutation = rng.permutation(y_train.size)
         epoch_loss = 0.0
         epoch_correct = 0
 
@@ -498,7 +565,21 @@ def main() -> None:
             else:
                 x_batch = x_train[idx_batch]
             if args.augment:
-                x_batch = augment_batch(x_batch, rng)
+                x_batch = augment_batch(x_batch, rng, augment_config)
+
+            target_distribution = _make_target_distribution(
+                y_batch_idx,
+                num_classes,
+                label_smoothing=float(args.label_smoothing),
+            )
+            if args.mixup:
+                x_batch, target_distribution, _, _ = apply_mixup(
+                    x_batch,
+                    target_distribution,
+                    rng,
+                    prob=mixup_prob,
+                    beta_alpha=0.2,
+                )
 
             scheduled_lr = compute_phase_learning_rate(
                 base_lr=current_phase_base_lr,
@@ -522,25 +603,56 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             x_tensor = _to_tensor_batch(x_batch, device)
-            y_tensor = torch.as_tensor(y_batch_idx, dtype=torch.long, device=device)
+            y_tensor = torch.as_tensor(target_distribution, dtype=torch.float32, device=device)
             logits = model(x_tensor)
-            loss = criterion(logits, y_tensor)
+            loss = _compute_batch_loss(
+                logits,
+                y_tensor,
+                use_focal_loss=use_focal_loss,
+                focal_gamma=focal_gamma,
+                ce_class_weights=ce_class_weights,
+                focal_alpha_weights=focal_alpha_weights,
+            )
             loss.backward()
             if args.grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_([parameter for parameter in model.parameters() if parameter.requires_grad], max_norm=args.grad_clip)
             optimizer.step()
 
             epoch_loss += float(loss.item())
-            epoch_correct += int((torch.argmax(logits, dim=1) == y_tensor).sum().item())
+            metric_targets = torch.argmax(y_tensor, dim=1)
+            epoch_correct += int((torch.argmax(logits, dim=1) == metric_targets).sum().item())
 
         avg_loss = epoch_loss / max(1, num_batches)
         train_acc = epoch_correct / max(1, y_train.size)
 
         if y_val is not None and len(val_paths) > 0:
             if args.streaming or x_val is None:
-                val_loss, val_acc = evaluate_streaming(model, val_paths, y_val, num_classes, batch_size, input_size, device)
+                val_loss, val_acc = evaluate_streaming(
+                    model,
+                    val_paths,
+                    y_val,
+                    num_classes,
+                    batch_size,
+                    input_size,
+                    device,
+                    use_focal_loss=use_focal_loss,
+                    focal_gamma=focal_gamma,
+                    ce_class_weights=ce_class_weights,
+                    focal_alpha_weights=focal_alpha_weights,
+                )
             else:
-                val_loss, val_acc = evaluate_preloaded(model, x_val, y_val, batch_size, device)
+                val_loss, val_acc = evaluate_preloaded(
+                    model,
+                    x_val,
+                    y_val,
+                    num_classes,
+                    batch_size,
+                    device,
+                    use_focal_loss=use_focal_loss,
+                    focal_gamma=focal_gamma,
+                    ce_class_weights=ce_class_weights,
+                    focal_alpha_weights=focal_alpha_weights,
+                )
 
             improved = (val_loss < (best_val_loss - args.min_delta)) if args.early_stop_metric == "val_loss" else (val_acc > (best_val_acc + args.min_delta))
             if improved:

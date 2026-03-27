@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42, help="Random seed (used if no weights)")
     parser.add_argument("--data-dir", type=str, default=None, help="Dataset root used to resolve class labels")
     parser.add_argument("--class-count", type=int, default=None, help="Optional class-count override for model output size")
+    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
     args = parser.parse_args()
 
     image_path = Path(args.image)
@@ -54,7 +55,7 @@ def main() -> None:
     )
     x = x[np.newaxis, ...]  # (1, H, W, 3)
 
-    model = CNN(input_size=input_size, num_classes=num_classes, seed=args.seed)
+    model = CNN(input_size=input_size, num_classes=num_classes, seed=args.seed, width_scale=args.model_width_scale)
     if args.weights:
         weights_path = Path(args.weights)
         if weights_path.suffix != ".npz":

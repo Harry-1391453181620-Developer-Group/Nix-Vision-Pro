@@ -1,4 +1,11 @@
-"""CNN + SE classifier used by the active NumPy backend."""
+"""CNN + SE classifier used by the active NumPy backend.
+
+The stage-2 width is now configurable through a width scale so both training and
+inference can intentionally choose a smaller intermediate representation without
+hard-coding a single channel count into every entry point.
+"""
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple
@@ -7,6 +14,14 @@ import numpy as np
 
 from nn.activations import relu, relu_backward
 from nn.layers import BatchNorm2D, Conv2D, Dense, Dropout, MaxPool2D, SqueezeExcitation
+
+
+def _resolve_stage2_channels(width_scale: float) -> int:
+    """Convert a width multiplier into a safe integer stage-2 channel count."""
+    width_scale = float(width_scale)
+    if width_scale <= 0.0:
+        raise ValueError("width_scale must be > 0")
+    return max(8, int(round(64 * width_scale)))
 
 
 class CNN:
@@ -22,12 +37,15 @@ class CNN:
         num_classes: int,
         seed: int | None = None,
         dropout_p: float = 0.5,
+        width_scale: float = 0.75,
     ):
         if seed is not None:
             np.random.seed(seed)
         height, width = input_size
         if height < 8 or width < 8:
             raise ValueError("input_size must be at least (8, 8)")
+
+        stage2_channels = _resolve_stage2_channels(width_scale)
 
         self.conv1 = Conv2D(3, 32, (3, 3), stride=1, padding=1)
         self.bn1 = BatchNorm2D(32)
@@ -36,14 +54,16 @@ class CNN:
         self.se1 = SqueezeExcitation(32, reduction=4)
         self.pool1 = MaxPool2D((2, 2), stride=2)
 
-        self.conv3 = Conv2D(32, 64, (3, 3), stride=1, padding=1)
-        self.bn3 = BatchNorm2D(64)
-        self.conv4 = Conv2D(64, 64, (3, 3), stride=1, padding=1)
-        self.bn4 = BatchNorm2D(64)
-        self.se2 = SqueezeExcitation(64, reduction=4)
+        # Stage 2 is the width-scaled stage that now defaults to 48 channels.
+        self.conv3 = Conv2D(32, stage2_channels, (3, 3), stride=1, padding=1)
+        self.bn3 = BatchNorm2D(stage2_channels)
+        self.conv4 = Conv2D(stage2_channels, stage2_channels, (3, 3), stride=1, padding=1)
+        self.bn4 = BatchNorm2D(stage2_channels)
+        self.se2 = SqueezeExcitation(stage2_channels, reduction=4)
         self.pool2 = MaxPool2D((2, 2), stride=2)
 
-        self.conv5 = Conv2D(64, 128, (3, 3), stride=1, padding=1)
+        # Stage 3 keeps its output width stable so the dense head shape is unchanged.
+        self.conv5 = Conv2D(stage2_channels, 128, (3, 3), stride=1, padding=1)
         self.bn5 = BatchNorm2D(128)
         self.conv6 = Conv2D(128, 128, (3, 3), stride=1, padding=1)
         self.bn6 = BatchNorm2D(128)
@@ -61,6 +81,18 @@ class CNN:
         self._feature_shape = None
         self._backbone_frozen = False
         self._freeze_bn_affine = True
+        self._width_scale = float(width_scale)
+        self._stage2_channels = int(stage2_channels)
+
+    @property
+    def width_scale(self) -> float:
+        """Expose the configured width scale for tests and debugging."""
+        return self._width_scale
+
+    @property
+    def stage2_channels(self) -> int:
+        """Expose the resolved stage-2 channel count for tests and diagnostics."""
+        return self._stage2_channels
 
     def train(self) -> None:
         self._training = True

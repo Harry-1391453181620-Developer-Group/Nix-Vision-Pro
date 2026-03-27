@@ -1,4 +1,10 @@
-"""PyTorch CNN + SE backend model."""
+"""PyTorch CNN + SE backend model.
+
+The stage-2 width is now parameterized with a width scale so the project can use
+smaller intermediate feature maps without hard-coding a single architecture.
+Every entry point that constructs this model must therefore pass the same width
+scale that was used during training if it wants checkpoint shapes to match.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,18 @@ from typing import Iterable, Tuple
 import numpy as np
 import torch
 from torch import nn
+
+
+def _resolve_stage2_channels(width_scale: float) -> int:
+    """Convert a width multiplier into a safe integer channel count.
+
+    The base architecture uses 64 channels in stage 2. A scale of 0.75 therefore
+    maps to 48 channels, which is the requested default reduction.
+    """
+    width_scale = float(width_scale)
+    if width_scale <= 0.0:
+        raise ValueError("width_scale must be > 0")
+    return max(8, int(round(64 * width_scale)))
 
 
 class SqueezeExcitation(nn.Module):
@@ -28,7 +46,7 @@ class SqueezeExcitation(nn.Module):
 
 
 class TorchCNN(nn.Module):
-    """Three-stage CNN + SE classifier matching the active NumPy architecture."""
+    """Three-stage CNN + SE classifier matching the active project architecture."""
 
     def __init__(
         self,
@@ -36,6 +54,7 @@ class TorchCNN(nn.Module):
         num_classes: int,
         seed: int | None = None,
         dropout_p: float = 0.5,
+        width_scale: float = 0.75,
     ):
         super().__init__()
         if seed is not None:
@@ -45,6 +64,8 @@ class TorchCNN(nn.Module):
         if height < 8 or width < 8:
             raise ValueError("input_size must be at least (8, 8)")
 
+        stage2_channels = _resolve_stage2_channels(width_scale)
+
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
@@ -52,14 +73,16 @@ class TorchCNN(nn.Module):
         self.se1 = SqueezeExcitation(32, reduction=4)
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(64)
-        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm2d(64)
-        self.se2 = SqueezeExcitation(64, reduction=4)
+        # Stage 2 is the width-scaled stage. This is the main architecture knob.
+        self.conv3 = nn.Conv2d(32, stage2_channels, kernel_size=3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(stage2_channels)
+        self.conv4 = nn.Conv2d(stage2_channels, stage2_channels, kernel_size=3, stride=1, padding=1)
+        self.bn4 = nn.BatchNorm2d(stage2_channels)
+        self.se2 = SqueezeExcitation(stage2_channels, reduction=4)
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        self.conv5 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        # Stage 3 keeps its output width so the classifier head dimension stays stable.
+        self.conv5 = nn.Conv2d(stage2_channels, 128, kernel_size=3, stride=1, padding=1)
         self.bn5 = nn.BatchNorm2d(128)
         self.conv6 = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1)
         self.bn6 = nn.BatchNorm2d(128)
@@ -73,6 +96,18 @@ class TorchCNN(nn.Module):
 
         self._input_size = tuple(input_size)
         self._num_classes = int(num_classes)
+        self._width_scale = float(width_scale)
+        self._stage2_channels = int(stage2_channels)
+
+    @property
+    def width_scale(self) -> float:
+        """Expose the configured width scale for tests and debugging."""
+        return self._width_scale
+
+    @property
+    def stage2_channels(self) -> int:
+        """Expose the resolved stage-2 channel count for tests and diagnostics."""
+        return self._stage2_channels
 
     def backbone_modules(self) -> tuple[nn.Module, ...]:
         """Return the feature extractor modules affected by temporary freezing."""
