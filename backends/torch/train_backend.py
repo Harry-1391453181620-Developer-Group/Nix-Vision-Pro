@@ -95,6 +95,74 @@ def make_class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
     return weights
 
 
+def stable_partition_index(path: Path, num_parts: int) -> int:
+    """Hash a path into a stable partition id so repeated runs shard consistently."""
+    if num_parts <= 1:
+        return 0
+    digest = hashlib.md5(str(path.resolve()).lower().encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % num_parts
+
+
+def choose_partition(args) -> int:
+    """Resolve the active data partition, optionally rotating across runs."""
+    if not args.auto_next_partition:
+        return max(0, min(args.partition, max(0, args.num_partitions - 1)))
+    state_path = Path(args.partition_state)
+    state = {"num_partitions": args.num_partitions, "next": 0}
+    try:
+        if state_path.is_file():
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if int(loaded.get("num_partitions", -1)) == args.num_partitions:
+                state = loaded
+    except Exception:
+        pass
+    part = int(state.get("next", 0)) % max(1, args.num_partitions)
+    state["num_partitions"] = args.num_partitions
+    state["next"] = (part + 1) % max(1, args.num_partitions)
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
+    return part
+
+
+def _resolve_device(device_arg: str) -> torch.device:
+    """Resolve `cpu`, `cuda`, or `auto` into a concrete torch device."""
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit("--device=cuda requested, but CUDA is not available")
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr_value: float) -> None:
+    """Update every optimizer parameter group to the current effective LR."""
+    for group in optimizer.param_groups:
+        group["lr"] = lr_value
+
+
+def _to_tensor_batch(x_batch: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Convert a contiguous NHWC NumPy batch into a float32 torch tensor."""
+    return torch.from_numpy(np.ascontiguousarray(x_batch)).to(device=device, dtype=torch.float32)
+
+
+def _load_batch(paths: list[Path], input_size: tuple[int, int]) -> np.ndarray:
+    """Load and preprocess one batch of images from disk."""
+    batch = np.empty((len(paths), input_size[0], input_size[1], 3), dtype=np.float32)
+    for index, image_path in enumerate(paths):
+        image = load_image(image_path)
+        batch[index] = preprocess_image(
+            image,
+            target_size=input_size,
+            normalize_to=config.NORMALIZE_TO,
+            input_value_range=config.INPUT_VALUE_RANGE,
+        ).astype(np.float32)
+    return batch
+
+
 def _make_target_distribution(
     labels: np.ndarray,
     num_classes: int,

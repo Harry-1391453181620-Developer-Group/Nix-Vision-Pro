@@ -53,3 +53,20 @@ n\losses.py tests	est_losses.py tests	est_mixup_focal_width.py`
 - The first test attempt used the wrong interpreter and failed because `pytest` was not installed there. The rerun used the project virtualenv and passed.
 - Pytest still reports a cache-write warning in this environment because `.pytest_cache` cannot create its nested cache directory cleanly here.
 - Passive security review: no new high-severity security issues were introduced in the added CLI, checkpoint-loading, or loss-selection paths. The checkpoint readers still use explicit extension checks and NumPy loading remains `allow_pickle=False`.
+
+
+## Torch Trainer Repair
+
+- Investigated reported errors in `backends/torch/train_backend.py` using direct module inspection instead of only `py_compile`.
+- Found that a previous block replacement had accidentally removed these required helper functions from the file:
+  - `stable_partition_index`
+  - `choose_partition`
+  - `_resolve_device`
+  - `_set_optimizer_lr`
+  - `_to_tensor_batch`
+  - `_load_batch`
+- Restored the missing helper block without changing the newer focal-loss, MixUp, or width-scale logic.
+- Revalidated with:
+  - `.\.venv\Scripts\python.exe -c "import backends.torch.train_backend as m; ..."`
+  - `.\.venv\Scripts\python.exe -m py_compile backends	orch	rain_backend.py`
+  - `.\.venv\Scripts\python.exe -m pytest tests	est_training_policies.py tests	est_torch_model.py tests	est_mixup_focal_width.py -q`
