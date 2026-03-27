@@ -31,6 +31,7 @@ from utils.training import (
     validate_augmentation_args,
     validate_focal_gamma,
     validate_freeze_cycle_args,
+    validate_mixup_alpha,
     validate_mixup_probability,
     validate_model_width_scale,
     validate_phase_learning_rates,
@@ -396,7 +397,8 @@ def main() -> None:
     parser.add_argument("--focal-loss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--focal-gamma", type=float, default=1.5, help="Focal-loss gamma parameter")
     parser.add_argument("--focal-alpha", choices=["auto", "none"], default="auto", help="Focal alpha weighting policy")
-    parser.add_argument("--mixup", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mixup", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mixup-alpha", type=float, default=0.2, help="Alpha parameter for Beta(alpha, alpha) MixUp")
     parser.add_argument("--mixup-prob", type=float, default=0.5, help="Per-batch probability of applying MixUp")
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
@@ -462,6 +464,7 @@ def main() -> None:
             args.contrast,
             args.saturation,
         )
+        mixup_alpha = validate_mixup_alpha(args.mixup_alpha)
         mixup_prob = validate_mixup_probability(args.mixup_prob)
         focal_gamma = validate_focal_gamma(args.focal_gamma)
         width_scale = validate_model_width_scale(args.model_width_scale)
@@ -636,7 +639,7 @@ def main() -> None:
                     y_batch,
                     rng,
                     prob=mixup_prob,
-                    beta_alpha=0.2,
+                    beta_alpha=mixup_alpha,
                 )
                 x_batch = x_batch.astype(np.float64, copy=False)
                 y_batch = y_batch.astype(np.float64, copy=False)

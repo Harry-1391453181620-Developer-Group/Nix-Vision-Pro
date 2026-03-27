@@ -70,3 +70,26 @@ n\losses.py tests	est_losses.py tests	est_mixup_focal_width.py`
   - `.\.venv\Scripts\python.exe -c "import backends.torch.train_backend as m; ..."`
   - `.\.venv\Scripts\python.exe -m py_compile backends	orch	rain_backend.py`
   - `.\.venv\Scripts\python.exe -m pytest tests	est_training_policies.py tests	est_torch_model.py tests	est_mixup_focal_width.py -q`
+
+
+## Request
+
+Enabled MixUp by default in both training backends, added `--mixup-alpha` with default `0.2`, kept `--mixup-prob 0.5`, updated docs, and prepared a commit without touching `best_train_commands.txt`.
+
+## Work completed
+
+- Added `validate_mixup_alpha()` to `utils/training.py` so invalid Beta parameters fail fast before training starts.
+- Updated `backends/torch/train_backend.py` and `backends/numpy/train_backend.py` so `--mixup` now defaults to enabled, `--mixup-alpha` is exposed on the CLI, and the validated alpha value drives the existing MixUp helper.
+- Extended `tests/test_mixup_focal_width.py` to cover valid and invalid `mixup_alpha` values.
+- Updated `README.md` and `Image_Identify_CNN.md` so the documented defaults and example commands match the trainer behavior.
+- Wrote `docs/plans/2026-03-27-default-mixup-alpha-design.md` to capture the approved design delta for this follow-up change.
+
+## Validation
+
+- `.\.venv\Scripts\python.exe -m py_compile utils\training.py backends\torch\train_backend.py backends\numpy\train_backend.py tests\test_mixup_focal_width.py`
+- `.\.venv\Scripts\python.exe -m pytest tests\test_mixup_focal_width.py tests\test_training_policies.py -q`
+
+## Notes
+
+- Passive security review: this change only adjusts safe numeric CLI validation and loss-policy selection; it does not expand file, network, or deserialization attack surface.
+- Test warning: pytest still emitted the existing `.pytest_cache` directory warning in this environment.

@@ -95,6 +95,14 @@ def validate_mixup_probability(mixup_prob: float) -> float:
     return _validate_unit_interval("mixup_prob", mixup_prob)
 
 
+def validate_mixup_alpha(mixup_alpha: float) -> float:
+    """Validate the Beta(alpha, alpha) parameter used by MixUp."""
+    mixup_alpha = float(mixup_alpha)
+    if mixup_alpha <= 0.0:
+        raise ValueError("mixup_alpha must be > 0")
+    return mixup_alpha
+
+
 def validate_focal_gamma(focal_gamma: float) -> float:
     """Validate focal-loss gamma before either backend builds its loss path."""
     focal_gamma = float(focal_gamma)

@@ -84,14 +84,16 @@ Validation rules:
 
 New arguments:
 - `--mixup / --no-mixup`
+- `--mixup-alpha`
 - `--mixup-prob`
 - `--focal-loss / --no-focal-loss`
 - `--focal-gamma`
 - `--focal-alpha {auto,none}`
 
 Policy details:
-- MixUp uses `lam ~ Beta(0.2, 0.2)`
-- MixUp is applied per batch with probability `--mixup-prob`
+- MixUp defaults to enabled
+- MixUp uses `lam ~ Beta(--mixup-alpha, --mixup-alpha)` with default `--mixup-alpha 0.2`
+- MixUp is applied per batch with default probability `--mixup-prob 0.5`
 - focal loss defaults to `gamma=1.5`
 - `--focal-alpha auto` reuses inverse-frequency class weights as focal alpha
 - if MixUp is enabled for a run, focal loss is disabled automatically for that run and the trainer falls back to cross entropy for both train and validation loss reporting
@@ -143,16 +145,16 @@ The post-unfreeze LR rule now works on the current effective LR, not the phase b
 
 ## Recommended PyTorch Training Command
 
-This example keeps focal loss enabled and leaves MixUp disabled.
+This example keeps MixUp at its default-enabled setting and disables focal loss explicitly for clarity.
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.00015 --warmup-epochs 3 --batch-size 128 --streaming --optimizer adamw --weight-decay 4e-4 --dropout 0.35 --label-smoothing 0.1 --class-weighting --focal-loss --focal-gamma 1.5 --focal-alpha auto --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.02 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 5 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00008 --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from D:/Programing_materials/Python/python_Projects/Image_Identify_CNN/checkpoints/best_torch_model.pt
+python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.00015 --warmup-epochs 3 --batch-size 128 --streaming --optimizer adamw --weight-decay 4e-4 --dropout 0.35 --label-smoothing 0.1 --class-weighting --no-focal-loss --mixup --mixup-alpha 0.2 --mixup-prob 0.5 --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.02 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 5 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00008 --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from D:/Programing_materials/Python/python_Projects/Image_Identify_CNN/checkpoints/best_torch_model.pt
 ```
 
 ## NumPy Training Command
 
 ```powershell
-python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.3 --label-smoothing 0.1 --class-weighting --focal-loss --focal-gamma 1.5 --focal-alpha auto --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --checkpoint checkpoints/best_numpy_model.npz
+python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.3 --label-smoothing 0.1 --class-weighting --no-focal-loss --mixup --mixup-alpha 0.2 --mixup-prob 0.5 --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --checkpoint checkpoints/best_numpy_model.npz
 ```
 
 ## Key Training Arguments
@@ -179,6 +181,7 @@ python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-coun
 - `--focal-gamma`
 - `--focal-alpha {auto,none}`
 - `--mixup / --no-mixup`
+- `--mixup-alpha`
 - `--mixup-prob`
 - `--augment / --no-augment`
 - `--rotation`

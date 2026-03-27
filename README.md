@@ -43,7 +43,7 @@ The current dependency set covers the whole project:
 - Augmentation order is now `crop -> flip -> rotation -> color jitter -> random erasing`.
 - `--rotation`, `--brightness`, `--contrast`, and `--saturation` control augmentation strength directly.
 - Random erasing uses `p=0.3`, erases `10%-20%` of image area, and fills with the per-image channel mean.
-- `--mixup` and `--mixup-prob` enable Beta(0.2, 0.2) MixUp.
+- MixUp now defaults to enabled via `--mixup`, with `--mixup-alpha 0.2` and `--mixup-prob 0.5`. Use `--no-mixup` to disable it.
 - `--focal-loss`, `--focal-gamma`, and `--focal-alpha` replace the old balance-sampling path.
 - If MixUp is enabled for a run, focal loss is automatically disabled for that run and the trainer falls back to cross entropy.
 - Multiphase LR uses `--phase-count` and a list passed to `--lr`.
@@ -59,7 +59,7 @@ The current dependency set covers the whole project:
 Recommended PyTorch training command:
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.00015 --warmup-epochs 3 --batch-size 128 --streaming --optimizer adamw --weight-decay 4e-4 --dropout 0.35 --label-smoothing 0.1 --class-weighting --focal-loss --focal-gamma 1.5 --focal-alpha auto --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.02 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 5 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00008 --checkpoint checkpoints/best_torch_model.pt --device cuda
+python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.00015 --warmup-epochs 3 --batch-size 128 --streaming --optimizer adamw --weight-decay 4e-4 --dropout 0.35 --label-smoothing 0.1 --class-weighting --no-focal-loss --mixup --mixup-alpha 0.2 --mixup-prob 0.5 --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.02 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 5 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00008 --checkpoint checkpoints/best_torch_model.pt --device cuda
 ```
 
 Legacy NumPy training remains available:

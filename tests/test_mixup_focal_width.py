@@ -12,6 +12,7 @@ from utils.training import (
     apply_mixup,
     validate_augmentation_args,
     validate_focal_gamma,
+    validate_mixup_alpha,
     validate_mixup_probability,
     validate_model_width_scale,
 )
@@ -26,12 +27,15 @@ from backends.torch.train_backend import load_weights_forgiving as torch_load_we
 def test_validate_new_training_args():
     config = validate_augmentation_args(12.0, 0.2, 0.3, 0.4)
     assert config.rotation == pytest.approx(12.0)
+    assert validate_mixup_alpha(0.2) == pytest.approx(0.2)
     assert validate_mixup_probability(0.5) == pytest.approx(0.5)
     assert validate_focal_gamma(1.5) == pytest.approx(1.5)
     assert validate_model_width_scale(0.75) == pytest.approx(0.75)
 
     with pytest.raises(ValueError):
         validate_augmentation_args(180.0, 0.2, 0.2, 0.2)
+    with pytest.raises(ValueError):
+        validate_mixup_alpha(0.0)
     with pytest.raises(ValueError):
         validate_mixup_probability(1.5)
     with pytest.raises(ValueError):
