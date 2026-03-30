@@ -37,6 +37,6 @@ python.exe train.py `
 --mixup-alpha 0.2 `
 --mixup-prob 0.5 `
 --device cuda `
---class-count 61 `
+--class-count 62 `
 --checkpoint checkpoints/best_torch_model.pt `
 --init-from D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt
