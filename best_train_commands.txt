@@ -1,0 +1,40 @@
+python.exe train.py `
+--backend torch `
+--data-dir Dataset `
+--epochs 100 `
+--phase-count 2 `
+--lr 0.0004 0.0002 `
+--warmup-epochs 3 `
+--batch-size 64 `
+--streaming `
+--optimizer adamw `
+--weight-decay 2e-4 `
+--dropout 0.25 `
+--label-smoothing 0.0 `
+--augment `
+--lr-schedule cosine `
+--min-lr-ratio 0.05 `
+--grad-clip 5.0 `
+--early-stop `
+--early-stop-metric val_acc `
+--patience 20 `
+--min-delta 0.001 `
+--freeze-bn-affine false `
+--freeze-patience 5 `
+--freeze-epoch-num 6 `
+--after-unfreeze-lr-change 0.00004 `
+--focal-loss `
+--focal-gamma 1.5 `
+--focal-alpha auto `
+--rotation 12 `
+--brightness 0.2 `
+--contrast 0.2 `
+--saturation 0.2 `
+--model-width-scale 0.75 `
+--mixup `
+--mixup-alpha 0.2 `
+--mixup-prob 0.5 `
+--device cuda `
+--class-count 61 `
+--checkpoint checkpoints/best_torch_model.pt `
+--init-from D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt
