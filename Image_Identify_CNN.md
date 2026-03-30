@@ -143,19 +143,9 @@ That keeps BN affine parameters trainable while BN running statistics remain fro
 
 The post-unfreeze LR rule now works on the current effective LR, not the phase base LR, so cosine decay is preserved and the deduction remains cumulative inside the phase.
 
-## Recommended PyTorch Training Command
+## Recommended Training Command
 
-This example keeps MixUp at its default-enabled setting and disables focal loss explicitly for clarity.
-
-```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.00015 --warmup-epochs 3 --batch-size 128 --streaming --optimizer adamw --weight-decay 4e-4 --dropout 0.35 --label-smoothing 0.1 --class-weighting --no-focal-loss --mixup --mixup-alpha 0.2 --mixup-prob 0.5 --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.02 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 5 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00008 --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from D:/Programing_materials/Python/python_Projects/Image_Identify_CNN/checkpoints/best_torch_model.pt
-```
-
-## NumPy Training Command
-
-```powershell
-python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.3 --label-smoothing 0.1 --class-weighting --no-focal-loss --mixup --mixup-alpha 0.2 --mixup-prob 0.5 --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --checkpoint checkpoints/best_numpy_model.npz
-```
+- See in best_train_commands.txt
 
 ## Key Training Arguments
 
