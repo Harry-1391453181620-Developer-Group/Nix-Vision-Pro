@@ -13,7 +13,6 @@ from nn.layers import (
     SqueezeExcitation,
 )
 from nn.losses import cross_entropy_loss, cross_entropy_loss_backward
-from nn.mamba import MambaBlock
 from nn.optimizers import AdamW, SGD
 
 __all__ = [
@@ -31,7 +30,6 @@ __all__ = [
     "Dropout",
     "GlobalAveragePool2D",
     "LayerNorm",
-    "MambaBlock",
     "MaxPool2D",
     "SqueezeExcitation",
     "cross_entropy_loss",

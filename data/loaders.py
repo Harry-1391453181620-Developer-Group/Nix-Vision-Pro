@@ -1,4 +1,4 @@
-﻿"""
+"""
 Load images from disk using Pillow and return as np.ndarray (H, W, 3).
 Memory-aware and transparency-safe.
 """
@@ -50,11 +50,9 @@ def _downscale_for_memory(img: Image.Image, max_image_mb: float, min_side: int) 
     mb = (w * h * 3 * 8) / (1024 * 1024)
     if mb <= max_image_mb:
         return img
-    # Target area so that float64 bytes ~= max_image_mb
     target_area = (max_image_mb * 1024 * 1024) / (3 * 8)
     cur_area = w * h
     scale = math.sqrt(target_area / cur_area)
-    # Respect min_side guard
     new_w = max(min_side, int(w * scale))
     new_h = max(min_side, int(h * scale))
     if new_w < w or new_h < h:
@@ -76,14 +74,11 @@ def load_image(path: Union[str, Path]) -> np.ndarray:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Image not found: {path}")
-    img = Image.open(path)
-    img = _to_rgb_safe(img)
-    # First, bound by side length; then reduce further if float64 conversion would exceed cap
-    img = _downscale_if_needed(img, _MAX_SIDE)
-    img = _downscale_for_memory(img, _MAX_IMAGE_MB, _MIN_SIDE)
-    # Keep test-facing API: float64 in [0,255]
-    arr = np.array(img, dtype=np.float64)
-    return arr
+    with Image.open(path) as opened:
+        img = _to_rgb_safe(opened)
+        img = _downscale_if_needed(img, _MAX_SIDE)
+        img = _downscale_for_memory(img, _MAX_IMAGE_MB, _MIN_SIDE)
+        return np.array(img, dtype=np.float64)
 
 
 def load_images_from_dir(

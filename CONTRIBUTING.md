@@ -20,11 +20,12 @@ python -m pip install -r requirements.txt
 - `backends/numpy/` contains the preserved legacy NumPy backend.
 - `utils/training.py` contains shared augmentation and phase-schedule policy.
 - Top-level `train.py`, `predict.py`, `gui.py`, and `model.py` are compatibility and dispatch entrypoints.
+- The supported dataset contract is `Dataset/<class_name>/*`; keep training and inference aligned with that layout.
 
 ## Contribution Rules
 
 - Keep the original project structure intact; do not remove the NumPy backend.
-- Preserve the current high-level model architecture unless a change is explicitly requested.
+- Preserve the current high-level CNN architecture unless a change is explicitly requested.
 - Write clear, detailed comments in code changes.
 - Keep security and reliability ahead of convenience.
 - Update the daily history file under `Agent_History/Daily/` for every substantive change.
@@ -58,7 +59,7 @@ Examples:
 ```powershell
 .\.venv\Scripts\python.exe train.py --help
 .\.venv\Scripts\python.exe predict.py --help
-.\.venv\Scripts\python.exe -m pytest tests -v
+.\.venv\Scripts\python.exe -m pytest tests -v -p no:cacheprovider
 ```
 
 ## Documentation
@@ -68,5 +69,6 @@ If you change behavior, update the relevant documents:
 - `Image_Identify_CNN.md`
 - `docs/plans/YYYY-MM-DD-*.md` when a design is approved
 - `Agent_History/Daily/YYYY/MM/DD_history.md`
+- `Agent_History/Monthly/YYYY/MM_summary.md` when writing the month-end summary
 
 Keep instruction documents unchanged unless the project owner explicitly changes project policy.

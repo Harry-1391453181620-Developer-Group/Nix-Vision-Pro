@@ -8,6 +8,7 @@ The project uses `PyTorch` as the default backend and keeps the original `NumPy`
 - Recommended interpreter: `./.venv/Scripts/python.exe`
 - Default backend: `torch`
 - Legacy backend: `numpy`
+- Active dataset source: real images stored under `Dataset/` by default
 
 ## Active Architecture
 
@@ -22,7 +23,7 @@ Width scaling is controlled by `--model-width-scale`.
 - default `0.75` gives stage-2 width `48`
 - use `--model-width-scale 1.0` for older checkpoints trained with stage-2 width `64`
 
-`Mamba` is no longer used by the active model paths.
+The old Mamba implementation has been removed because it was no longer part of the active model path.
 
 ## Environment Setup
 
@@ -36,17 +37,14 @@ python -m pip install -r requirements.txt
 
 ```text
 Dataset/
-  airplane/
-  bird/
-  cat/
-  deer/
-  dog/
-  frog/
-  horse/
-  ship/
+  class_name_1/
+  class_name_2/
+  ...
 ```
 
 Each class should be a directory. Training auto-detects the class count from `Dataset/`; use `--class-count` only when you need to override the detected output size.
+
+The repository no longer ships synthetic or Wikimedia dataset-builder scripts. Current training and inference operate on the real image dataset only.
 
 ## Global Backend Switch
 
@@ -54,7 +52,7 @@ Each class should be a directory. Training auto-detects the class count from `Da
 --backend {torch,numpy}
 ```
 
-## New Training Behavior
+## Training Behavior
 
 ### RandAugment
 

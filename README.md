@@ -15,6 +15,7 @@ Default width scale is `0.75`, so the active stage-2 width is `48`. Use `--model
 - Virtual environment: `.venv`
 - Default backend: `torch`
 - Legacy backend: `numpy`
+- Active training data source: real image files under `Dataset/` or an explicit `--data-dir`
 
 ## Install
 
@@ -37,6 +38,11 @@ The current dependency set covers the whole project:
 - `predict.py` - backend-dispatching inference entrypoint
 - `gui.py` - backend-dispatching GUI entrypoint
 - `model.py` - compatibility facade exposing the default model class
+
+## Dataset Contract
+
+Training and inference read labeled image files from `Dataset/<class_name>/...` by default.
+This repository no longer includes built-in synthetic or Wikimedia dataset builders because they were stale with the current 62-class dataset layout and were not part of the runtime path.
 
 ## Training Policy Highlights
 

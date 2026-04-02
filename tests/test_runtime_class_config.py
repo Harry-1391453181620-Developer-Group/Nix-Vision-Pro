@@ -1,4 +1,4 @@
-"""Regression tests for runtime class discovery and dataset-builder class resolution."""
+"""Regression tests for runtime class discovery from the active dataset layout."""
 
 from __future__ import annotations
 
@@ -8,11 +8,8 @@ from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
 
-import pytest
-
 import config
-from build_synthetic_dataset import resolve_synthetic_class_names
-from build_wikimedia_dataset import DEFAULT_CLASS_SOURCES, resolve_wikimedia_class_sources
+
 
 _TEST_TMP_ROOT = Path('.pytest-tmp') / 'runtime_case_dirs'
 _TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -31,62 +28,36 @@ def _dataset_dir() -> Iterator[Path]:
 
 def _touch_image(path: Path) -> None:
     """Create a tiny placeholder image file for suffix-based dataset detection tests."""
-    path.write_bytes(b"test")
+    path.write_bytes(b'test')
 
 
 def test_get_class_names_detects_only_non_empty_class_dirs() -> None:
     with _dataset_dir() as dataset_root:
-        for class_name in ("ship", "cat"):
+        for class_name in ('ship', 'cat'):
             class_dir = dataset_root / class_name
             class_dir.mkdir()
-            _touch_image(class_dir / "sample.jpg")
-        (dataset_root / "empty_class").mkdir()
+            _touch_image(class_dir / 'sample.jpg')
+        (dataset_root / 'empty_class').mkdir()
 
         class_names = config.get_class_names(dataset_root, require_images=True)
 
-        assert class_names == ["cat", "ship"]
+        assert class_names == ['cat', 'ship']
         assert config.get_num_classes(dataset_root, require_images=True) == 2
 
 
 def test_get_class_names_pads_when_class_count_is_larger() -> None:
     with _dataset_dir() as dataset_root:
-        for class_name in ("bird", "dog"):
+        for class_name in ('bird', 'dog'):
             class_dir = dataset_root / class_name
             class_dir.mkdir()
-            _touch_image(class_dir / "sample.jpg")
+            _touch_image(class_dir / 'sample.jpg')
 
         class_names = config.get_class_names(dataset_root, class_count=4, require_images=True)
 
-        assert class_names == ["bird", "dog", "2", "3"]
+        assert class_names == ['bird', 'dog', '2', '3']
         assert config.get_num_classes(dataset_root, class_count=4, require_images=True) == 4
 
 
-def test_synthetic_builder_uses_dataset_subset() -> None:
-    with _dataset_dir() as dataset_root:
-        for class_name in ("dog", "cat"):
-            (dataset_root / class_name).mkdir()
-
-        assert resolve_synthetic_class_names(dataset_root) == ["cat", "dog"]
-
-
-def test_wikimedia_builder_uses_dataset_subset() -> None:
-    with _dataset_dir() as dataset_root:
-        for class_name in ("ship", "airplane"):
-            (dataset_root / class_name).mkdir()
-
-        class_sources = resolve_wikimedia_class_sources(dataset_root)
-
-        assert class_sources == {
-            "airplane": DEFAULT_CLASS_SOURCES["airplane"],
-            "ship": DEFAULT_CLASS_SOURCES["ship"],
-        }
-
-
-def test_builder_resolvers_reject_unsupported_dataset_classes() -> None:
-    with _dataset_dir() as dataset_root:
-        (dataset_root / "unknown_class").mkdir()
-
-        with pytest.raises(SystemExit):
-            resolve_synthetic_class_names(dataset_root)
-        with pytest.raises(SystemExit):
-            resolve_wikimedia_class_sources(dataset_root)
+def test_get_class_names_falls_back_when_dataset_root_is_missing() -> None:
+    class_names = config.get_class_names(Path('.pytest-tmp') / 'missing_dataset_root')
+    assert class_names == config.DEFAULT_CLASS_NAMES

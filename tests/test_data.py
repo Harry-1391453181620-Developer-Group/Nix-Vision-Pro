@@ -1,7 +1,9 @@
 """Unit tests for data loaders and preprocessing."""
 
+import shutil
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -11,10 +13,14 @@ from data.loaders import load_image, load_images_from_dir
 from data.preprocessing import batch_preprocess, normalize, preprocess_image, resize
 
 
+_TEST_TMP_ROOT = Path('.pytest-tmp') / 'data_tests'
+_TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+
 def test_load_image_creates_ndarray():
     """load_image returns ndarray (H, W, 3) with values in [0, 255]."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        img = Image.new("RGB", (10, 8), color=(100, 150, 200))
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+        img = Image.new('RGB', (10, 8), color=(100, 150, 200))
         img.save(f.name)
         path = f.name
     try:
@@ -64,14 +70,18 @@ def test_batch_preprocess_stacks():
 def test_load_image_nonexistent_raises():
     """load_image raises FileNotFoundError for missing file."""
     with pytest.raises(FileNotFoundError):
-        load_image("/nonexistent/path/image.png")
+        load_image('/nonexistent/path/image.png')
 
 
 def test_load_images_from_dir_empty_or_missing():
     """load_images_from_dir on empty dir returns empty lists."""
-    with tempfile.TemporaryDirectory() as d:
-        images, paths = load_images_from_dir(d)
+    temp_dir = _TEST_TMP_ROOT / uuid4().hex
+    temp_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        images, paths = load_images_from_dir(temp_dir)
         assert images == []
         assert paths == []
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
     with pytest.raises(NotADirectoryError):
-        load_images_from_dir("/nonexistent/dir")
+        load_images_from_dir('/nonexistent/dir')
