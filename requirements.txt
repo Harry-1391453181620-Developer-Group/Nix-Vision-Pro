@@ -12,5 +12,3 @@ opencv-python>=4.10.0
 
 # Test runner.
 pytest>=9.0
-
-pillow

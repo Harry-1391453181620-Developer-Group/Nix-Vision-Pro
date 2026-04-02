@@ -1,45 +1,113 @@
-python.exe train.py `
---backend torch `
---data-dir Dataset `
---epochs 100 `
---phase-count 2 `
---lr 0.0004 0.0002 `
---warmup-epochs 3 `
---batch-size 64 `
---streaming `
---optimizer adamw `
---seed 42 `
---weight-decay 2e-4 `
---dropout 0.3 `
---label-smoothing 0.05 `
---augment `
---no-class-weighting `
---lr-schedule cosine `
---min-lr-ratio 0.08 `
---grad-clip 5.0 `
---early-stop `
---early-stop-metric val_acc `
---patience 20 `
---min-delta 0.001 `
---freeze-bn-affine false `
---freeze-patience 8 `
---freeze-epoch-num 6 `
---after-unfreeze-lr-change 0.00004 `
---focal-loss `
---focal-gamma 1.8 `
---focal-alpha auto `
---rotation 12 `
---brightness 0.2 `
---contrast 0.2 `
---saturation 0.2 `
---model-width-scale 1.5 `
---mixup `
---mixup-alpha 0.1 `
---mixup-prob 0.4 `
---cutmix-ratio 0.5 `
---ema `
---ema-decay 0.999 `
---device cuda `
---class-count 62 `
---checkpoint checkpoints/best_torch_model.pt `
---init-from D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt
+$args = @(
+
+# =========================
+# Basic Settings
+# =========================
+"--backend", "torch",
+"--data-dir", "Dataset",
+"--device", "cuda",
+"--seed", "42",
+"--class-count", "62",
+
+# =========================
+# Training Settings
+# =========================
+"--epochs", "100",
+"--phase-count", "2",
+"--batch-size", "64",
+"--streaming",
+
+# =========================
+# Learning Rate
+# =========================
+"--lr", "0.0004", "0.0002",
+"--lr-schedule", "cosine",
+"--min-lr-ratio", "0.03",
+"--warmup-epochs", "3",
+"--after-unfreeze-lr-change", "0.00004",
+
+# Unused
+# "--step-size", "10",
+# "--gamma", "0.5",
+
+# =========================
+# Optimizer
+# =========================
+"--optimizer", "adamw",
+"--weight-decay", "2e-4",
+# "--momentum", "0.9",
+
+# =========================
+# Regularization
+# =========================
+"--dropout", "0.2",
+"--label-smoothing", "0.07",
+"--grad-clip", "5.0",
+"--no-class-weighting",
+"--no-focal-loss",
+
+# Unused
+# "--focal-gamma", "1.8",
+# "--focal-alpha", "auto",
+
+# =========================
+# RandAugment + Mix
+# =========================
+"--augment",
+"--rotation", "12",
+"--brightness", "0.2",
+"--contrast", "0.2",
+"--saturation", "0.2",
+
+# Mixup
+"--mixup",
+"--mixup-alpha", "0.25",
+"--mixup-prob", "0.35",
+"--cutmix-ratio", "0.5",
+
+# =========================
+# Model Settings
+# =========================
+"--model-width-scale", "1.5",
+"--freeze-bn-affine", "false",
+
+# =========================
+# Freeze / Unfreeze
+# =========================
+"--freeze-patience", "9",
+"--freeze-epoch-num", "6",
+
+# =========================
+# EMA
+# =========================
+"--ema",
+"--ema-decay", "0.998",
+
+# =========================
+# Early Stopping
+# =========================
+"--early-stop",
+"--early-stop-metric", "val_acc",
+"--patience", "20",
+"--min-delta", "0.001",
+
+# =========================
+# Checkpoint
+# =========================
+"--checkpoint", "checkpoints/best_torch_model.pt",
+"--init-from", "D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt",
+
+# =========================
+# Unused parameters
+# =========================
+# "--help-md",
+# "--val-split", "0.2",
+# "--allow-unlabeled-root",
+# "--num-partitions", "1",
+# "--partition", "0",
+# "--auto-next-partition",
+# "--partition-state", "checkpoints/partition_state.json",
+# "--enforce-readonly-dataset"
+)
+
+python.exe train.py @args

@@ -1,5 +1,6 @@
 # Virtual environment
 .venv/
+.venv312/
 venv/
 env/
 
@@ -61,4 +62,3 @@ pytest-cache-files-*/
 *.log
 
 tmp_build_synth.txt
-
