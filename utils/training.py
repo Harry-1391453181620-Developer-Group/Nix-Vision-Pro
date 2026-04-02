@@ -1,23 +1,23 @@
 """Shared training policies used by both NumPy and PyTorch backends.
 
-This module centralizes augmentation, argument validation, MixUp, and
-phase-based learning-rate logic so the two maintained backends stay aligned.
-The helpers intentionally stay in NumPy/Pillow space because the two trainers
-still load and preprocess images before backend-specific tensor conversion.
+This module centralizes RandAugment, batch-mixing, EMA, and phase-based
+learning-rate logic so the two maintained backends stay aligned. The helpers
+intentionally stay in NumPy/Pillow space because the two trainers still load and
+preprocess images before backend-specific tensor conversion.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
-from PIL import Image
-
-from data.preprocessing import resize
+from PIL import Image, ImageEnhance, ImageOps
 
 
 EPS = 1e-12
+RANDAUGMENT_LAYERS = 2
+RANDAUGMENT_LEVEL = 0.9
 
 
 @dataclass(frozen=True)
@@ -37,15 +37,76 @@ class PhaseConfig:
 class AugmentationConfig:
     """Resolved augmentation strengths shared by both training backends.
 
-    The numeric values are strengths, not probabilities. When a strength is
-    zero, that transform is disabled. Otherwise the transform is applied with a
-    random factor sampled from the documented range for that strength.
+    RandAugment samples from a fixed op pool, but the operation magnitudes still
+    come from the user-facing CLI strengths so both backends share the same
+    limits for geometry and photometric changes.
     """
 
     rotation: float = 12.0
     brightness: float = 0.2
     contrast: float = 0.2
     saturation: float = 0.2
+    randaugment_layers: int = RANDAUGMENT_LAYERS
+
+
+class ModelEMA:
+    """Maintain an EMA copy of a model, including floating buffers.
+
+    The EMA model is a real model instance so validation and checkpoint saves can
+    operate on it directly. EMA updates blend floating-point entries from the
+    full `state_dict`, while non-floating values such as integer counters are
+    copied exactly to avoid invalid interpolation.
+    """
+
+    def __init__(self, ema_model: Any, decay: float, phase_warmup_steps: int = 0):
+        self.ema_model = ema_model
+        self.decay = validate_ema_decay(decay)
+        self.phase_warmup_steps = max(0, int(phase_warmup_steps))
+        self.num_updates = 0
+
+    def sync_from(self, model: Any) -> None:
+        """Reset the EMA model to match the current live model exactly."""
+        ema_state = self.ema_model.state_dict()
+        model_state = model.state_dict()
+        if list(ema_state.keys()) != list(model_state.keys()):
+            raise ValueError("EMA model state does not match source model state")
+        for key in ema_state:
+            _copy_state_value_inplace(ema_state[key], model_state[key])
+        if hasattr(self.ema_model, "eval"):
+            self.ema_model.eval()
+
+    def _compute_effective_decay(self, step_in_phase: int, mix_active: bool) -> float:
+        """Lower EMA decay briefly at each phase start so EMA can catch up.
+
+        The first EMA window of each phase ramps from 0.9 up to the configured
+        base decay. Mixed batches reduce the decay slightly again because their
+        parameter updates are intentionally noisier.
+        """
+        decay = float(self.decay)
+        if self.phase_warmup_steps > 0 and 0 <= int(step_in_phase) < self.phase_warmup_steps and decay > 0.9:
+            progress = (int(step_in_phase) + 1) / self.phase_warmup_steps
+            warmup_decay = 0.9 + (decay - 0.9) * progress
+            decay = min(decay, warmup_decay)
+        if mix_active:
+            decay *= 0.999
+        return float(min(max(decay, 0.0), 0.999999))
+
+    def update(self, model: Any, *, step_in_phase: int, mix_active: bool) -> float:
+        """Blend the current live model state into the EMA model."""
+        decay = self._compute_effective_decay(step_in_phase=step_in_phase, mix_active=mix_active)
+        ema_state = self.ema_model.state_dict()
+        model_state = model.state_dict()
+        if list(ema_state.keys()) != list(model_state.keys()):
+            raise ValueError("EMA model state does not match source model state")
+        for key in ema_state:
+            if _is_floating_state_value(model_state[key]):
+                _blend_state_value_inplace(ema_state[key], model_state[key], decay)
+            else:
+                _copy_state_value_inplace(ema_state[key], model_state[key])
+        self.num_updates += 1
+        if hasattr(self.ema_model, "eval"):
+            self.ema_model.eval()
+        return decay
 
 
 def parse_bool_flag(value: bool | str) -> bool:
@@ -74,11 +135,7 @@ def validate_augmentation_args(
     contrast: float,
     saturation: float,
 ) -> AugmentationConfig:
-    """Validate user-facing augmentation strengths before training starts.
-
-    Rotation is an angle bound in degrees. The photometric values are strength
-    values inside [0, 1], where the runtime factor is sampled from [1-s, 1+s].
-    """
+    """Validate user-facing augmentation strengths before training starts."""
     rotation = float(rotation)
     if not (0.0 <= rotation < 180.0):
         raise ValueError("rotation must satisfy 0 <= value < 180")
@@ -91,12 +148,17 @@ def validate_augmentation_args(
 
 
 def validate_mixup_probability(mixup_prob: float) -> float:
-    """Validate the per-batch MixUp activation probability."""
+    """Validate the per-batch mix activation probability."""
     return _validate_unit_interval("mixup_prob", mixup_prob)
 
 
+def validate_cutmix_ratio(cutmix_ratio: float) -> float:
+    """Validate the conditional probability of choosing CutMix over MixUp."""
+    return _validate_unit_interval("cutmix_ratio", cutmix_ratio)
+
+
 def validate_mixup_alpha(mixup_alpha: float) -> float:
-    """Validate the Beta(alpha, alpha) parameter used by MixUp."""
+    """Validate the shared Beta(alpha, alpha) parameter used by MixUp and CutMix."""
     mixup_alpha = float(mixup_alpha)
     if mixup_alpha <= 0.0:
         raise ValueError("mixup_alpha must be > 0")
@@ -139,12 +201,7 @@ def validate_freeze_cycle_args(
     freeze_epoch_num: int,
     after_unfreeze_lr_change: float,
 ) -> tuple[int, int, float]:
-    """Validate the timed-freeze configuration before training starts.
-
-    The LR decrement is additive, so only non-negative values are allowed. The
-    actual deduction is guarded separately to ensure the resulting effective LR
-    stays above the scheduler floor and the next phase LR when that bound exists.
-    """
+    """Validate the timed-freeze configuration before training starts."""
     freeze_patience = int(freeze_patience)
     freeze_epoch_num = int(freeze_epoch_num)
     after_unfreeze_lr_change = float(after_unfreeze_lr_change)
@@ -157,18 +214,57 @@ def validate_freeze_cycle_args(
     return freeze_patience, freeze_epoch_num, after_unfreeze_lr_change
 
 
+def validate_ema_decay(ema_decay: float) -> float:
+    """Validate EMA decay before either backend enables EMA."""
+    ema_decay = float(ema_decay)
+    if not (0.0 < ema_decay < 1.0):
+        raise ValueError("ema_decay must satisfy 0 < value < 1")
+    return ema_decay
+
+
+def _is_floating_state_value(value: Any) -> bool:
+    """Return whether a checkpoint entry is safe to EMA-blend."""
+    if hasattr(value, "is_floating_point"):
+        try:
+            return bool(value.is_floating_point())
+        except TypeError:
+            pass
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        return False
+    try:
+        return bool(np.issubdtype(dtype, np.floating))
+    except TypeError:
+        return False
+
+
+def _copy_state_value_inplace(target: Any, source: Any) -> None:
+    """Copy one state entry into another without breaking storage sharing."""
+    if hasattr(target, "copy_"):
+        source_value = source.detach() if hasattr(source, "detach") else source
+        target.copy_(source_value)
+        return
+    target[...] = np.asarray(source, dtype=target.dtype)
+
+
+def _blend_state_value_inplace(target: Any, source: Any, decay: float) -> None:
+    """Blend one floating state entry into another in place."""
+    if hasattr(target, "mul_") and hasattr(target, "add_"):
+        source_value = source.detach() if hasattr(source, "detach") else source
+        target.mul_(decay)
+        target.add_(source_value.to(device=target.device, dtype=target.dtype), alpha=1.0 - decay)
+        return
+    source_value = np.asarray(source, dtype=target.dtype)
+    target[...] = decay * target + (1.0 - decay) * source_value
+
+
 def compute_effective_learning_rate(
     scheduled_lr: float,
     phase_lr_offset: float,
     phase_base_lr: float,
     min_lr_ratio: float,
 ) -> float:
-    """Convert the scheduler LR into the effective optimizer LR.
-
-    Cosine or step scheduling still operates on the configured phase base LR.
-    Temporary post-unfreeze deductions are represented as a cumulative offset and
-    are applied after scheduling, with a floor at `phase_base_lr * min_lr_ratio`.
-    """
+    """Convert the scheduler LR into the effective optimizer LR."""
     scheduled_lr = float(scheduled_lr)
     phase_lr_offset = float(phase_lr_offset)
     phase_base_lr = float(phase_base_lr)
@@ -186,17 +282,7 @@ def adjust_phase_lr_offset_after_unfreeze(
     next_phase_start_lr: float | None,
     eps: float = EPS,
 ) -> tuple[float, bool]:
-    """Apply the additive post-unfreeze LR deduction when it is still useful.
-
-    Rules:
-    - only deduct when the current effective LR is still meaningfully above the
-      scheduler floor (`> 2 * min_lr`)
-    - the candidate LR after deduction must stay strictly positive
-    - if a next phase exists, the candidate LR must stay at or above the next
-      phase start LR, with a small epsilon for float robustness
-    - the cumulative offset is capped so the effective LR can never undercut the
-      next phase start LR, or the scheduler floor in the final phase
-    """
+    """Apply the additive post-unfreeze LR deduction when it is still useful."""
     current_effective_lr = float(current_effective_lr)
     phase_lr_offset = float(phase_lr_offset)
     after_unfreeze_lr_change = float(after_unfreeze_lr_change)
@@ -259,11 +345,7 @@ def compute_phase_learning_rate(
     batch_index: int,
     num_batches: int,
 ) -> float:
-    """Compute the active LR for one batch inside a single phase.
-
-    Warmup runs first inside each phase, then the requested schedule takes over.
-    Cosine scheduling intentionally restarts from the phase base LR.
-    """
+    """Compute the active LR for one batch inside a single phase."""
     if num_batches <= 0:
         raise ValueError("num_batches must be > 0")
     base_lr = float(base_lr)
@@ -271,7 +353,6 @@ def compute_phase_learning_rate(
     step_in_phase = int(epoch_index_in_phase) * int(num_batches) + int(batch_index)
     warmup_steps = max(0, min(int(warmup_epochs), int(epochs_in_phase)) * int(num_batches))
 
-    # Warmup ramps linearly from 10% of the phase base LR up to the base LR.
     if warmup_steps > 0 and step_in_phase < warmup_steps:
         progress = (step_in_phase + 1) / warmup_steps
         return float(base_lr * (0.1 + 0.9 * progress))
@@ -295,82 +376,19 @@ def compute_phase_learning_rate(
     return float(base_lr * (float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * cosine))
 
 
-def random_resized_crop_batch(
-    x: np.ndarray,
-    rng: np.random.Generator,
-    scale: tuple[float, float] = (0.6, 1.0),
-    ratio: tuple[float, float] = (3 / 4, 4 / 3),
-) -> np.ndarray:
-    """Apply torchvision-style random resized crop and resize back to input size."""
-    batch_size, height, width, _ = x.shape
-    out = np.empty_like(x)
-    for index in range(batch_size):
-        area = height * width
-        applied = False
-        for _ in range(10):
-            target_area = float(area) * float(rng.uniform(scale[0], scale[1]))
-            log_ratio = (np.log(ratio[0]), np.log(ratio[1]))
-            aspect = float(np.exp(rng.uniform(*log_ratio)))
-            crop_h = int(round(np.sqrt(target_area * aspect)))
-            crop_w = int(round(np.sqrt(target_area / aspect)))
-            if 1 <= crop_h <= height and 1 <= crop_w <= width:
-                y0 = int(rng.integers(0, max(1, height - crop_h + 1)))
-                x0 = int(rng.integers(0, max(1, width - crop_w + 1)))
-                crop = x[index, y0 : y0 + crop_h, x0 : x0 + crop_w, :]
-                crop_u8 = np.clip(crop * 255.0, 0, 255).astype(np.uint8)
-                out[index] = np.asarray(resize(crop_u8, (height, width)), dtype=np.float32) / 255.0
-                applied = True
-                break
-        if not applied:
-            out[index] = x[index]
-    return out
+def _to_pil_image(image: np.ndarray) -> Image.Image:
+    """Convert one normalized float image into a PIL image for RandAugment ops."""
+    image_u8 = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(image_u8)
 
 
-def _rotate_image_reflect(image: np.ndarray, angle_degrees: float) -> np.ndarray:
-    """Rotate one image with reflection padding, centered rotation, and bilinear resampling."""
-    height, width, _ = image.shape
-    pad = int(np.ceil(max(height, width) * (np.sqrt(2.0) - 1.0) / 2.0)) + 2
-    padded = np.pad(image, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
-    padded_u8 = np.clip(padded * 255.0, 0, 255).astype(np.uint8)
-    pil = Image.fromarray(padded_u8)
-    center = (padded.shape[1] / 2.0, padded.shape[0] / 2.0)
-    rotated = pil.rotate(
-        float(angle_degrees),
-        resample=Image.BILINEAR,
-        expand=False,
-        center=center,
-    )
-    rotated_arr = np.asarray(rotated, dtype=np.float32) / 255.0
-    return rotated_arr[pad : pad + height, pad : pad + width, :]
-
-
-def _apply_color_jitter(image: np.ndarray, rng: np.random.Generator, config: AugmentationConfig) -> np.ndarray:
-    """Apply brightness, contrast, and saturation jitter from user-supplied strengths."""
-    out = image.copy()
-
-    if config.brightness > 0.0:
-        brightness = float(rng.uniform(1.0 - config.brightness, 1.0 + config.brightness))
-        out = out * brightness
-
-    if config.contrast > 0.0:
-        contrast = float(rng.uniform(1.0 - config.contrast, 1.0 + config.contrast))
-        mean = np.mean(out, axis=(0, 1), keepdims=True)
-        out = (out - mean) * contrast + mean
-
-    if config.saturation > 0.0:
-        saturation = float(rng.uniform(1.0 - config.saturation, 1.0 + config.saturation))
-        grayscale = np.mean(out, axis=2, keepdims=True)
-        out = grayscale + (out - grayscale) * saturation
-
-    return out
+def _from_pil_image(image: Image.Image, dtype: np.dtype) -> np.ndarray:
+    """Convert one PIL image back into the normalized float domain."""
+    return (np.asarray(image, dtype=np.float32) / 255.0).astype(dtype, copy=False)
 
 
 def _apply_random_erasing(image: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Erase one random rectangle and fill it with the per-image channel mean.
-
-    Filling with the current image mean keeps the erased region neutral even if a
-    future preprocessing change makes zero a non-natural value.
-    """
+    """Erase one random rectangle and fill it with the per-image channel mean."""
     height, width, _ = image.shape
     total_area = float(height * width)
     fill_value = np.mean(image, axis=(0, 1), keepdims=True)
@@ -391,41 +409,90 @@ def _apply_random_erasing(image: np.ndarray, rng: np.random.Generator) -> np.nda
     return image
 
 
+def _randaugment_signed_magnitude(rng: np.random.Generator, magnitude: float) -> float:
+    """Sample a RandAugment magnitude with random sign for signed ops."""
+    sign = -1.0 if rng.random() < 0.5 else 1.0
+    return sign * float(magnitude)
+
+
+def _apply_randaugment_operation(
+    image: np.ndarray,
+    op_name: str,
+    rng: np.random.Generator,
+    config: AugmentationConfig,
+    level: float,
+) -> np.ndarray:
+    """Apply one RandAugment operation to a single normalized image."""
+    if op_name == "cutout":
+        return _apply_random_erasing(image, rng)
+
+    pil_image = _to_pil_image(image)
+
+    if op_name == "rotate":
+        angle = _randaugment_signed_magnitude(rng, config.rotation * level)
+        pil_image = pil_image.rotate(angle, resample=Image.BILINEAR)
+    elif op_name == "brightness":
+        factor = max(0.05, 1.0 + _randaugment_signed_magnitude(rng, config.brightness * level))
+        pil_image = ImageEnhance.Brightness(pil_image).enhance(factor)
+    elif op_name == "contrast":
+        factor = max(0.05, 1.0 + _randaugment_signed_magnitude(rng, config.contrast * level))
+        pil_image = ImageEnhance.Contrast(pil_image).enhance(factor)
+    elif op_name == "saturation":
+        factor = max(0.05, 1.0 + _randaugment_signed_magnitude(rng, config.saturation * level))
+        pil_image = ImageEnhance.Color(pil_image).enhance(factor)
+    elif op_name == "sharpness":
+        factor = max(0.05, 1.0 + _randaugment_signed_magnitude(rng, 0.9 * level))
+        pil_image = ImageEnhance.Sharpness(pil_image).enhance(factor)
+    elif op_name == "posterize":
+        bits = max(1, 8 - int(round(4.0 * level)))
+        pil_image = ImageOps.posterize(pil_image, bits)
+    elif op_name == "solarize":
+        threshold = int(round(255.0 * (1.0 - 0.8 * level)))
+        pil_image = ImageOps.solarize(pil_image, threshold=threshold)
+    elif op_name == "autocontrast":
+        pil_image = ImageOps.autocontrast(pil_image)
+    elif op_name == "equalize":
+        pil_image = ImageOps.equalize(pil_image)
+    elif op_name == "invert":
+        pil_image = ImageOps.invert(pil_image)
+    else:
+        raise ValueError(f"Unsupported RandAugment op: {op_name}")
+
+    return _from_pil_image(pil_image, dtype=image.dtype)
+
+
 def augment_batch(
     x: np.ndarray,
     rng: np.random.Generator,
     config: AugmentationConfig | None = None,
 ) -> np.ndarray:
-    """Apply the shared training augmentation policy in a deterministic RNG order.
+    """Apply RandAugment to a batch in a deterministic RNG order.
 
-    The transform order is fixed so both backends see the same data policy:
-    crop -> flip -> rotation -> color jitter -> random erasing.
+    Validation does not call this helper, so RandAugment is training-only by
+    construction. Each image samples the configured number of ops with
+    replacement from the op pool, matching the intended RandAugment behavior.
     """
     config = config or AugmentationConfig()
     out = x.copy()
-    batch_size = out.shape[0]
-
-    # Geometry first so later photometric changes operate on final spatial data.
-    if rng.random() < 0.9:
-        out = random_resized_crop_batch(out, rng)
-    flip_mask = rng.random(batch_size) < 0.5
-    out[flip_mask] = out[flip_mask, :, ::-1, :]
-
-    if config.rotation > 0.0:
-        for index in range(batch_size):
-            angle = float(rng.uniform(-config.rotation, config.rotation))
-            if abs(angle) > EPS:
-                out[index] = _rotate_image_reflect(out[index], angle)
-
-    if config.brightness > 0.0 or config.contrast > 0.0 or config.saturation > 0.0:
-        for index in range(batch_size):
-            out[index] = _apply_color_jitter(out[index], rng, config)
-
-    # Random erasing stays last because it is the only intentionally destructive transform.
-    for index in range(batch_size):
-        if rng.random() < 0.3:
-            out[index] = _apply_random_erasing(out[index], rng)
-
+    op_pool = (
+        "rotate",
+        "brightness",
+        "contrast",
+        "saturation",
+        "sharpness",
+        "posterize",
+        "solarize",
+        "autocontrast",
+        "equalize",
+        "invert",
+        "cutout",
+    )
+    for index in range(out.shape[0]):
+        image = out[index]
+        for _ in range(config.randaugment_layers):
+            op_name = op_pool[int(rng.integers(0, len(op_pool)))]
+            image = _apply_randaugment_operation(image, op_name, rng, config, level=RANDAUGMENT_LEVEL)
+        out[index] = image
     return np.clip(out, 0.0, 1.0).astype(x.dtype, copy=False)
 
 
@@ -437,11 +504,7 @@ def apply_mixup(
     prob: float,
     beta_alpha: float = 0.2,
 ) -> tuple[np.ndarray, np.ndarray, bool, float]:
-    """Apply MixUp to a batch of inputs and labels using one shared lambda.
-
-    Returning the activation flag and lambda lets callers log or branch on the
-    exact behavior without trying to re-sample any RNG state.
-    """
+    """Apply MixUp to a batch of inputs and labels using one shared lambda."""
     prob = float(prob)
     beta_alpha = float(beta_alpha)
     if x.shape[0] != y.shape[0]:
@@ -463,3 +526,72 @@ def apply_mixup(
         True,
         lam,
     )
+
+
+def apply_cutmix(
+    x: np.ndarray,
+    y: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    beta_alpha: float = 0.2,
+) -> tuple[np.ndarray, np.ndarray, bool, float]:
+    """Apply CutMix and recompute lambda from the actual pasted patch area."""
+    beta_alpha = float(beta_alpha)
+    if x.shape[0] != y.shape[0]:
+        raise ValueError("CutMix expects the same batch dimension for inputs and labels")
+    if x.shape[0] < 2:
+        return x, y, False, 1.0
+    if beta_alpha <= 0.0:
+        raise ValueError("beta_alpha must be > 0")
+
+    batch_size, height, width, _ = x.shape
+    lam_sample = float(rng.beta(beta_alpha, beta_alpha))
+    cut_ratio = np.sqrt(max(0.0, 1.0 - lam_sample))
+    cut_w = max(1, int(round(width * cut_ratio)))
+    cut_h = max(1, int(round(height * cut_ratio)))
+
+    center_x = int(rng.integers(0, width))
+    center_y = int(rng.integers(0, height))
+    x1 = max(0, center_x - cut_w // 2)
+    y1 = max(0, center_y - cut_h // 2)
+    x2 = min(width, center_x + (cut_w + 1) // 2)
+    y2 = min(height, center_y + (cut_h + 1) // 2)
+
+    permutation = rng.permutation(batch_size)
+    mixed_x = x.copy()
+    mixed_x[:, y1:y2, x1:x2, :] = x[permutation, y1:y2, x1:x2, :]
+
+    patch_area = float(max(0, y2 - y1) * max(0, x2 - x1))
+    lam = 1.0 - (patch_area / float(height * width))
+    mixed_y = lam * y + (1.0 - lam) * y[permutation]
+    return (
+        mixed_x.astype(x.dtype, copy=False),
+        mixed_y.astype(y.dtype, copy=False),
+        True,
+        float(lam),
+    )
+
+
+def apply_batch_mix(
+    x: np.ndarray,
+    y: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    prob: float,
+    beta_alpha: float,
+    cutmix_ratio: float,
+) -> tuple[np.ndarray, np.ndarray, str, float]:
+    """Route a mixed batch to CutMix or MixUp through one probability gate."""
+    prob = float(prob)
+    cutmix_ratio = float(cutmix_ratio)
+    if x.shape[0] != y.shape[0]:
+        raise ValueError("Batch mixing expects the same batch dimension for inputs and labels")
+    if prob <= 0.0 or x.shape[0] < 2:
+        return x, y, "none", 1.0
+    if rng.random() >= prob:
+        return x, y, "none", 1.0
+    if rng.random() < cutmix_ratio:
+        mixed_x, mixed_y, _, lam = apply_cutmix(x, y, rng, beta_alpha=beta_alpha)
+        return mixed_x, mixed_y, "cutmix", lam
+    mixed_x, mixed_y, _, lam = apply_mixup(x, y, rng, prob=1.0, beta_alpha=beta_alpha)
+    return mixed_x, mixed_y, "mixup", lam

@@ -10,32 +10,35 @@ python.exe train.py `
 --optimizer adamw `
 --seed 42 `
 --weight-decay 2e-4 `
---dropout 0.25 `
---label-smoothing 0.0 `
+--dropout 0.3 `
+--label-smoothing 0.05 `
 --augment `
---class-weighting `
+--no-class-weighting `
 --lr-schedule cosine `
---min-lr-ratio 0.05 `
+--min-lr-ratio 0.08 `
 --grad-clip 5.0 `
 --early-stop `
 --early-stop-metric val_acc `
 --patience 20 `
 --min-delta 0.001 `
 --freeze-bn-affine false `
---freeze-patience 5 `
+--freeze-patience 8 `
 --freeze-epoch-num 6 `
 --after-unfreeze-lr-change 0.00004 `
 --focal-loss `
---focal-gamma 1.5 `
+--focal-gamma 1.8 `
 --focal-alpha auto `
 --rotation 12 `
 --brightness 0.2 `
 --contrast 0.2 `
 --saturation 0.2 `
---model-width-scale 0.75 `
+--model-width-scale 1.5 `
 --mixup `
---mixup-alpha 0.2 `
---mixup-prob 0.5 `
+--mixup-alpha 0.1 `
+--mixup-prob 0.4 `
+--cutmix-ratio 0.5 `
+--ema `
+--ema-decay 0.999 `
 --device cuda `
 --class-count 62 `
 --checkpoint checkpoints/best_torch_model.pt `

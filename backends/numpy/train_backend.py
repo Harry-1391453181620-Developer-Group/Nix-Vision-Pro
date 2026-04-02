@@ -21,14 +21,17 @@ import numpy as np
 import config
 from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
+    ModelEMA,
     adjust_phase_lr_offset_after_unfreeze,
-    apply_mixup,
+    apply_batch_mix,
     augment_batch,
     build_epoch_phase_map,
     compute_effective_learning_rate,
     compute_phase_learning_rate,
     parse_bool_flag,
     validate_augmentation_args,
+    validate_cutmix_ratio,
+    validate_ema_decay,
     validate_focal_gamma,
     validate_freeze_cycle_args,
     validate_mixup_alpha,
@@ -38,7 +41,7 @@ from utils.training import (
 )
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
-from backends.numpy.model import CNN
+from backends.numpy.model import CNN, load_checkpoint_state
 from nn.losses import cross_entropy_loss, cross_entropy_loss_backward, focal_loss, focal_loss_backward
 
 # Robust optimizers import with local AdamW fallback
@@ -331,35 +334,27 @@ def choose_partition(args) -> int:
 
 
 def load_weights_forgiving(model: CNN, npz_path: str | Path, skip_prefixes: tuple[str, ...] = ("fc2.",)) -> tuple[list[str], list[str]]:
-    npz_path = str(npz_path)
     try:
-        data = np.load(npz_path, allow_pickle=False)
+        checkpoint_state, _ = load_checkpoint_state(npz_path)
     except Exception as e:
         raise SystemExit(f"Failed to open checkpoint {npz_path}: {e}")
-    try:
-        state = model.state_dict()
-        loaded: list[str] = []
-        skipped: list[str] = []
-        files = set(data.files)
-        for k, tgt in state.items():
-            if any(k.startswith(p) for p in skip_prefixes):
-                skipped.append(k)
-                continue
-            if k not in files:
-                skipped.append(k)
-                continue
-            src = np.asarray(data[k], dtype=np.float64)
-            if src.shape != tgt.shape:
-                skipped.append(k)
-                continue
-            tgt[...] = src
-            loaded.append(k)
-        return loaded, skipped
-    finally:
-        try:
-            data.close()
-        except Exception:
-            pass
+    state = model.state_dict()
+    loaded: list[str] = []
+    skipped: list[str] = []
+    for k, tgt in state.items():
+        if any(k.startswith(p) for p in skip_prefixes):
+            skipped.append(k)
+            continue
+        if k not in checkpoint_state:
+            skipped.append(k)
+            continue
+        src = np.asarray(checkpoint_state[k], dtype=np.float64)
+        if src.shape != tgt.shape:
+            skipped.append(k)
+            continue
+        tgt[...] = src
+        loaded.append(k)
+    return loaded, skipped
 
 
 def _build_optimizer(args: argparse.Namespace, parameters: List[Tuple[np.ndarray, np.ndarray]], lr_value: float):
@@ -398,8 +393,11 @@ def main() -> None:
     parser.add_argument("--focal-gamma", type=float, default=1.5, help="Focal-loss gamma parameter")
     parser.add_argument("--focal-alpha", choices=["auto", "none"], default="auto", help="Focal alpha weighting policy")
     parser.add_argument("--mixup", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mixup-alpha", type=float, default=0.2, help="Alpha parameter for Beta(alpha, alpha) MixUp")
-    parser.add_argument("--mixup-prob", type=float, default=0.5, help="Per-batch probability of applying MixUp")
+    parser.add_argument("--mixup-alpha", type=float, default=0.2, help="Shared Beta(alpha, alpha) parameter for MixUp and CutMix")
+    parser.add_argument("--mixup-prob", type=float, default=0.4, help="Per-batch probability of enabling MixUp/CutMix routing")
+    parser.add_argument("--cutmix-ratio", type=float, default=0.5, help="Conditional probability of using CutMix once batch mixing is enabled")
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ema-decay", type=float, default=0.999, help="Base EMA decay applied after each optimizer step")
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
     parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
@@ -466,6 +464,8 @@ def main() -> None:
         )
         mixup_alpha = validate_mixup_alpha(args.mixup_alpha)
         mixup_prob = validate_mixup_probability(args.mixup_prob)
+        cutmix_ratio = validate_cutmix_ratio(args.cutmix_ratio)
+        ema_decay = validate_ema_decay(args.ema_decay)
         focal_gamma = validate_focal_gamma(args.focal_gamma)
         width_scale = validate_model_width_scale(args.model_width_scale)
     except ValueError as exc:
@@ -537,10 +537,7 @@ def main() -> None:
     ce_class_weights = inverse_frequency_weights if args.class_weighting else None
     focal_alpha_weights = inverse_frequency_weights if args.focal_alpha == "auto" else None
 
-    mixup_disables_focal = bool(args.mixup and mixup_prob > 0.0)
-    use_focal_loss = bool(args.focal_loss and not mixup_disables_focal)
-    if args.focal_loss and mixup_disables_focal:
-        print("[info] Focal loss disabled for this run because MixUp is enabled.")
+    base_use_focal_loss = bool(args.focal_loss)
 
     input_size = config.INPUT_SIZE
 
@@ -588,6 +585,19 @@ def main() -> None:
     current_lr = current_phase_base_lr
     optimizer = _build_optimizer(args, model.get_trainable_parameters(), lr_value=current_phase_base_lr)
 
+    ema: ModelEMA | None = None
+    if args.ema:
+        ema_model = CNN(
+            input_size=input_size,
+            num_classes=num_classes,
+            seed=args.seed,
+            dropout_p=args.dropout,
+            width_scale=width_scale,
+        )
+        ema_model.eval()
+        ema = ModelEMA(ema_model, decay=ema_decay, phase_warmup_steps=max(1, n_batches))
+        ema.sync_from(model)
+
     for epoch in range(args.epochs):
         phase_config = phase_map[epoch]
         if phase_config.phase_index != current_phase_index:
@@ -632,17 +642,24 @@ def main() -> None:
 
             if args.augment:
                 x_batch = augment_batch(x_batch, rng, augment_config).astype(np.float64, copy=False)
-            y_batch = one_hot(y_batch_idx, num_classes, label_smoothing=args.label_smoothing)
+
+            mix_mode = "none"
             if args.mixup:
-                x_batch, y_batch, _, _ = apply_mixup(
+                y_batch = one_hot(y_batch_idx, num_classes, label_smoothing=0.0)
+                x_batch, y_batch, mix_mode, _ = apply_batch_mix(
                     x_batch,
                     y_batch,
                     rng,
                     prob=mixup_prob,
                     beta_alpha=mixup_alpha,
+                    cutmix_ratio=cutmix_ratio,
                 )
+                if mix_mode == "none":
+                    y_batch = one_hot(y_batch_idx, num_classes, label_smoothing=args.label_smoothing)
                 x_batch = x_batch.astype(np.float64, copy=False)
                 y_batch = y_batch.astype(np.float64, copy=False)
+            else:
+                y_batch = one_hot(y_batch_idx, num_classes, label_smoothing=args.label_smoothing)
 
             scheduled_lr = compute_phase_learning_rate(
                 base_lr=current_phase_base_lr,
@@ -665,10 +682,11 @@ def main() -> None:
             optimizer.lr = current_lr
 
             logits = model.forward(x_batch)
+            batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
             loss = _compute_batch_loss(
                 logits,
                 y_batch,
-                use_focal_loss=use_focal_loss,
+                use_focal_loss=batch_use_focal_loss,
                 focal_gamma=focal_gamma,
                 ce_class_weights=ce_class_weights,
                 focal_alpha_weights=focal_alpha_weights,
@@ -681,7 +699,7 @@ def main() -> None:
             dlogits = _compute_batch_gradient(
                 logits,
                 y_batch,
-                use_focal_loss=use_focal_loss,
+                use_focal_loss=batch_use_focal_loss,
                 focal_gamma=focal_gamma,
                 ce_class_weights=ce_class_weights,
                 focal_alpha_weights=focal_alpha_weights,
@@ -692,33 +710,37 @@ def main() -> None:
                 clip_gradients(params, args.grad_clip)
             optimizer.parameters = params
             optimizer.step()
+            if ema is not None:
+                phase_step = phase_config.epoch_index_in_phase * n_batches + b
+                ema.update(model, step_in_phase=phase_step, mix_active=(mix_mode != "none"))
 
         avg_loss = epoch_loss / max(1, n_batches)
         train_acc = epoch_correct / max(1, y_train.size)
 
         if y_val is not None and len(val_paths) > 0:
-            model.eval()
+            eval_model = ema.ema_model if ema is not None else model
+            eval_model.eval()
             if args.streaming or X_val is None:
                 val_loss, val_acc = evaluate_streaming(
-                    model,
+                    eval_model,
                     val_paths,
                     y_val,
                     num_classes=num_classes,
                     batch_size=batch_size,
                     input_size=input_size,
-                    use_focal_loss=use_focal_loss,
+                    use_focal_loss=base_use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
                     focal_alpha_weights=focal_alpha_weights,
                 )
             else:
                 val_loss, val_acc = evaluate_preloaded(
-                    model,
+                    eval_model,
                     X_val,
                     y_val,
                     num_classes=num_classes,
                     batch_size=batch_size,
-                    use_focal_loss=use_focal_loss,
+                    use_focal_loss=base_use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
                     focal_alpha_weights=focal_alpha_weights,
@@ -730,7 +752,14 @@ def main() -> None:
                     best_val_loss = val_loss
                 else:
                     best_val_acc = val_acc
-                model.save_weights(args.checkpoint)
+                checkpoint_model = ema.ema_model if ema is not None else model
+                checkpoint_model.save_weights(
+                    args.checkpoint,
+                    metadata={
+                        "is_ema": bool(ema is not None),
+                        "ema_decay": float(ema_decay) if ema is not None else None,
+                    },
+                )
                 best_saved = True
                 bad_epochs = 0
             else:
@@ -816,7 +845,14 @@ def main() -> None:
             )
 
     if y_val is None or len(val_paths) == 0:
-        model.save_weights(args.checkpoint)
+        checkpoint_model = ema.ema_model if ema is not None else model
+        checkpoint_model.save_weights(
+            args.checkpoint,
+            metadata={
+                "is_ema": bool(ema is not None),
+                "ema_decay": float(ema_decay) if ema is not None else None,
+            },
+        )
         best_saved = True
     if best_saved:
         print(f"Saved checkpoint: {args.checkpoint}")

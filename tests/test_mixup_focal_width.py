@@ -1,4 +1,4 @@
-"""Focused tests for MixUp, focal-policy helpers, and width-scaled models."""
+"""Focused tests for batch-mix routing, checkpoints, and width-scaled models."""
 
 from pathlib import Path
 
@@ -9,8 +9,12 @@ from backends.numpy.model import CNN
 from backends.numpy.train_backend import load_weights_forgiving as numpy_load_weights_forgiving
 from utils.training import (
     _apply_random_erasing,
+    apply_batch_mix,
+    apply_cutmix,
     apply_mixup,
     validate_augmentation_args,
+    validate_cutmix_ratio,
+    validate_ema_decay,
     validate_focal_gamma,
     validate_mixup_alpha,
     validate_mixup_probability,
@@ -24,11 +28,23 @@ from backends.torch.model import TorchCNN
 from backends.torch.train_backend import load_weights_forgiving as torch_load_weights_forgiving
 
 
+def _make_distinct_batch(dtype: np.dtype = np.float32) -> tuple[np.ndarray, np.ndarray]:
+    """Build a small batch whose samples are easy to distinguish after mixing."""
+    x = np.stack(
+        [np.full((8, 8, 3), fill_value=index / 4.0, dtype=dtype) for index in range(4)],
+        axis=0,
+    )
+    y = np.eye(4, dtype=dtype)
+    return x, y
+
+
 def test_validate_new_training_args():
     config = validate_augmentation_args(12.0, 0.2, 0.3, 0.4)
     assert config.rotation == pytest.approx(12.0)
     assert validate_mixup_alpha(0.2) == pytest.approx(0.2)
-    assert validate_mixup_probability(0.5) == pytest.approx(0.5)
+    assert validate_mixup_probability(0.4) == pytest.approx(0.4)
+    assert validate_cutmix_ratio(0.5) == pytest.approx(0.5)
+    assert validate_ema_decay(0.999) == pytest.approx(0.999)
     assert validate_focal_gamma(1.5) == pytest.approx(1.5)
     assert validate_model_width_scale(0.75) == pytest.approx(0.75)
 
@@ -39,14 +55,17 @@ def test_validate_new_training_args():
     with pytest.raises(ValueError):
         validate_mixup_probability(1.5)
     with pytest.raises(ValueError):
+        validate_cutmix_ratio(-0.1)
+    with pytest.raises(ValueError):
+        validate_ema_decay(1.0)
+    with pytest.raises(ValueError):
         validate_focal_gamma(-0.1)
     with pytest.raises(ValueError):
         validate_model_width_scale(0.0)
 
 
 def test_apply_mixup_preserves_soft_label_simplex():
-    x = np.arange(4 * 2 * 2 * 1, dtype=np.float32).reshape(4, 2, 2, 1)
-    y = np.eye(4, dtype=np.float32)
+    x, y = _make_distinct_batch()
     mixed_x, mixed_y, active, lam = apply_mixup(x, y, np.random.default_rng(7), prob=1.0, beta_alpha=0.2)
 
     assert active
@@ -55,6 +74,66 @@ def test_apply_mixup_preserves_soft_label_simplex():
     assert mixed_y.shape == y.shape
     np.testing.assert_allclose(np.sum(mixed_y, axis=1), np.ones((4,), dtype=np.float32), atol=1e-6)
     assert not np.allclose(mixed_x, x)
+
+
+def test_apply_cutmix_uses_actual_patch_area_for_labels():
+    x, y = _make_distinct_batch()
+    mixed_x, mixed_y, active, lam = apply_cutmix(x, y, np.random.default_rng(11), beta_alpha=0.2)
+
+    assert active
+    changed_areas: list[int] = []
+    for index in range(x.shape[0]):
+        diff_mask = np.any(np.abs(mixed_x[index] - x[index]) > 1e-6, axis=2)
+        area = int(np.count_nonzero(diff_mask))
+        if area > 0:
+            changed_areas.append(area)
+
+    assert changed_areas
+    assert len(set(changed_areas)) == 1
+    expected_lam = 1.0 - (changed_areas[0] / float(x.shape[1] * x.shape[2]))
+    assert lam == pytest.approx(expected_lam, abs=1e-6)
+    np.testing.assert_allclose(np.sum(mixed_y, axis=1), np.ones((4,), dtype=np.float32), atol=1e-6)
+
+
+def test_apply_batch_mix_respects_probability_gate_and_route_choice():
+    x, y = _make_distinct_batch()
+
+    none_x, none_y, none_mode, none_lam = apply_batch_mix(
+        x,
+        y,
+        np.random.default_rng(1),
+        prob=0.0,
+        beta_alpha=0.2,
+        cutmix_ratio=0.5,
+    )
+    assert none_mode == "none"
+    assert none_lam == pytest.approx(1.0)
+    np.testing.assert_allclose(none_x, x)
+    np.testing.assert_allclose(none_y, y)
+
+    cutmix_x, cutmix_y, cutmix_mode, _ = apply_batch_mix(
+        x,
+        y,
+        np.random.default_rng(2),
+        prob=1.0,
+        beta_alpha=0.2,
+        cutmix_ratio=1.0,
+    )
+    assert cutmix_mode == "cutmix"
+    assert not np.allclose(cutmix_x, x)
+    np.testing.assert_allclose(np.sum(cutmix_y, axis=1), np.ones((4,), dtype=np.float32), atol=1e-6)
+
+    mixup_x, mixup_y, mixup_mode, _ = apply_batch_mix(
+        x,
+        y,
+        np.random.default_rng(3),
+        prob=1.0,
+        beta_alpha=0.2,
+        cutmix_ratio=0.0,
+    )
+    assert mixup_mode == "mixup"
+    assert not np.allclose(mixup_x, x)
+    np.testing.assert_allclose(np.sum(mixup_y, axis=1), np.ones((4,), dtype=np.float32), atol=1e-6)
 
 
 def test_random_erasing_uses_image_mean_fill():

@@ -1,4 +1,4 @@
-"""Focused tests for augmentation, phase schedules, and backbone freeze policy."""
+"""Focused tests for RandAugment, EMA, schedules, and backbone freeze policy."""
 
 from argparse import Namespace
 
@@ -7,6 +7,7 @@ import pytest
 
 from backends.numpy.model import CNN
 from utils.training import (
+    ModelEMA,
     adjust_phase_lr_offset_after_unfreeze,
     augment_batch,
     build_epoch_phase_map,
@@ -128,8 +129,6 @@ def test_freeze_cycle_validation_and_post_unfreeze_offset_rules():
     assert applied
     assert new_offset == pytest.approx(0.0001)
 
-    # EPS guard: this should still pass even though the candidate is smaller than
-    # the next phase LR by a tiny floating-point residue.
     new_offset, applied = adjust_phase_lr_offset_after_unfreeze(
         current_effective_lr=0.0006,
         phase_lr_offset=0.0,
@@ -141,7 +140,6 @@ def test_freeze_cycle_validation_and_post_unfreeze_offset_rules():
     assert applied
     assert new_offset == pytest.approx(0.0001000000000005)
 
-    # Do not deduct when the effective LR is already too close to the floor.
     same_offset, applied = adjust_phase_lr_offset_after_unfreeze(
         current_effective_lr=0.00039,
         phase_lr_offset=0.0001,
@@ -153,7 +151,6 @@ def test_freeze_cycle_validation_and_post_unfreeze_offset_rules():
     assert not applied
     assert same_offset == pytest.approx(0.0001)
 
-    # Cap cumulative offset so it never undercuts the next phase LR.
     capped_offset, applied = adjust_phase_lr_offset_after_unfreeze(
         current_effective_lr=0.0017,
         phase_lr_offset=0.00145,
@@ -165,7 +162,6 @@ def test_freeze_cycle_validation_and_post_unfreeze_offset_rules():
     assert applied
     assert capped_offset == pytest.approx(0.0015)
 
-    # Final phase cap falls back to the scheduler floor.
     final_offset, applied = adjust_phase_lr_offset_after_unfreeze(
         current_effective_lr=0.0012,
         phase_lr_offset=0.0016,
@@ -176,6 +172,33 @@ def test_freeze_cycle_validation_and_post_unfreeze_offset_rules():
     )
     assert applied
     assert final_offset == pytest.approx(0.0018)
+
+
+def test_numpy_model_ema_tracks_parameters_and_running_stats():
+    model = CNN(input_size=(32, 32), num_classes=8, seed=7)
+    ema_model = CNN(input_size=(32, 32), num_classes=8, seed=9)
+    ema = ModelEMA(ema_model, decay=0.5, phase_warmup_steps=0)
+    ema.sync_from(model)
+
+    initial_weight = ema.ema_model.conv1.W.copy()
+    initial_running_mean = ema.ema_model.bn1.running_mean.copy()
+
+    model.train()
+    model.forward(np.random.randn(4, 32, 32, 3).astype(np.float64))
+    model.conv1.W += 0.25
+    ema.update(model, step_in_phase=10, mix_active=False)
+
+    np.testing.assert_allclose(
+        ema.ema_model.conv1.W,
+        0.5 * initial_weight + 0.5 * model.conv1.W,
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        ema.ema_model.bn1.running_mean,
+        0.5 * initial_running_mean + 0.5 * model.bn1.running_mean,
+        atol=1e-10,
+    )
+    assert ema.num_updates == 1
 
 
 def test_numpy_freeze_keeps_bn_running_stats_fixed():
@@ -192,6 +215,35 @@ def test_numpy_freeze_keeps_bn_running_stats_fixed():
     model.set_backbone_frozen(True, freeze_bn_affine=True)
     model.forward(x_b)
     np.testing.assert_allclose(model.bn1.running_mean, running_mean_before, atol=1e-12)
+
+
+def test_torch_model_ema_tracks_parameters_and_bn_buffers():
+    model = TorchCNN(input_size=(32, 32), num_classes=8, seed=11)
+    ema_model = TorchCNN(input_size=(32, 32), num_classes=8, seed=13)
+    ema = ModelEMA(ema_model, decay=0.5, phase_warmup_steps=0)
+    ema.sync_from(model)
+
+    initial_weight = ema.ema_model.conv1.weight.detach().clone()
+    initial_running_mean = ema.ema_model.bn1.running_mean.detach().clone()
+
+    model.train()
+    _ = model(torch.randn(4, 32, 32, 3))
+    with torch.no_grad():
+        model.conv1.weight.add_(0.25)
+    ema.update(model, step_in_phase=10, mix_active=False)
+
+    assert torch.allclose(
+        ema.ema_model.conv1.weight.detach(),
+        0.5 * initial_weight + 0.5 * model.conv1.weight.detach(),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        ema.ema_model.bn1.running_mean.detach(),
+        0.5 * initial_running_mean + 0.5 * model.bn1.running_mean.detach(),
+        atol=1e-6,
+    )
+    assert int(ema.ema_model.bn1.num_batches_tracked.item()) == int(model.bn1.num_batches_tracked.item())
+    assert ema.num_updates == 1
 
 
 def test_torch_freeze_transition_updates_expected_params_and_bn_modes():

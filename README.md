@@ -40,33 +40,38 @@ The current dependency set covers the whole project:
 
 ## Training Policy Highlights
 
-- Augmentation order is now `crop -> flip -> rotation -> color jitter -> random erasing`.
-- `--rotation`, `--brightness`, `--contrast`, and `--saturation` control augmentation strength directly.
-- Random erasing uses `p=0.3`, erases `10%-20%` of image area, and fills with the per-image channel mean.
-- MixUp now defaults to enabled via `--mixup`, with `--mixup-alpha 0.2` and `--mixup-prob 0.5`. Use `--no-mixup` to disable it.
-- `--focal-loss`, `--focal-gamma`, and `--focal-alpha` replace the old balance-sampling path.
-- If MixUp is enabled for a run, focal loss is automatically disabled for that run and the trainer falls back to cross entropy.
-- Multiphase LR uses `--phase-count` and a list passed to `--lr`.
-- Phase boundaries are computed with `np.array_split(range(epochs), phase_count)`.
-- Cosine schedule intentionally restarts per phase.
-- Optional warmup uses `--warmup-epochs` and ramps from `0.1 * base_lr` to `base_lr` at each phase start.
-- If `val_acc` stalls inside a phase, the backbone freezes temporarily, then unfreezes inside the same phase.
-- `--freeze-bn-affine false` keeps BN affine parameters trainable while BN running stats stay frozen.
-- `--after-unfreeze-lr-change` builds a cumulative within-phase LR offset from the current effective LR, clamped to the scheduler floor and capped so it never undercuts the next phase start LR.
+- `--augment` now applies a shared RandAugment-style policy in `utils/training.py` for both backends.
+- Each training image samples two ops from the shared pool: `rotate`, `brightness`, `contrast`, `saturation`, `sharpness`, `posterize`, `solarize`, `autocontrast`, `equalize`, `invert`, and `cutout`.
+- `--rotation`, `--brightness`, `--contrast`, and `--saturation` still control the user-facing strength limits.
+- Batch mixing is now a single gate: `--mixup-prob 0.4` decides whether to mix, then `--cutmix-ratio 0.5` decides between CutMix and MixUp for that batch.
+- Validation is always clean: no RandAugment, no MixUp, and no CutMix.
+- Mixed batches force label smoothing to `0` for that batch and only use cross entropy. Non-mixed batches can still use focal loss.
+- `--ema` is enabled by default with `--ema-decay 0.999`.
+- EMA updates run immediately after `optimizer.step()`, evaluate the EMA weights for validation, and save best checkpoints from EMA weights.
+- EMA tracks the full model state, including BN buffers, so validation does not drift from stale running statistics.
+- New checkpoints are structured as `model + meta`, while legacy raw checkpoints still load.
+- Multiphase LR, warmup, cosine restarts, and temporary backbone freeze remain supported in both training backends.
 
 ## Training
 
 Recommended PyTorch training command:
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.00015 --warmup-epochs 3 --batch-size 128 --streaming --optimizer adamw --weight-decay 4e-4 --dropout 0.35 --label-smoothing 0.1 --class-weighting --no-focal-loss --mixup --mixup-alpha 0.2 --mixup-prob 0.5 --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.02 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 5 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00008 --checkpoint checkpoints/best_torch_model.pt --device cuda
+python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0002 --warmup-epochs 3 --batch-size 64 --streaming --optimizer adamw --seed 42 --weight-decay 2e-4 --dropout 0.3 --label-smoothing 0.05 --augment --no-class-weighting --lr-schedule cosine --min-lr-ratio 0.08 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00004 --focal-loss --focal-gamma 1.8 --focal-alpha auto --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 1.5 --mixup --mixup-alpha 0.1 --mixup-prob 0.4 --cutmix-ratio 0.5 --ema --ema-decay 0.999 --device cuda --class-count 62 --checkpoint checkpoints/best_torch_model.pt --init-from checkpoints/best_torch_model.pt
 ```
 
 Legacy NumPy training remains available:
 
 ```powershell
-python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.3 --label-smoothing 0.1 --class-weighting --focal-loss --focal-gamma 1.5 --focal-alpha auto --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --checkpoint checkpoints/best_numpy_model.npz
+python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.3 --label-smoothing 0.05 --class-weighting --focal-loss --focal-gamma 1.5 --focal-alpha auto --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --mixup --mixup-alpha 0.2 --mixup-prob 0.4 --cutmix-ratio 0.5 --ema --ema-decay 0.999 --checkpoint checkpoints/best_numpy_model.npz
 ```
+
+## Checkpoints
+
+- New checkpoints save a structured payload with the model weights under `model` plus metadata under `meta`.
+- The metadata includes the checkpoint version, backend, and whether the saved weights are EMA weights.
+- `load_weights()` still accepts older plain state-dict checkpoints, so older training runs remain usable.
+- Load only trusted checkpoints. The PyTorch loader prefers `weights_only=True`, but older interpreter combinations can still fall back to normal `torch.load()` for compatibility.
 
 ## Inference
 
@@ -78,5 +83,5 @@ python.exe predict.py --backend numpy Dataset/airplane/0000001.jpg --weights che
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -v
+.\.venv\Scripts\python.exe -m pytest tests -v -p no:cacheprovider
 ```

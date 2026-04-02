@@ -15,19 +15,22 @@ from pathlib import Path
 import numpy as np
 
 import config
-from backends.torch.model import TorchCNN
+from backends.torch.model import TorchCNN, load_checkpoint_state
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
 from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
+    ModelEMA,
     adjust_phase_lr_offset_after_unfreeze,
-    apply_mixup,
+    apply_batch_mix,
     augment_batch,
     build_epoch_phase_map,
     compute_effective_learning_rate,
     compute_phase_learning_rate,
     parse_bool_flag,
     validate_augmentation_args,
+    validate_cutmix_ratio,
+    validate_ema_decay,
     validate_focal_gamma,
     validate_freeze_cycle_args,
     validate_mixup_alpha,
@@ -312,12 +315,7 @@ def evaluate_preloaded(
 
 def load_weights_forgiving(model: TorchCNN, checkpoint_path: str | Path, skip_prefixes: tuple[str, ...] = ("fc2.",)) -> tuple[list[str], list[str]]:
     checkpoint = Path(checkpoint_path)
-    try:
-        state = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    except TypeError:
-        state = torch.load(checkpoint, map_location="cpu")
-    if not isinstance(state, dict):
-        raise SystemExit(f"Invalid checkpoint format: {checkpoint}")
+    state, _ = load_checkpoint_state(checkpoint, map_location="cpu")
     current = model.state_dict()
     loaded: list[str] = []
     skipped: list[str] = []
@@ -409,8 +407,11 @@ def main() -> None:
     parser.add_argument("--focal-gamma", type=float, default=1.5, help="Focal-loss gamma parameter")
     parser.add_argument("--focal-alpha", choices=["auto", "none"], default="auto", help="Focal alpha weighting policy")
     parser.add_argument("--mixup", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mixup-alpha", type=float, default=0.2, help="Alpha parameter for Beta(alpha, alpha) MixUp")
-    parser.add_argument("--mixup-prob", type=float, default=0.5, help="Per-batch probability of applying MixUp")
+    parser.add_argument("--mixup-alpha", type=float, default=0.2, help="Shared Beta(alpha, alpha) parameter for MixUp and CutMix")
+    parser.add_argument("--mixup-prob", type=float, default=0.4, help="Per-batch probability of enabling MixUp/CutMix routing")
+    parser.add_argument("--cutmix-ratio", type=float, default=0.5, help="Conditional probability of using CutMix once batch mixing is enabled")
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ema-decay", type=float, default=0.999, help="Base EMA decay applied after each optimizer step")
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
     parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
@@ -469,6 +470,8 @@ def main() -> None:
         )
         mixup_alpha = validate_mixup_alpha(args.mixup_alpha)
         mixup_prob = validate_mixup_probability(args.mixup_prob)
+        cutmix_ratio = validate_cutmix_ratio(args.cutmix_ratio)
+        ema_decay = validate_ema_decay(args.ema_decay)
         focal_gamma = validate_focal_gamma(args.focal_gamma)
         width_scale = validate_model_width_scale(args.model_width_scale)
     except ValueError as exc:
@@ -544,10 +547,7 @@ def main() -> None:
     if args.focal_alpha == "auto" and inverse_frequency_weights is not None:
         focal_alpha_weights = torch.as_tensor(inverse_frequency_weights, dtype=torch.float32, device=device)
 
-    mixup_disables_focal = bool(args.mixup and mixup_prob > 0.0)
-    use_focal_loss = bool(args.focal_loss and not mixup_disables_focal)
-    if args.focal_loss and mixup_disables_focal:
-        print("[info] Focal loss disabled for this run because MixUp is enabled.")
+    base_use_focal_loss = bool(args.focal_loss)
 
     input_size = config.INPUT_SIZE
 
@@ -598,6 +598,22 @@ def main() -> None:
     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
     optimizer: torch.optim.Optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
 
+    ema: ModelEMA | None = None
+    if args.ema:
+        ema_model = TorchCNN(
+            input_size=input_size,
+            num_classes=num_classes,
+            seed=args.seed,
+            dropout_p=args.dropout,
+            width_scale=width_scale,
+        )
+        ema_model.to(device)
+        for parameter in ema_model.parameters():
+            parameter.requires_grad_(False)
+        ema_model.eval()
+        ema = ModelEMA(ema_model, decay=ema_decay, phase_warmup_steps=max(1, num_batches))
+        ema.sync_from(model)
+
     for epoch in range(args.epochs):
         phase_config = phase_map[epoch]
         if phase_config.phase_index != current_phase_index:
@@ -638,18 +654,32 @@ def main() -> None:
             if args.augment:
                 x_batch = augment_batch(x_batch, rng, augment_config)
 
-            target_distribution = _make_target_distribution(
-                y_batch_idx,
-                num_classes,
-                label_smoothing=float(args.label_smoothing),
-            )
+            mix_mode = "none"
             if args.mixup:
-                x_batch, target_distribution, _, _ = apply_mixup(
+                target_distribution = _make_target_distribution(
+                    y_batch_idx,
+                    num_classes,
+                    label_smoothing=0.0,
+                )
+                x_batch, target_distribution, mix_mode, _ = apply_batch_mix(
                     x_batch,
                     target_distribution,
                     rng,
                     prob=mixup_prob,
                     beta_alpha=mixup_alpha,
+                    cutmix_ratio=cutmix_ratio,
+                )
+                if mix_mode == "none":
+                    target_distribution = _make_target_distribution(
+                        y_batch_idx,
+                        num_classes,
+                        label_smoothing=float(args.label_smoothing),
+                    )
+            else:
+                target_distribution = _make_target_distribution(
+                    y_batch_idx,
+                    num_classes,
+                    label_smoothing=float(args.label_smoothing),
                 )
 
             scheduled_lr = compute_phase_learning_rate(
@@ -676,10 +706,11 @@ def main() -> None:
             x_tensor = _to_tensor_batch(x_batch, device)
             y_tensor = torch.as_tensor(target_distribution, dtype=torch.float32, device=device)
             logits = model(x_tensor)
+            batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
             loss = _compute_batch_loss(
                 logits,
                 y_tensor,
-                use_focal_loss=use_focal_loss,
+                use_focal_loss=batch_use_focal_loss,
                 focal_gamma=focal_gamma,
                 ce_class_weights=ce_class_weights,
                 focal_alpha_weights=focal_alpha_weights,
@@ -688,6 +719,9 @@ def main() -> None:
             if args.grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_([parameter for parameter in model.parameters() if parameter.requires_grad], max_norm=args.grad_clip)
             optimizer.step()
+            if ema is not None:
+                phase_step = phase_config.epoch_index_in_phase * num_batches + batch_index
+                ema.update(model, step_in_phase=phase_step, mix_active=(mix_mode != "none"))
 
             epoch_loss += float(loss.item())
             metric_targets = torch.argmax(y_tensor, dim=1)
@@ -697,29 +731,31 @@ def main() -> None:
         train_acc = epoch_correct / max(1, y_train.size)
 
         if y_val is not None and len(val_paths) > 0:
+            eval_model = ema.ema_model if ema is not None else model
+            eval_model.eval()
             if args.streaming or x_val is None:
                 val_loss, val_acc = evaluate_streaming(
-                    model,
+                    eval_model,
                     val_paths,
                     y_val,
                     num_classes,
                     batch_size,
                     input_size,
                     device,
-                    use_focal_loss=use_focal_loss,
+                    use_focal_loss=base_use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
                     focal_alpha_weights=focal_alpha_weights,
                 )
             else:
                 val_loss, val_acc = evaluate_preloaded(
-                    model,
+                    eval_model,
                     x_val,
                     y_val,
                     num_classes,
                     batch_size,
                     device,
-                    use_focal_loss=use_focal_loss,
+                    use_focal_loss=base_use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
                     focal_alpha_weights=focal_alpha_weights,
@@ -731,7 +767,14 @@ def main() -> None:
                     best_val_loss = val_loss
                 else:
                     best_val_acc = val_acc
-                model.save_weights(args.checkpoint)
+                checkpoint_model = ema.ema_model if ema is not None else model
+                checkpoint_model.save_weights(
+                    args.checkpoint,
+                    metadata={
+                        "is_ema": bool(ema is not None),
+                        "ema_decay": float(ema_decay) if ema is not None else None,
+                    },
+                )
                 best_saved = True
                 bad_epochs = 0
             else:
@@ -817,7 +860,14 @@ def main() -> None:
             )
 
     if y_val is None or len(val_paths) == 0:
-        model.save_weights(args.checkpoint)
+        checkpoint_model = ema.ema_model if ema is not None else model
+        checkpoint_model.save_weights(
+            args.checkpoint,
+            metadata={
+                "is_ema": bool(ema is not None),
+                "ema_decay": float(ema_decay) if ema is not None else None,
+            },
+        )
         best_saved = True
     if best_saved:
         print(f"Saved checkpoint: {args.checkpoint}")

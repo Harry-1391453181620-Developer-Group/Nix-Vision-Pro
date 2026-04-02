@@ -9,11 +9,40 @@ scale that was used during training if it wants checkpoint shapes to match.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Any, Iterable, Mapping, Tuple
 
 import numpy as np
 import torch
 from torch import nn
+
+
+def load_checkpoint_state(
+    path: str | Path,
+    map_location: str | torch.device | None = None,
+) -> tuple[Mapping[str, torch.Tensor], dict[str, Any]]:
+    """Load either a legacy raw state_dict or a structured checkpoint."""
+    checkpoint = Path(path).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    if checkpoint.suffix not in {".pt", ".pth"}:
+        raise ValueError("Checkpoint path must use .pt or .pth extension")
+    try:
+        payload = torch.load(checkpoint, map_location=map_location or "cpu", weights_only=True)
+    except TypeError:
+        payload = torch.load(checkpoint, map_location=map_location or "cpu")
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid checkpoint format: expected a state_dict mapping")
+    if "model" in payload:
+        state = payload.get("model")
+        metadata = payload.get("meta", {})
+        if not isinstance(state, dict):
+            raise ValueError("Invalid checkpoint format: `model` must be a state_dict mapping")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise ValueError("Invalid checkpoint format: `meta` must be a dictionary when present")
+        return state, dict(metadata)
+    return payload, {}
 
 
 def _resolve_stage2_channels(width_scale: float) -> int:
@@ -195,26 +224,29 @@ class TorchCNN(nn.Module):
         x = self.dropout(x)
         return self.fc2(x)
 
-    def save_weights(self, path: str | Path) -> None:
+    def save_weights(self, path: str | Path, metadata: Mapping[str, Any] | None = None) -> None:
         checkpoint = Path(path)
         if checkpoint.suffix not in {".pt", ".pth"}:
             raise ValueError("Checkpoint path must use .pt or .pth extension")
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.state_dict(), checkpoint)
+        payload = {
+            "model": self.state_dict(),
+            "meta": {
+                "checkpoint_version": 2,
+                "backend": "torch",
+                **({} if metadata is None else dict(metadata)),
+            },
+        }
+        torch.save(payload, checkpoint)
 
-    def load_weights(self, path: str | Path, map_location: str | torch.device | None = None) -> None:
-        checkpoint = Path(path).resolve()
-        if not checkpoint.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
-        if checkpoint.suffix not in {".pt", ".pth"}:
-            raise ValueError("Checkpoint path must use .pt or .pth extension")
-        try:
-            state = torch.load(checkpoint, map_location=map_location or "cpu", weights_only=True)
-        except TypeError:
-            state = torch.load(checkpoint, map_location=map_location or "cpu")
-        if not isinstance(state, dict):
-            raise ValueError("Invalid checkpoint format: expected a state_dict mapping")
+    def load_weights(
+        self,
+        path: str | Path,
+        map_location: str | torch.device | None = None,
+    ) -> dict[str, Any]:
+        state, metadata = load_checkpoint_state(path, map_location=map_location)
         self.load_state_dict(state)
+        return metadata
 
 
 CNN = TorchCNN

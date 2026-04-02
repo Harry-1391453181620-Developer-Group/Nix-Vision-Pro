@@ -56,23 +56,17 @@ Each class should be a directory. Training auto-detects the class count from `Da
 
 ## New Training Behavior
 
-### Augmentation
+### RandAugment
 
-When `--augment` is enabled, both backends apply the same transform order:
-
-```text
-crop -> flip -> rotation -> color jitter -> random erasing
-```
+When `--augment` is enabled, both backends apply the same RandAugment-style policy from `utils/training.py`.
 
 Policy details:
-- random resized crop remains the first geometry transform
-- horizontal flip uses `p=0.5`
-- `--rotation x` samples an angle in `[-x, +x]`; default `12`, recommended `<= 20` for CIFAR-like datasets
-- `--brightness x`, `--contrast x`, and `--saturation x` sample factors in `[1-x, 1+x]`; defaults are `0.2`
-- random erasing remains the final destructive transform with:
-  - `p=0.3`
-  - erased area sampled from `10%` to `20%`
-  - mean-value fill using the current image channel mean
+- each training image samples `2` ops with replacement from a shared op pool
+- the op pool is: `rotate`, `brightness`, `contrast`, `saturation`, `sharpness`, `posterize`, `solarize`, `autocontrast`, `equalize`, `invert`, and `cutout`
+- `--rotation x` still controls the maximum absolute rotation magnitude
+- `--brightness x`, `--contrast x`, and `--saturation x` still control the photometric strength limits
+- `cutout` keeps the mean-fill random erasing behavior
+- validation never calls this augmentation path
 
 Validation rules:
 - `0 <= rotation < 180`
@@ -80,23 +74,64 @@ Validation rules:
 - `0 <= contrast <= 1`
 - `0 <= saturation <= 1`
 
-### MixUp and Focal Loss
+### MixUp, CutMix, and Focal Loss
 
 New arguments:
 - `--mixup / --no-mixup`
 - `--mixup-alpha`
 - `--mixup-prob`
+- `--cutmix-ratio`
 - `--focal-loss / --no-focal-loss`
 - `--focal-gamma`
 - `--focal-alpha {auto,none}`
 
 Policy details:
-- MixUp defaults to enabled
-- MixUp uses `lam ~ Beta(--mixup-alpha, --mixup-alpha)` with default `--mixup-alpha 0.2`
-- MixUp is applied per batch with default probability `--mixup-prob 0.5`
-- focal loss defaults to `gamma=1.5`
-- `--focal-alpha auto` reuses inverse-frequency class weights as focal alpha
-- if MixUp is enabled for a run, focal loss is disabled automatically for that run and the trainer falls back to cross entropy for both train and validation loss reporting
+- batch mixing defaults to enabled
+- `--mixup-prob` now defaults to `0.4`
+- when a batch is selected for mixing, `--cutmix-ratio` decides between CutMix and MixUp and defaults to `0.5`
+- CutMix recomputes label `lam` from the actual pasted patch area after clipping
+- label smoothing becomes `0` on mixed batches to avoid double regularization
+- focal loss stays enabled only for non-mixed training batches
+- validation is always clean:
+  - MixUp off
+  - CutMix off
+
+### EMA
+
+New arguments:
+- `--ema / --no-ema`
+- `--ema-decay`
+
+Policy details:
+- EMA defaults to enabled with `--ema-decay 0.999`
+- update order is:
+  - `optimizer.step()`
+  - `ema.update(model)`
+- EMA tracks both parameters and buffers, including BN running statistics
+- validation uses EMA weights when EMA is enabled
+- best checkpoint saves also use EMA weights when EMA is enabled
+- phase starts use a short EMA warmup so EMA can catch up after cosine restarts or freeze/unfreeze transitions
+- mixed batches slightly lower the effective EMA decay so the shadow weights track noisier updates more quickly
+
+### Structured Checkpoints
+
+New checkpoints now store:
+
+```text
+{
+  model: ...,
+  meta: {
+    checkpoint_version: 2,
+    backend: ...,
+    is_ema: true/false,
+    ema_decay: ...
+  }
+}
+```
+
+Notes:
+- both backends still load older plain checkpoints
+- `--init-from` loads the live model first and then syncs EMA from that loaded model so the two states start aligned
 
 ### Multiphase LR
 
@@ -141,11 +176,9 @@ Optional advanced mode:
 
 That keeps BN affine parameters trainable while BN running statistics remain frozen.
 
-The post-unfreeze LR rule now works on the current effective LR, not the phase base LR, so cosine decay is preserved and the deduction remains cumulative inside the phase.
-
 ## Recommended Training Command
 
-- See in best_train_commands.txt
+See `best_train_commands.txt`.
 
 ## Key Training Arguments
 
@@ -173,6 +206,9 @@ The post-unfreeze LR rule now works on the current effective LR, not the phase b
 - `--mixup / --no-mixup`
 - `--mixup-alpha`
 - `--mixup-prob`
+- `--cutmix-ratio`
+- `--ema / --no-ema`
+- `--ema-decay`
 - `--augment / --no-augment`
 - `--rotation`
 - `--brightness`
@@ -202,5 +238,5 @@ The post-unfreeze LR rule now works on the current effective LR, not the phase b
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -v
+.\.venv\Scripts\python.exe -m pytest tests -v -p no:cacheprovider
 ```

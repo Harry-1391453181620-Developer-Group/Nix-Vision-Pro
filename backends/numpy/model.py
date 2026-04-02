@@ -7,13 +7,48 @@ hard-coding a single channel count into every entry point.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 import numpy as np
 
 from nn.activations import relu, relu_backward
 from nn.layers import BatchNorm2D, Conv2D, Dense, Dropout, MaxPool2D, SqueezeExcitation
+
+
+def load_checkpoint_state(path: str | Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Load either a legacy raw `.npz` state_dict or a structured checkpoint."""
+    checkpoint = Path(path).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    if checkpoint.suffix != ".npz":
+        raise ValueError("Checkpoint must be .npz")
+    try:
+        data = np.load(checkpoint, allow_pickle=False)
+    except Exception as exc:
+        raise ValueError(f"Invalid checkpoint file: {exc}") from exc
+    try:
+        is_structured = "__meta__" in data.files or any(key.startswith("model.") for key in data.files)
+        if not is_structured:
+            return {key: np.asarray(data[key], dtype=np.float64) for key in data.files}, {}
+
+        metadata: dict[str, Any] = {}
+        if "__meta__" in data.files:
+            meta_raw = data["__meta__"]
+            meta_text = str(meta_raw.item())
+            if meta_text:
+                metadata = dict(json.loads(meta_text))
+        state = {
+            key[len("model."):]: np.asarray(data[key], dtype=np.float64)
+            for key in data.files
+            if key.startswith("model.")
+        }
+        if not state:
+            raise ValueError("Structured checkpoint missing `model.` weights")
+        return state, metadata
+    finally:
+        data.close()
 
 
 def _resolve_stage2_channels(width_scale: float) -> int:
@@ -311,25 +346,26 @@ class CNN:
                 raise ValueError(f"Shape mismatch for {key}: expected {target.shape}, got {source.shape}")
             target[...] = source
 
-    def save_weights(self, path: str | Path) -> None:
+    def save_weights(self, path: str | Path, metadata: Mapping[str, Any] | None = None) -> None:
         checkpoint = Path(path)
         if checkpoint.suffix != ".npz":
             raise ValueError("Checkpoint path must use .npz extension")
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(checkpoint, **self.state_dict())
+        payload: dict[str, np.ndarray] = {
+            "__meta__": np.array(
+                json.dumps({
+                    "checkpoint_version": 2,
+                    "backend": "numpy",
+                    **({} if metadata is None else dict(metadata)),
+                }),
+                dtype=np.str_,
+            )
+        }
+        for key, value in self.state_dict().items():
+            payload[f"model.{key}"] = value
+        np.savez(checkpoint, **payload)
 
-    def load_weights(self, path: str | Path) -> None:
-        checkpoint = Path(path).resolve()
-        if not checkpoint.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
-        if checkpoint.suffix != ".npz":
-            raise ValueError("Checkpoint must be .npz")
-        try:
-            data = np.load(checkpoint, allow_pickle=False)
-        except Exception as exc:
-            raise ValueError(f"Invalid checkpoint file: {exc}") from exc
-        try:
-            state = {key: data[key] for key in data.files}
-        finally:
-            data.close()
+    def load_weights(self, path: str | Path) -> dict[str, Any]:
+        state, metadata = load_checkpoint_state(path)
         self.load_state_dict(state)
+        return metadata
