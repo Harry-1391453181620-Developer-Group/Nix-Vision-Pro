@@ -7,7 +7,7 @@ $args = @(
 "--data-dir", "Dataset",
 "--device", "cuda",
 "--seed", "42",
-"--class-count", "62",
+"--class-count", "13",
 
 # =========================
 # Training Settings
@@ -22,7 +22,7 @@ $args = @(
 # =========================
 "--lr", "0.0004", "0.0002",
 "--lr-schedule", "cosine",
-"--min-lr-ratio", "0.03",
+"--min-lr-ratio", "0.3",
 "--warmup-epochs", "3",
 "--after-unfreeze-lr-change", "0.00004",
 
@@ -43,7 +43,7 @@ $args = @(
 "--dropout", "0.2",
 "--label-smoothing", "0.07",
 "--grad-clip", "5.0",
-"--no-class-weighting",
+"--class-weighting",
 "--no-focal-loss",
 
 # Unused
@@ -60,10 +60,10 @@ $args = @(
 "--saturation", "0.2",
 
 # Mixup
-"--mixup",
-"--mixup-alpha", "0.25",
-"--mixup-prob", "0.35",
-"--cutmix-ratio", "0.5",
+"--no-mixup",
+# "--mixup-alpha", "0.25",
+# "--mixup-prob", "0.35",
+# "--cutmix-ratio", "0.5",
 
 # =========================
 # Model Settings
@@ -74,7 +74,7 @@ $args = @(
 # =========================
 # Freeze / Unfreeze
 # =========================
-"--freeze-patience", "9",
+"--freeze-patience", "30",
 "--freeze-epoch-num", "6",
 
 # =========================
@@ -95,7 +95,7 @@ $args = @(
 # Checkpoint
 # =========================
 "--checkpoint", "checkpoints/best_torch_model.pt",
-"--init-from", "D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt",
+"--init-from", "D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt"
 
 # =========================
 # Unused parameters
@@ -109,5 +109,4 @@ $args = @(
 # "--partition-state", "checkpoints/partition_state.json",
 # "--enforce-readonly-dataset"
 )
-
 python.exe train.py @args
