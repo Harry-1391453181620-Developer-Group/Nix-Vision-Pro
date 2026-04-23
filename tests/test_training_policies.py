@@ -1,6 +1,7 @@
 """Focused tests for RandAugment, EMA, schedules, and backbone freeze policy."""
 
 from argparse import Namespace
+import pickle
 import random
 
 import numpy as np
@@ -327,6 +328,7 @@ def test_torch_collate_outputs_contiguous_tensors():
 
 def test_torch_worker_init_fn_reseeds_numpy_and_random_per_worker():
     init_worker = _make_worker_init_fn(1234)
+    pickle.dumps(init_worker)
 
     init_worker(0)
     worker_zero_int = int(np.random.randint(0, 1_000_000))

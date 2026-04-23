@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from functools import partial
 import hashlib
 import json
 import random
@@ -206,13 +207,15 @@ def _resolve_num_workers(streaming: bool, num_workers_arg: int | None) -> int:
     return 4 if streaming else 0
 
 
-def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
-    def _init_worker(worker_id: int) -> None:
-        worker_seed = int(base_seed) + int(worker_id)
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
+def _seed_data_loader_worker(worker_id: int, *, base_seed: int) -> None:
+    """Keep worker init pickle-safe so Windows spawn can launch DataLoader workers."""
+    worker_seed = int(base_seed) + int(worker_id)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
-    return _init_worker
+
+def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
+    return partial(_seed_data_loader_worker, base_seed=int(base_seed))
 
 
 def _collate_image_batch(batch: Sequence[tuple[torch.Tensor, int]]) -> tuple[torch.Tensor, torch.Tensor]:

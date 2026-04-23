@@ -52,3 +52,21 @@ Implemented checkpoint-compatible inference, the torch training runtime refactor
 
 - `pytest` is not installed in the available interpreter in this session, so the added regression tests were compile-checked but not executed under `pytest`.
 - The torch checkpoint smoke validation confirmed the original GUI load failure was fixed at the checkpoint-architecture reconstruction layer.
+
+## Documentation Follow-up
+
+- Added the requested final implementation plan document:
+  - `Agent_History/docs/plans/2026-04-23-checkpoint-compatible-inference-real-torch-speedups-docs-migration-plan.md`
+- Confirmed the plan storage location remains under `Agent_History/docs/plans/` as required by the docs-migration policy.
+
+## Debug Follow-up
+
+- Investigated a Windows torch training failure reported with `--num-workers 4`.
+- Traced the root cause to the nested worker-init closure in `backends/torch/train_backend.py`, which is not pickleable under Windows `spawn`.
+- Replaced the nested worker seeding closure with a top-level pickle-safe worker seeding helper plus `functools.partial`.
+- Extended the torch training policy regression test so the worker-init callable is explicitly pickle-checked.
+
+## Additional Validation
+
+- `.\.venv312\Scripts\python.exe -m py_compile backends\torch\train_backend.py tests\test_training_policies.py`
+- `.\.venv312\Scripts\python.exe train.py --backend torch --data-dir .worktmp\train_smoke_dataset --epochs 1 --batch-size 2 --device cpu --streaming --num-workers 2 --amp-mode off --compile-mode off --no-ema --mixup --mixup-alpha 0.2 --mixup-prob 1.0 --cutmix-ratio 0.5 --checkpoint .worktmp\smoke_torch_workers.pt --val-split 0.25 --phase-count 1 --lr 0.001 --no-early-stop`
