@@ -756,6 +756,7 @@ def main() -> None:
                 checkpoint_model.save_weights(
                     args.checkpoint,
                     metadata={
+                        "class_names": list(resolved_class_names),
                         "is_ema": bool(ema is not None),
                         "ema_decay": float(ema_decay) if ema is not None else None,
                     },
@@ -849,6 +850,7 @@ def main() -> None:
         checkpoint_model.save_weights(
             args.checkpoint,
             metadata={
+                "class_names": list(resolved_class_names),
                 "is_ema": bool(ema is not None),
                 "ema_decay": float(ema_decay) if ema is not None else None,
             },

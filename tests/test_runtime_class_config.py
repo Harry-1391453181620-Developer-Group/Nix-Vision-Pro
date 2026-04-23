@@ -61,3 +61,36 @@ def test_get_class_names_pads_when_class_count_is_larger() -> None:
 def test_get_class_names_falls_back_when_dataset_root_is_missing() -> None:
     class_names = config.get_class_names(Path('.pytest-tmp') / 'missing_dataset_root')
     assert class_names == config.DEFAULT_CLASS_NAMES
+
+
+def test_resolve_runtime_class_names_prefers_checkpoint_names_when_count_matches() -> None:
+    with _dataset_dir() as dataset_root:
+        for class_name in ('bird', 'dog'):
+            class_dir = dataset_root / class_name
+            class_dir.mkdir()
+            _touch_image(class_dir / 'sample.jpg')
+
+        resolved = config.resolve_runtime_class_names(
+            dataset_root,
+            num_classes=2,
+            checkpoint_class_names=['checkpoint_bird', 'checkpoint_dog'],
+            require_images=True,
+        )
+
+        assert resolved == ['checkpoint_bird', 'checkpoint_dog']
+
+
+def test_resolve_runtime_class_names_uses_numeric_placeholders_when_counts_do_not_match() -> None:
+    with _dataset_dir() as dataset_root:
+        class_dir = dataset_root / 'bird'
+        class_dir.mkdir()
+        _touch_image(class_dir / 'sample.jpg')
+
+        resolved = config.resolve_runtime_class_names(
+            dataset_root,
+            num_classes=3,
+            checkpoint_class_names=['bird', 'dog'],
+            require_images=True,
+        )
+
+        assert resolved == ['0', '1', '2']

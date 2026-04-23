@@ -48,13 +48,13 @@ This summary covers the recorded project work from 2026-03-23 through 2026-03-27
 - Added configurable augmentation strengths, random erasing, MixUp, focal loss, and width scaling across both backends.
 - Repaired a torch trainer regression caused by missing helper functions.
 - Enabled MixUp by default and added `--mixup-alpha`.
-- Documented the approved designs in `docs/plans/` and committed the work.
+- Documented the approved designs in `Agent_History/docs/plans/` and committed the work.
 
 ## Documentation And Process
 
 - `README.md`, `Image_Identify_CNN.md`, and `CONTRIBUTING.md` were repeatedly updated to match runtime behavior.
 - Daily histories were written for the active workdays in March.
-- Design notes were added under `docs/plans/` for major approved behavior changes.
+- Design notes were added under `Agent_History/docs/plans/` for major approved behavior changes.
 
 ## Validation Themes
 

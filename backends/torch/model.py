@@ -8,12 +8,27 @@ scale that was used during training if it wants checkpoint shapes to match.
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Tuple
 
 import numpy as np
 import torch
 from torch import nn
+
+
+DEFAULT_INPUT_SIZE: Tuple[int, int] = (32, 32)
+
+
+@dataclass(frozen=True)
+class CheckpointRuntimeConfig:
+    input_size: Tuple[int, int]
+    num_classes: int
+    width_scale: float
+    stage2_channels: int
+    class_names: tuple[str, ...]
+    metadata: dict[str, Any]
 
 
 def load_checkpoint_state(
@@ -55,6 +70,98 @@ def _resolve_stage2_channels(width_scale: float) -> int:
     if width_scale <= 0.0:
         raise ValueError("width_scale must be > 0")
     return max(8, int(round(64 * width_scale)))
+
+
+def _normalize_input_size(value: Any) -> Tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        height = int(value[0])
+        width = int(value[1])
+    except (TypeError, ValueError):
+        return None
+    if height <= 0 or width <= 0:
+        return None
+    return (height, width)
+
+
+def _infer_input_size_from_state(
+    state: Mapping[str, torch.Tensor],
+    default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
+) -> Tuple[int, int]:
+    fc1_weight = state.get("fc1.weight")
+    if fc1_weight is None or fc1_weight.ndim != 2:
+        return tuple(default_input_size)
+    flatten_dim = int(fc1_weight.shape[1])
+    if flatten_dim <= 0 or flatten_dim % 128 != 0:
+        return tuple(default_input_size)
+    spatial_area = flatten_dim // 128
+    spatial_edge = int(round(math.sqrt(spatial_area)))
+    if spatial_edge * spatial_edge != spatial_area:
+        return tuple(default_input_size)
+    return (spatial_edge * 8, spatial_edge * 8)
+
+
+def _normalize_checkpoint_class_names(
+    value: Any,
+    *,
+    expected_count: int,
+) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    class_names = tuple(str(item).strip() for item in value if str(item).strip())
+    return class_names if len(class_names) == expected_count else ()
+
+
+def resolve_checkpoint_runtime_config(
+    path: str | Path,
+    map_location: str | torch.device | None = None,
+    *,
+    default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
+) -> CheckpointRuntimeConfig:
+    state, metadata = load_checkpoint_state(path, map_location=map_location)
+    return resolve_runtime_config_from_state(
+        state,
+        metadata,
+        default_input_size=default_input_size,
+    )
+
+
+def resolve_runtime_config_from_state(
+    state: Mapping[str, torch.Tensor],
+    metadata: Mapping[str, Any] | None = None,
+    *,
+    default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
+) -> CheckpointRuntimeConfig:
+    metadata_dict = {} if metadata is None else dict(metadata)
+
+    fc2_weight = state.get("fc2.weight")
+    if fc2_weight is None or fc2_weight.ndim != 2:
+        raise ValueError("Checkpoint is missing `fc2.weight`, so num_classes cannot be resolved")
+    conv3_weight = state.get("conv3.weight")
+    if conv3_weight is None or conv3_weight.ndim != 4:
+        raise ValueError("Checkpoint is missing `conv3.weight`, so width_scale cannot be resolved")
+
+    num_classes = int(metadata_dict.get("num_classes", fc2_weight.shape[0]))
+    stage2_channels = int(metadata_dict.get("stage2_channels", conv3_weight.shape[0]))
+    width_scale = float(metadata_dict.get("width_scale", stage2_channels / 64.0))
+    input_size = (
+        _normalize_input_size(metadata_dict.get("input_size"))
+        or _infer_input_size_from_state(state, default_input_size=default_input_size)
+    )
+    class_names = _normalize_checkpoint_class_names(
+        metadata_dict.get("class_names"),
+        expected_count=num_classes,
+    )
+
+    return CheckpointRuntimeConfig(
+        input_size=input_size,
+        num_classes=num_classes,
+        width_scale=width_scale,
+        stage2_channels=stage2_channels,
+        class_names=class_names,
+        metadata=metadata_dict,
+    )
 
 
 class SqueezeExcitation(nn.Module):
@@ -138,6 +245,16 @@ class TorchCNN(nn.Module):
         """Expose the resolved stage-2 channel count for tests and diagnostics."""
         return self._stage2_channels
 
+    @property
+    def input_size(self) -> Tuple[int, int]:
+        """Expose the configured input size for checkpoint metadata and tests."""
+        return self._input_size
+
+    @property
+    def num_classes(self) -> int:
+        """Expose the classifier output size for checkpoint metadata and tests."""
+        return self._num_classes
+
     def backbone_modules(self) -> tuple[nn.Module, ...]:
         """Return the feature extractor modules affected by temporary freezing."""
         return (
@@ -206,16 +323,17 @@ class TorchCNN(nn.Module):
             x = torch.from_numpy(x)
         if not isinstance(x, torch.Tensor):
             raise TypeError(f"Unsupported input type: {type(x)!r}")
-        x = x.float()
         device = next(self.parameters()).device
-        x = x.to(device)
+        x = x.to(device=device, dtype=torch.float32)
 
         # Accept both NHWC and NCHW to keep compatibility with the current pipeline.
         if x.ndim != 4:
             raise ValueError(f"Expected 4D input, got {tuple(x.shape)}")
-        if x.shape[-1] == 3:
-            x = x.permute(0, 3, 1, 2).contiguous()
-        elif x.shape[1] != 3:
+        if x.shape[1] == 3:
+            pass
+        elif x.shape[-1] == 3:
+            x = x.permute(0, 3, 1, 2)
+        else:
             raise ValueError("Input must be NHWC or NCHW with 3 channels")
 
         x = self._forward_features(x)
@@ -229,13 +347,18 @@ class TorchCNN(nn.Module):
         if checkpoint.suffix not in {".pt", ".pth"}:
             raise ValueError("Checkpoint path must use .pt or .pth extension")
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        payload_metadata = {
+            "checkpoint_version": 2,
+            "backend": "torch",
+            "num_classes": int(self.num_classes),
+            "width_scale": float(self.width_scale),
+            "stage2_channels": int(self.stage2_channels),
+            "input_size": list(self.input_size),
+            **({} if metadata is None else dict(metadata)),
+        }
         payload = {
             "model": self.state_dict(),
-            "meta": {
-                "checkpoint_version": 2,
-                "backend": "torch",
-                **({} if metadata is None else dict(metadata)),
-            },
+            "meta": payload_metadata,
         }
         torch.save(payload, checkpoint)
 
@@ -251,4 +374,11 @@ class TorchCNN(nn.Module):
 
 CNN = TorchCNN
 
-__all__ = ["TorchCNN", "CNN"]
+__all__ = [
+    "CheckpointRuntimeConfig",
+    "TorchCNN",
+    "CNN",
+    "load_checkpoint_state",
+    "resolve_checkpoint_runtime_config",
+    "resolve_runtime_config_from_state",
+]

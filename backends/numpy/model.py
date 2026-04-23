@@ -8,6 +8,8 @@ hard-coding a single channel count into every entry point.
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Tuple
 
@@ -15,6 +17,19 @@ import numpy as np
 
 from nn.activations import relu, relu_backward
 from nn.layers import BatchNorm2D, Conv2D, Dense, Dropout, MaxPool2D, SqueezeExcitation
+
+
+DEFAULT_INPUT_SIZE: Tuple[int, int] = (32, 32)
+
+
+@dataclass(frozen=True)
+class CheckpointRuntimeConfig:
+    input_size: Tuple[int, int]
+    num_classes: int
+    width_scale: float
+    stage2_channels: int
+    class_names: tuple[str, ...]
+    metadata: dict[str, Any]
 
 
 def load_checkpoint_state(path: str | Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
@@ -57,6 +72,97 @@ def _resolve_stage2_channels(width_scale: float) -> int:
     if width_scale <= 0.0:
         raise ValueError("width_scale must be > 0")
     return max(8, int(round(64 * width_scale)))
+
+
+def _normalize_input_size(value: Any) -> Tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        height = int(value[0])
+        width = int(value[1])
+    except (TypeError, ValueError):
+        return None
+    if height <= 0 or width <= 0:
+        return None
+    return (height, width)
+
+
+def _infer_input_size_from_state(
+    state: Mapping[str, np.ndarray],
+    default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
+) -> Tuple[int, int]:
+    fc1_weight = state.get("fc1.W")
+    if fc1_weight is None or fc1_weight.ndim != 2:
+        return tuple(default_input_size)
+    flatten_dim = int(fc1_weight.shape[0])
+    if flatten_dim <= 0 or flatten_dim % 128 != 0:
+        return tuple(default_input_size)
+    spatial_area = flatten_dim // 128
+    spatial_edge = int(round(math.sqrt(spatial_area)))
+    if spatial_edge * spatial_edge != spatial_area:
+        return tuple(default_input_size)
+    return (spatial_edge * 8, spatial_edge * 8)
+
+
+def _normalize_checkpoint_class_names(
+    value: Any,
+    *,
+    expected_count: int,
+) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    class_names = tuple(str(item).strip() for item in value if str(item).strip())
+    return class_names if len(class_names) == expected_count else ()
+
+
+def resolve_checkpoint_runtime_config(
+    path: str | Path,
+    *,
+    default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
+) -> CheckpointRuntimeConfig:
+    state, metadata = load_checkpoint_state(path)
+    return resolve_runtime_config_from_state(
+        state,
+        metadata,
+        default_input_size=default_input_size,
+    )
+
+
+def resolve_runtime_config_from_state(
+    state: Mapping[str, np.ndarray],
+    metadata: Mapping[str, Any] | None = None,
+    *,
+    default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
+) -> CheckpointRuntimeConfig:
+    metadata_dict = {} if metadata is None else dict(metadata)
+
+    fc2_weight = state.get("fc2.W")
+    if fc2_weight is None or fc2_weight.ndim != 2:
+        raise ValueError("Checkpoint is missing `fc2.W`, so num_classes cannot be resolved")
+    conv3_weight = state.get("conv3.W")
+    if conv3_weight is None or conv3_weight.ndim != 4:
+        raise ValueError("Checkpoint is missing `conv3.W`, so width_scale cannot be resolved")
+
+    num_classes = int(metadata_dict.get("num_classes", fc2_weight.shape[1]))
+    stage2_channels = int(metadata_dict.get("stage2_channels", conv3_weight.shape[-1]))
+    width_scale = float(metadata_dict.get("width_scale", stage2_channels / 64.0))
+    input_size = (
+        _normalize_input_size(metadata_dict.get("input_size"))
+        or _infer_input_size_from_state(state, default_input_size=default_input_size)
+    )
+    class_names = _normalize_checkpoint_class_names(
+        metadata_dict.get("class_names"),
+        expected_count=num_classes,
+    )
+
+    return CheckpointRuntimeConfig(
+        input_size=input_size,
+        num_classes=num_classes,
+        width_scale=width_scale,
+        stage2_channels=stage2_channels,
+        class_names=class_names,
+        metadata=metadata_dict,
+    )
 
 
 class CNN:
@@ -128,6 +234,14 @@ class CNN:
     def stage2_channels(self) -> int:
         """Expose the resolved stage-2 channel count for tests and diagnostics."""
         return self._stage2_channels
+
+    @property
+    def input_size(self) -> Tuple[int, int]:
+        return self._input_size
+
+    @property
+    def num_classes(self) -> int:
+        return self._num_classes
 
     def train(self) -> None:
         self._training = True
@@ -351,13 +465,18 @@ class CNN:
         if checkpoint.suffix != ".npz":
             raise ValueError("Checkpoint path must use .npz extension")
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        payload_metadata = {
+            "checkpoint_version": 2,
+            "backend": "numpy",
+            "num_classes": int(self.num_classes),
+            "width_scale": float(self.width_scale),
+            "stage2_channels": int(self.stage2_channels),
+            "input_size": list(self.input_size),
+            **({} if metadata is None else dict(metadata)),
+        }
         payload: dict[str, np.ndarray] = {
             "__meta__": np.array(
-                json.dumps({
-                    "checkpoint_version": 2,
-                    "backend": "numpy",
-                    **({} if metadata is None else dict(metadata)),
-                }),
+                json.dumps(payload_metadata),
                 dtype=np.str_,
             )
         }
@@ -369,3 +488,12 @@ class CNN:
         state, metadata = load_checkpoint_state(path)
         self.load_state_dict(state)
         return metadata
+
+
+__all__ = [
+    "CheckpointRuntimeConfig",
+    "CNN",
+    "load_checkpoint_state",
+    "resolve_checkpoint_runtime_config",
+    "resolve_runtime_config_from_state",
+]

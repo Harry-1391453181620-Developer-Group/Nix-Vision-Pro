@@ -6,7 +6,7 @@ Added controlled augmentation, temporary backbone freeze, and multiphase LR trai
 
 ## Work completed
 
-- Wrote the approved design note to `docs/plans/2026-03-26-phase-freeze-augment-design.md`.
+- Wrote the approved design note to `Agent_History/docs/plans/2026-03-26-phase-freeze-augment-design.md`.
 - Added `utils/training.py` so both backends share:
   - deterministic augmentation order
   - reflection-padded centered rotation

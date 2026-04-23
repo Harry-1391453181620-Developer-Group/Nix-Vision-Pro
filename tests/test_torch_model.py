@@ -8,7 +8,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from backends.torch.model import TorchCNN, load_checkpoint_state
+from backends.torch.model import TorchCNN, load_checkpoint_state, resolve_checkpoint_runtime_config
+from backends.torch.predict_backend import _validate_checkpoint_overrides
 
 
 def test_torch_cnn_forward_shape():
@@ -63,3 +64,52 @@ def test_torch_cnn_loads_legacy_state_dict_checkpoint():
         restored(x).detach().cpu().numpy(),
         atol=1e-6,
     )
+
+
+def test_torch_checkpoint_runtime_config_round_trip_from_structured_checkpoint():
+    checkpoint = Path('.worktmp') / 'model_test_torch_runtime_config.pt'
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    class_names = [f'class_{index}' for index in range(13)]
+    model = TorchCNN(input_size=(32, 32), num_classes=13, seed=29, width_scale=1.5)
+    model.save_weights(checkpoint, metadata={"class_names": class_names})
+
+    runtime_config = resolve_checkpoint_runtime_config(checkpoint, map_location='cpu')
+
+    assert runtime_config.num_classes == 13
+    assert runtime_config.width_scale == pytest.approx(1.5)
+    assert runtime_config.stage2_channels == model.stage2_channels
+    assert runtime_config.input_size == (32, 32)
+    assert runtime_config.class_names == class_names
+
+
+def test_torch_checkpoint_runtime_config_infers_legacy_architecture():
+    checkpoint = Path('.worktmp') / 'model_test_torch_runtime_config_legacy.pt'
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    model = TorchCNN(input_size=(32, 32), num_classes=13, seed=31, width_scale=1.0)
+    torch.save(model.state_dict(), checkpoint)
+
+    runtime_config = resolve_checkpoint_runtime_config(checkpoint, map_location='cpu')
+
+    assert runtime_config.num_classes == 13
+    assert runtime_config.width_scale == pytest.approx(1.0)
+    assert runtime_config.stage2_channels == 64
+    assert runtime_config.input_size == (32, 32)
+    assert runtime_config.class_names is None
+
+
+def test_torch_predict_override_validation_rejects_checkpoint_conflicts():
+    with pytest.raises(SystemExit, match="class-count"):
+        _validate_checkpoint_overrides(
+            class_count_override=12,
+            width_scale_override=None,
+            checkpoint_num_classes=13,
+            checkpoint_width_scale=1.0,
+        )
+
+    with pytest.raises(SystemExit, match="model-width-scale"):
+        _validate_checkpoint_overrides(
+            class_count_override=None,
+            width_scale_override=0.75,
+            checkpoint_num_classes=13,
+            checkpoint_width_scale=1.0,
+        )

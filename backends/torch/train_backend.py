@@ -8,9 +8,13 @@ PyTorch. The original NumPy trainer remains available under `--backend numpy`.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
+import random
+import time
 from pathlib import Path
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -22,7 +26,6 @@ from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
     ModelEMA,
     adjust_phase_lr_offset_after_unfreeze,
-    apply_batch_mix,
     augment_batch,
     build_epoch_phase_map,
     compute_effective_learning_rate,
@@ -45,8 +48,61 @@ try:
     import torch
     from torch import nn
     import torch.nn.functional as F
+    from torch.utils.data import DataLoader, Dataset
 except Exception as exc:
     raise SystemExit(f"PyTorch backend is unavailable in this interpreter: {exc}") from exc
+
+
+class TorchImageDataset(Dataset[tuple[torch.Tensor, int]]):
+    """Stateless dataset for worker-safe Windows DataLoader multiprocessing."""
+
+    def __init__(
+        self,
+        *,
+        labels: np.ndarray,
+        input_size: tuple[int, int],
+        paths: Sequence[Path] | None = None,
+        preloaded_images: np.ndarray | None = None,
+        augment_config=None,
+    ) -> None:
+        if paths is None and preloaded_images is None:
+            raise ValueError("Either paths or preloaded_images must be provided")
+        if paths is not None and preloaded_images is not None and len(paths) != int(preloaded_images.shape[0]):
+            raise ValueError("paths and preloaded_images must have matching lengths")
+        self.labels = np.asarray(labels, dtype=np.int64)
+        self.input_size = tuple(input_size)
+        self.paths = tuple(Path(path) for path in paths) if paths is not None else None
+        self.preloaded_images = (
+            np.asarray(preloaded_images, dtype=np.float32)
+            if preloaded_images is not None
+            else None
+        )
+        self.augment_config = augment_config
+
+    def __len__(self) -> int:
+        return int(self.labels.shape[0])
+
+    def _load_image(self, index: int) -> np.ndarray:
+        if self.preloaded_images is not None:
+            return np.asarray(self.preloaded_images[index], dtype=np.float32)
+        assert self.paths is not None
+        image = load_image(self.paths[index])
+        return preprocess_image(
+            image,
+            target_size=self.input_size,
+            normalize_to=config.NORMALIZE_TO,
+            input_value_range=config.INPUT_VALUE_RANGE,
+        ).astype(np.float32)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        image = self._load_image(index)
+        if self.augment_config is not None:
+            seed = int(np.random.randint(0, 2**31 - 1))
+            rng = np.random.default_rng(seed)
+            image = augment_batch(image[np.newaxis, ...], rng, self.augment_config)[0]
+        image_nchw = np.transpose(image, (2, 0, 1))
+        image_tensor = torch.from_numpy(np.ascontiguousarray(image_nchw, dtype=np.float32))
+        return image_tensor, int(self.labels[index])
 
 
 def list_labeled_paths(
@@ -142,19 +198,57 @@ def _resolve_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr_value: float) -> None:
-    """Update every optimizer parameter group to the current effective LR."""
-    for group in optimizer.param_groups:
-        group["lr"] = lr_value
+def _resolve_num_workers(streaming: bool, num_workers_arg: int | None) -> int:
+    if num_workers_arg is not None:
+        if int(num_workers_arg) < 0:
+            raise SystemExit("--num-workers must be >= 0")
+        return int(num_workers_arg)
+    return 4 if streaming else 0
 
 
-def _to_tensor_batch(x_batch: np.ndarray, device: torch.device) -> torch.Tensor:
-    """Convert a contiguous NHWC NumPy batch into a float32 torch tensor."""
-    return torch.from_numpy(np.ascontiguousarray(x_batch)).to(device=device, dtype=torch.float32)
+def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
+    def _init_worker(worker_id: int) -> None:
+        worker_seed = int(base_seed) + int(worker_id)
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    return _init_worker
 
 
-def _load_batch(paths: list[Path], input_size: tuple[int, int]) -> np.ndarray:
-    """Load and preprocess one batch of images from disk."""
+def _collate_image_batch(batch: Sequence[tuple[torch.Tensor, int]]) -> tuple[torch.Tensor, torch.Tensor]:
+    images, labels = zip(*batch)
+    image_tensor = torch.stack(images, dim=0).contiguous()
+    label_tensor = torch.as_tensor(labels, dtype=torch.int64).contiguous()
+    return image_tensor, label_tensor
+
+
+def _build_data_loader(
+    dataset: Dataset[tuple[torch.Tensor, int]],
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    base_seed: int,
+) -> DataLoader[tuple[torch.Tensor, torch.Tensor]]:
+    generator = torch.Generator()
+    generator.manual_seed(int(base_seed))
+    loader_kwargs: dict[str, object] = {
+        "batch_size": int(batch_size),
+        "shuffle": bool(shuffle),
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+        "collate_fn": _collate_image_batch,
+        "generator": generator,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+        loader_kwargs["worker_init_fn"] = _make_worker_init_fn(base_seed)
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def _load_all_images(paths: Sequence[Path], input_size: tuple[int, int]) -> np.ndarray:
     batch = np.empty((len(paths), input_size[0], input_size[1], 3), dtype=np.float32)
     for index, image_path in enumerate(paths):
         image = load_image(image_path)
@@ -167,18 +261,48 @@ def _load_batch(paths: list[Path], input_size: tuple[int, int]) -> np.ndarray:
     return batch
 
 
+def _move_input_batch(
+    x_batch: torch.Tensor,
+    device: torch.device,
+    *,
+    use_channels_last: bool,
+) -> torch.Tensor:
+    x_tensor = x_batch.to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=(device.type == "cuda"),
+    )
+    if use_channels_last:
+        x_tensor = x_tensor.contiguous(memory_format=torch.channels_last)
+    return x_tensor
+
+
+def _move_label_batch(y_batch: torch.Tensor, device: torch.device) -> torch.Tensor:
+    return y_batch.to(device=device, dtype=torch.long, non_blocking=(device.type == "cuda"))
+
+
 def _make_target_distribution(
-    labels: np.ndarray,
+    labels: torch.Tensor,
     num_classes: int,
     label_smoothing: float,
-) -> np.ndarray:
-    """Build one-hot or label-smoothed targets before tensor conversion."""
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     label_smoothing = float(label_smoothing)
     if not (0.0 <= label_smoothing < 1.0):
         raise ValueError("label_smoothing must satisfy 0 <= value < 1")
-    labels = np.asarray(labels, dtype=np.int64).ravel()
-    targets = np.full((labels.size, num_classes), label_smoothing / num_classes, dtype=np.float32)
-    targets[np.arange(labels.size), labels] = 1.0 - label_smoothing + (label_smoothing / num_classes)
+    labels = labels.to(dtype=torch.long).view(-1)
+    targets = torch.full(
+        (int(labels.shape[0]), int(num_classes)),
+        fill_value=label_smoothing / num_classes,
+        device=labels.device,
+        dtype=dtype,
+    )
+    targets.scatter_(
+        1,
+        labels.unsqueeze(1),
+        1.0 - label_smoothing + (label_smoothing / num_classes),
+    )
     return targets
 
 
@@ -230,87 +354,383 @@ def _compute_batch_loss(
     return _soft_cross_entropy_loss(logits, targets, class_weights=ce_class_weights)
 
 
-def evaluate_streaming(
+def _beta_sample_on_device(beta_alpha: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    concentration = torch.tensor(float(beta_alpha), device=device, dtype=dtype)
+    return torch.distributions.Beta(concentration, concentration).sample().to(device=device, dtype=dtype)
+
+
+def _apply_mixup_torch(
+    x_batch: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    beta_alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor]:
+    if int(x_batch.shape[0]) < 2:
+        lam = torch.ones((), device=x_batch.device, dtype=x_batch.dtype)
+        return x_batch, targets, False, lam
+    lam = _beta_sample_on_device(beta_alpha, device=x_batch.device, dtype=x_batch.dtype)
+    permutation = torch.randperm(int(x_batch.shape[0]), device=x_batch.device)
+    lam_targets = lam.to(device=targets.device, dtype=targets.dtype)
+    mixed_x = lam * x_batch + (1.0 - lam) * x_batch[permutation]
+    mixed_targets = lam_targets * targets + (1.0 - lam_targets) * targets[permutation]
+    return mixed_x, mixed_targets, True, lam
+
+
+def _apply_cutmix_torch(
+    x_batch: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    beta_alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor]:
+    if int(x_batch.shape[0]) < 2:
+        lam = torch.ones((), device=x_batch.device, dtype=x_batch.dtype)
+        return x_batch, targets, False, lam
+
+    batch_size, _, height, width = x_batch.shape
+    lam_sample = _beta_sample_on_device(beta_alpha, device=x_batch.device, dtype=x_batch.dtype)
+    cut_ratio = torch.sqrt(torch.clamp(1.0 - lam_sample, min=0.0, max=1.0))
+
+    cut_w = torch.clamp(torch.round(torch.tensor(float(width), device=x_batch.device, dtype=x_batch.dtype) * cut_ratio), min=1.0, max=float(width)).to(dtype=torch.int64)
+    cut_h = torch.clamp(torch.round(torch.tensor(float(height), device=x_batch.device, dtype=x_batch.dtype) * cut_ratio), min=1.0, max=float(height)).to(dtype=torch.int64)
+
+    center_x = torch.randint(0, width, (1,), device=x_batch.device, dtype=torch.int64).item()
+    center_y = torch.randint(0, height, (1,), device=x_batch.device, dtype=torch.int64).item()
+    x1 = max(0, center_x - int(cut_w.item()) // 2)
+    y1 = max(0, center_y - int(cut_h.item()) // 2)
+    x2 = min(width, center_x + (int(cut_w.item()) + 1) // 2)
+    y2 = min(height, center_y + (int(cut_h.item()) + 1) // 2)
+
+    permutation = torch.randperm(batch_size, device=x_batch.device)
+    mixed_x = x_batch.clone()
+    mixed_x[:, :, y1:y2, x1:x2] = x_batch[permutation, :, y1:y2, x1:x2]
+
+    patch_area = float(max(0, y2 - y1) * max(0, x2 - x1))
+    lam = torch.tensor(
+        1.0 - (patch_area / float(height * width)),
+        device=x_batch.device,
+        dtype=x_batch.dtype,
+    )
+    lam_targets = lam.to(device=targets.device, dtype=targets.dtype)
+    mixed_targets = lam_targets * targets + (1.0 - lam_targets) * targets[permutation]
+    return mixed_x, mixed_targets, True, lam
+
+
+def _apply_batch_mix_torch(
+    x_batch: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    prob: float,
+    beta_alpha: float,
+    cutmix_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor, str, torch.Tensor]:
+    if int(x_batch.shape[0]) < 2 or float(prob) <= 0.0:
+        lam = torch.ones((), device=x_batch.device, dtype=x_batch.dtype)
+        return x_batch, targets, "none", lam
+    if torch.rand((), device=x_batch.device) >= float(prob):
+        lam = torch.ones((), device=x_batch.device, dtype=x_batch.dtype)
+        return x_batch, targets, "none", lam
+    if torch.rand((), device=x_batch.device) < float(cutmix_ratio):
+        mixed_x, mixed_targets, _, lam = _apply_cutmix_torch(x_batch, targets, beta_alpha=beta_alpha)
+        return mixed_x, mixed_targets, "cutmix", lam
+    mixed_x, mixed_targets, _, lam = _apply_mixup_torch(x_batch, targets, beta_alpha=beta_alpha)
+    return mixed_x, mixed_targets, "mixup", lam
+
+
+def _resolve_amp_dtype(device: torch.device, amp_mode: str) -> torch.dtype | None:
+    if amp_mode not in {"auto", "on", "off"}:
+        raise ValueError(f"Unsupported amp_mode: {amp_mode}")
+    if amp_mode == "off":
+        return None
+    if device.type != "cuda":
+        if amp_mode == "on":
+            raise SystemExit("--amp-mode=on requires CUDA")
+        return None
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def _make_grad_scaler(device: torch.device, amp_dtype: torch.dtype | None):
+    enabled = bool(device.type == "cuda" and amp_dtype == torch.float16)
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except AttributeError:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _make_autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
+    return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
+
+
+def _configure_runtime_kernels(device: torch.device, *, fixed_input_shape: bool) -> bool:
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+    use_channels_last = device.type == "cuda"
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = bool(device.type == "cuda" and fixed_input_shape)
+    return use_channels_last
+
+
+def _backward_and_step(
+    loss: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
     model: TorchCNN,
-    paths: list[Path],
-    labels: np.ndarray,
+    *,
+    grad_clip: float,
+    scaler,
+) -> None:
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if scaler is not None and getattr(scaler, "is_enabled", lambda: False)():
+        scaler.scale(loss).backward()
+        if grad_clip > 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm=grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        return
+    loss.backward()
+    if grad_clip > 0.0:
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm=grad_clip)
+    optimizer.step()
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device=device)
+
+
+def _benchmark_train_steps(
+    *,
+    forward_model: nn.Module,
+    raw_model: TorchCNN,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    x_batch: torch.Tensor,
+    y_batch_idx: torch.Tensor,
     num_classes: int,
-    batch_size: int,
-    input_size: tuple[int, int],
+    label_smoothing: float,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: torch.Tensor | None,
+    focal_alpha_weights: torch.Tensor | None,
+    grad_clip: float,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    warmup_steps: int,
+    measure_steps: int,
+) -> float:
+    forward_model.train()
+    raw_model.train()
+    times: list[float] = []
+    targets = _make_target_distribution(
+        y_batch_idx,
+        num_classes,
+        label_smoothing=label_smoothing,
+        dtype=torch.float32,
+    )
+    total_steps = int(warmup_steps) + int(measure_steps)
+    for step in range(total_steps):
+        optimizer.zero_grad(set_to_none=True)
+        _synchronize_device(device)
+        start = time.perf_counter()
+        with _make_autocast_context(device, amp_dtype):
+            logits = forward_model(x_batch)
+            loss = _compute_batch_loss(
+                logits,
+                targets,
+                use_focal_loss=use_focal_loss,
+                focal_gamma=focal_gamma,
+                ce_class_weights=ce_class_weights,
+                focal_alpha_weights=focal_alpha_weights,
+            )
+        _backward_and_step(
+            loss,
+            optimizer,
+            raw_model,
+            grad_clip=grad_clip,
+            scaler=scaler,
+        )
+        _synchronize_device(device)
+        elapsed = time.perf_counter() - start
+        if step >= warmup_steps:
+            times.append(elapsed)
+    return float(np.median(np.asarray(times, dtype=np.float64)))
+
+
+def _should_keep_compiled_model(
+    eager_step_median: float,
+    compiled_step_median: float,
+    *,
+    required_speedup_ratio: float = 0.95,
+) -> bool:
+    return float(compiled_step_median) < (float(eager_step_median) * float(required_speedup_ratio))
+
+
+def _clone_model_for_benchmark(
+    model: TorchCNN,
+    *,
+    device: torch.device,
+    use_channels_last: bool,
+) -> TorchCNN:
+    cloned = copy.deepcopy(model)
+    if use_channels_last:
+        cloned.to(device=device, memory_format=torch.channels_last)
+    else:
+        cloned.to(device=device)
+    return cloned
+
+
+def _maybe_enable_compiled_forward_model(
+    *,
+    model: TorchCNN,
+    args: argparse.Namespace,
+    benchmark_batch: tuple[torch.Tensor, torch.Tensor] | None,
+    benchmark_lr: float,
+    num_classes: int,
+    label_smoothing: float,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: torch.Tensor | None,
+    focal_alpha_weights: torch.Tensor | None,
+    grad_clip: float,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    use_channels_last: bool,
+) -> nn.Module | None:
+    if args.compile_mode == "off":
+        return None
+    if device.type != "cuda":
+        if args.compile_mode == "on":
+            raise SystemExit("--compile-mode=on requires CUDA")
+        return None
+    if not hasattr(torch, "compile"):
+        if args.compile_mode == "on":
+            raise SystemExit("torch.compile is unavailable in this PyTorch build")
+        print("[warn] torch.compile unavailable; continuing in eager mode.")
+        return None
+
+    if args.compile_mode == "on":
+        try:
+            compiled = torch.compile(model)
+            print("Enabled torch.compile (--compile-mode=on).")
+            return compiled
+        except Exception as exc:
+            raise SystemExit(f"Failed to enable torch.compile: {exc}") from exc
+
+    if benchmark_batch is None:
+        return None
+
+    x_cpu, y_cpu = benchmark_batch
+    x_device = _move_input_batch(x_cpu, device, use_channels_last=use_channels_last)
+    y_device = _move_label_batch(y_cpu, device)
+
+    try:
+        eager_model = _clone_model_for_benchmark(model, device=device, use_channels_last=use_channels_last)
+        eager_optimizer = _build_optimizer(args, eager_model, lr_value=benchmark_lr)
+        eager_scaler = _make_grad_scaler(device, amp_dtype)
+        eager_time = _benchmark_train_steps(
+            forward_model=eager_model,
+            raw_model=eager_model,
+            optimizer=eager_optimizer,
+            scaler=eager_scaler,
+            x_batch=x_device,
+            y_batch_idx=y_device,
+            num_classes=num_classes,
+            label_smoothing=label_smoothing,
+            use_focal_loss=use_focal_loss,
+            focal_gamma=focal_gamma,
+            ce_class_weights=ce_class_weights,
+            focal_alpha_weights=focal_alpha_weights,
+            grad_clip=grad_clip,
+            device=device,
+            amp_dtype=amp_dtype,
+            warmup_steps=5,
+            measure_steps=10,
+        )
+
+        compiled_model = _clone_model_for_benchmark(model, device=device, use_channels_last=use_channels_last)
+        compiled_forward = torch.compile(compiled_model)
+        compiled_optimizer = _build_optimizer(args, compiled_model, lr_value=benchmark_lr)
+        compiled_scaler = _make_grad_scaler(device, amp_dtype)
+        compiled_time = _benchmark_train_steps(
+            forward_model=compiled_forward,
+            raw_model=compiled_model,
+            optimizer=compiled_optimizer,
+            scaler=compiled_scaler,
+            x_batch=x_device,
+            y_batch_idx=y_device,
+            num_classes=num_classes,
+            label_smoothing=label_smoothing,
+            use_focal_loss=use_focal_loss,
+            focal_gamma=focal_gamma,
+            ce_class_weights=ce_class_weights,
+            focal_alpha_weights=focal_alpha_weights,
+            grad_clip=grad_clip,
+            device=device,
+            amp_dtype=amp_dtype,
+            warmup_steps=5,
+            measure_steps=10,
+        )
+
+        if not _should_keep_compiled_model(eager_time, compiled_time):
+            print(
+                f"[info] torch.compile disabled: eager median step {eager_time:.6f}s, "
+                f"compiled median step {compiled_time:.6f}s"
+            )
+            return None
+
+        live_compiled_forward = torch.compile(model)
+        print(
+            f"Enabled torch.compile: eager median step {eager_time:.6f}s, "
+            f"compiled median step {compiled_time:.6f}s"
+        )
+        return live_compiled_forward
+    except Exception as exc:
+        print(f"[warn] torch.compile disabled: {exc}")
+        return None
+
+
+def evaluate_loader(
+    model: nn.Module,
+    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    num_classes: int,
     device: torch.device,
     *,
+    use_channels_last: bool,
+    amp_dtype: torch.dtype | None,
     use_focal_loss: bool,
     focal_gamma: float,
     ce_class_weights: torch.Tensor | None,
     focal_alpha_weights: torch.Tensor | None,
 ) -> tuple[float, float]:
-    """Evaluate a model while streaming validation images from disk."""
-    if len(paths) == 0:
+    if len(loader.dataset) == 0:
         return float("nan"), float("nan")
     total_loss = 0.0
     total_correct = 0
     num_batches = 0
     model.eval()
     with torch.no_grad():
-        for start in range(0, len(paths), batch_size):
-            end = min(start + batch_size, len(paths))
-            x_batch = _load_batch(paths[start:end], input_size)
-            y_batch = labels[start:end]
-            targets = _make_target_distribution(y_batch, num_classes, label_smoothing=0.0)
-            y_tensor = torch.as_tensor(targets, device=device, dtype=torch.float32)
-            logits = model(_to_tensor_batch(x_batch, device))
-            loss = _compute_batch_loss(
-                logits,
-                y_tensor,
-                use_focal_loss=use_focal_loss,
-                focal_gamma=focal_gamma,
-                ce_class_weights=ce_class_weights,
-                focal_alpha_weights=focal_alpha_weights,
+        for x_cpu, y_cpu in loader:
+            x_batch = _move_input_batch(x_cpu, device, use_channels_last=use_channels_last)
+            y_batch = _move_label_batch(y_cpu, device)
+            targets = _make_target_distribution(
+                y_batch,
+                num_classes,
+                label_smoothing=0.0,
+                dtype=torch.float32,
             )
+            with _make_autocast_context(device, amp_dtype):
+                logits = model(x_batch)
+                loss = _compute_batch_loss(
+                    logits,
+                    targets,
+                    use_focal_loss=use_focal_loss,
+                    focal_gamma=focal_gamma,
+                    ce_class_weights=ce_class_weights,
+                    focal_alpha_weights=focal_alpha_weights,
+                )
             total_loss += float(loss.item())
-            total_correct += int((torch.argmax(logits, dim=1) == torch.as_tensor(y_batch, device=device, dtype=torch.long)).sum().item())
+            total_correct += int((torch.argmax(logits, dim=1) == y_batch).sum().item())
             num_batches += 1
-    return total_loss / max(1, num_batches), total_correct / max(1, len(paths))
-
-
-def evaluate_preloaded(
-    model: TorchCNN,
-    x_data: np.ndarray,
-    labels: np.ndarray,
-    num_classes: int,
-    batch_size: int,
-    device: torch.device,
-    *,
-    use_focal_loss: bool,
-    focal_gamma: float,
-    ce_class_weights: torch.Tensor | None,
-    focal_alpha_weights: torch.Tensor | None,
-) -> tuple[float, float]:
-    """Evaluate a model against a preloaded validation tensor."""
-    total_loss = 0.0
-    total_correct = 0
-    num_batches = 0
-    model.eval()
-    with torch.no_grad():
-        for start in range(0, len(labels), batch_size):
-            end = min(start + batch_size, len(labels))
-            x_batch = _to_tensor_batch(x_data[start:end], device)
-            y_batch = labels[start:end]
-            targets = _make_target_distribution(y_batch, num_classes, label_smoothing=0.0)
-            y_tensor = torch.as_tensor(targets, device=device, dtype=torch.float32)
-            logits = model(x_batch)
-            loss = _compute_batch_loss(
-                logits,
-                y_tensor,
-                use_focal_loss=use_focal_loss,
-                focal_gamma=focal_gamma,
-                ce_class_weights=ce_class_weights,
-                focal_alpha_weights=focal_alpha_weights,
-            )
-            total_loss += float(loss.item())
-            total_correct += int((torch.argmax(logits, dim=1) == torch.as_tensor(y_batch, device=device, dtype=torch.long)).sum().item())
-            num_batches += 1
-    return total_loss / max(1, num_batches), total_correct / max(1, len(labels))
+    return total_loss / max(1, num_batches), total_correct / max(1, len(loader.dataset))
 
 
 def load_weights_forgiving(model: TorchCNN, checkpoint_path: str | Path, skip_prefixes: tuple[str, ...] = ("fc2.",)) -> tuple[list[str], list[str]]:
@@ -335,12 +755,7 @@ def load_weights_forgiving(model: TorchCNN, checkpoint_path: str | Path, skip_pr
 
 
 def _apply_backbone_freeze_state(model: TorchCNN, backbone_frozen: bool, freeze_bn_affine: bool) -> None:
-    """Apply the temporary freeze policy after each `model.train()` call.
-
-    `model.train()` recursively flips every module back to training mode, so the
-    trainer reapplies the backbone freeze state each epoch to keep BN running
-    statistics fixed when the backbone is frozen.
-    """
+    """Apply the temporary freeze policy after each `model.train()` call."""
     for parameter in model.iter_head_parameters():
         parameter.requires_grad = True
 
@@ -367,15 +782,16 @@ def _build_optimizer(
     model: TorchCNN,
     lr_value: float,
 ) -> torch.optim.Optimizer:
-    """Recreate the optimizer intentionally when freeze state changes.
-
-    Rebuilding the optimizer makes the transition explicit and avoids carrying
-    stale momentum state across a different parameter set.
-    """
+    """Recreate the optimizer intentionally when freeze state changes."""
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if args.optimizer == "adamw":
         return torch.optim.AdamW(parameters, lr=lr_value, weight_decay=args.weight_decay)
     return torch.optim.SGD(parameters, lr=lr_value, momentum=args.momentum, weight_decay=args.weight_decay)
+
+
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr_value: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr_value
 
 
 def main() -> None:
@@ -384,6 +800,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=str, default=None, help="Directory with train images")
     parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE, help="Batch size")
+    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker count (defaults to 4 for streaming, 0 for preloaded)")
     parser.add_argument("--lr", type=float, nargs="+", default=[1e-3], help="One learning rate per phase")
     parser.add_argument("--phase-count", type=int, default=1, help="Number of contiguous training phases")
     parser.add_argument("--warmup-epochs", type=int, default=0, help="Warmup epochs at the start of each phase")
@@ -424,6 +841,8 @@ def main() -> None:
     parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True, help="If true, stream batches from disk; if false, preload all images into memory.")
+    parser.add_argument("--amp-mode", choices=["auto", "on", "off"], default="auto", help="AMP policy for CUDA training")
+    parser.add_argument("--compile-mode", choices=["auto", "on", "off"], default="auto", help="torch.compile policy")
     parser.add_argument("--init-from", type=str, default=None, help="Path to checkpoint .pt/.pth to initialize weights")
     parser.add_argument("--num-partitions", type=int, default=1, help="Split training set into P disjoint shards")
     parser.add_argument("--partition", type=int, default=0, help="Train only on shard id [0..P-1]")
@@ -479,7 +898,11 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    random.seed(args.seed)
     device = _resolve_device(args.device)
+    amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
+    use_channels_last = _configure_runtime_kernels(device, fixed_input_shape=True)
+
     data_dir = Path(args.data_dir) if args.data_dir else Path(config.DATA_DIR)
     data_dir = data_dir.resolve()
     pre_signature = tree_signature(data_dir) if args.enforce_readonly_dataset else None
@@ -548,8 +971,54 @@ def main() -> None:
         focal_alpha_weights = torch.as_tensor(inverse_frequency_weights, dtype=torch.float32, device=device)
 
     base_use_focal_loss = bool(args.focal_loss)
-
     input_size = config.INPUT_SIZE
+    pin_memory = bool(device.type == "cuda")
+    batch_size = max(1, int(args.batch_size))
+    num_workers = _resolve_num_workers(bool(args.streaming), args.num_workers)
+
+    x_train = None
+    x_val = None
+    if not args.streaming:
+        print("Preloading images into memory (float32)...")
+        x_train = _load_all_images(train_paths, input_size)
+        if y_val is not None and len(val_paths) > 0:
+            x_val = _load_all_images(val_paths, input_size)
+
+    train_dataset = TorchImageDataset(
+        labels=y_train,
+        input_size=input_size,
+        paths=train_paths if args.streaming else None,
+        preloaded_images=x_train,
+        augment_config=augment_config if args.augment else None,
+    )
+    val_dataset = None
+    if y_val is not None and len(val_paths) > 0:
+        val_dataset = TorchImageDataset(
+            labels=y_val,
+            input_size=input_size,
+            paths=val_paths if args.streaming else None,
+            preloaded_images=x_val,
+            augment_config=None,
+        )
+
+    train_loader = _build_data_loader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        base_seed=args.seed,
+    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = _build_data_loader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers if args.streaming else 0,
+            pin_memory=pin_memory,
+            base_seed=args.seed + 10_000,
+        )
 
     model = TorchCNN(
         input_size=input_size,
@@ -558,7 +1027,10 @@ def main() -> None:
         dropout_p=args.dropout,
         width_scale=width_scale,
     )
-    model.to(device)
+    if use_channels_last:
+        model.to(device=device, memory_format=torch.channels_last)
+    else:
+        model.to(device=device)
     print(f"Using stage2_channels={model.stage2_channels} (width_scale={model.width_scale:.3f})")
     if args.init_from:
         try:
@@ -568,18 +1040,12 @@ def main() -> None:
             print(f"[warn] Strict load failed: {exc}")
             loaded, skipped = load_weights_forgiving(model, args.init_from, skip_prefixes=("fc2.",))
             print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (for example, classifier or resized feature tensors)")
-            model.to(device)
+            if use_channels_last:
+                model.to(device=device, memory_format=torch.channels_last)
+            else:
+                model.to(device=device)
 
-    batch_size = max(1, int(args.batch_size))
-    x_train = None
-    x_val = None
-    if not args.streaming:
-        print("Preloading images into memory (float32)...")
-        x_train = _load_batch(train_paths, input_size)
-        if y_val is not None and len(val_paths) > 0:
-            x_val = _load_batch(val_paths, input_size)
-
-    num_batches = (y_train.size + batch_size - 1) // batch_size
+    num_batches = max(1, len(train_loader))
     phase_map = build_epoch_phase_map(args.epochs, args.phase_count)
     current_phase_index = -1
     current_phase_base_lr = lr_values[0]
@@ -597,6 +1063,29 @@ def main() -> None:
 
     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
     optimizer: torch.optim.Optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
+    scaler = _make_grad_scaler(device, amp_dtype)
+
+    compile_probe_batch = None
+    try:
+        compile_probe_batch = next(iter(train_loader))
+    except StopIteration:
+        compile_probe_batch = None
+    compiled_forward_model = _maybe_enable_compiled_forward_model(
+        model=model,
+        args=args,
+        benchmark_batch=compile_probe_batch,
+        benchmark_lr=current_phase_base_lr,
+        num_classes=num_classes,
+        label_smoothing=float(args.label_smoothing),
+        use_focal_loss=base_use_focal_loss,
+        focal_gamma=focal_gamma,
+        ce_class_weights=ce_class_weights,
+        focal_alpha_weights=focal_alpha_weights,
+        grad_clip=float(args.grad_clip),
+        device=device,
+        amp_dtype=amp_dtype,
+        use_channels_last=use_channels_last,
+    )
 
     ema: ModelEMA | None = None
     if args.ema:
@@ -607,12 +1096,21 @@ def main() -> None:
             dropout_p=args.dropout,
             width_scale=width_scale,
         )
-        ema_model.to(device)
+        if use_channels_last:
+            ema_model.to(device=device, memory_format=torch.channels_last)
+        else:
+            ema_model.to(device=device)
         for parameter in ema_model.parameters():
             parameter.requires_grad_(False)
         ema_model.eval()
         ema = ModelEMA(ema_model, decay=ema_decay, phase_warmup_steps=max(1, num_batches))
         ema.sync_from(model)
+
+    checkpoint_metadata = {
+        "class_names": list(resolved_class_names),
+        "is_ema": False,
+        "ema_decay": None,
+    }
 
     for epoch in range(args.epochs):
         phase_config = phase_map[epoch]
@@ -625,8 +1123,11 @@ def main() -> None:
             freeze_epochs_remaining = 0
             backbone_frozen = False
             model.train()
+            if compiled_forward_model is not None:
+                compiled_forward_model.train()
             _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
             optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
+            scaler = _make_grad_scaler(device, amp_dtype)
             print(
                 f"Phase {current_phase_index + 1}/{args.phase_count}  "
                 f"base_lr={current_phase_base_lr:.6f}  "
@@ -635,24 +1136,16 @@ def main() -> None:
             )
 
         model.train()
+        if compiled_forward_model is not None:
+            compiled_forward_model.train()
         epoch_backbone_frozen = backbone_frozen
         _apply_backbone_freeze_state(model, backbone_frozen=epoch_backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
-        permutation = rng.permutation(y_train.size)
         epoch_loss = 0.0
         epoch_correct = 0
 
-        for batch_index in range(num_batches):
-            start = batch_index * batch_size
-            end = min(start + batch_size, y_train.size)
-            idx_batch = permutation[start:end]
-            y_batch_idx = y_train[idx_batch]
-
-            if args.streaming:
-                x_batch = _load_batch([train_paths[index] for index in idx_batch], input_size)
-            else:
-                x_batch = x_train[idx_batch]
-            if args.augment:
-                x_batch = augment_batch(x_batch, rng, augment_config)
+        for batch_index, (x_cpu, y_cpu) in enumerate(train_loader):
+            y_batch_idx = _move_label_batch(y_cpu, device)
+            x_batch = _move_input_batch(x_cpu, device, use_channels_last=use_channels_last)
 
             mix_mode = "none"
             if args.mixup:
@@ -660,11 +1153,11 @@ def main() -> None:
                     y_batch_idx,
                     num_classes,
                     label_smoothing=0.0,
+                    dtype=torch.float32,
                 )
-                x_batch, target_distribution, mix_mode, _ = apply_batch_mix(
+                x_batch, target_distribution, mix_mode, _ = _apply_batch_mix_torch(
                     x_batch,
                     target_distribution,
-                    rng,
                     prob=mixup_prob,
                     beta_alpha=mixup_alpha,
                     cutmix_ratio=cutmix_ratio,
@@ -674,12 +1167,14 @@ def main() -> None:
                         y_batch_idx,
                         num_classes,
                         label_smoothing=float(args.label_smoothing),
+                        dtype=torch.float32,
                     )
             else:
                 target_distribution = _make_target_distribution(
                     y_batch_idx,
                     num_classes,
                     label_smoothing=float(args.label_smoothing),
+                    dtype=torch.float32,
                 )
 
             scheduled_lr = compute_phase_learning_rate(
@@ -703,63 +1198,56 @@ def main() -> None:
             _set_optimizer_lr(optimizer, current_lr)
 
             optimizer.zero_grad(set_to_none=True)
-            x_tensor = _to_tensor_batch(x_batch, device)
-            y_tensor = torch.as_tensor(target_distribution, dtype=torch.float32, device=device)
-            logits = model(x_tensor)
-            batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
-            loss = _compute_batch_loss(
-                logits,
-                y_tensor,
-                use_focal_loss=batch_use_focal_loss,
-                focal_gamma=focal_gamma,
-                ce_class_weights=ce_class_weights,
-                focal_alpha_weights=focal_alpha_weights,
+            forward_model: nn.Module = compiled_forward_model if compiled_forward_model is not None else model
+            with _make_autocast_context(device, amp_dtype):
+                logits = forward_model(x_batch)
+                batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
+                loss = _compute_batch_loss(
+                    logits,
+                    target_distribution,
+                    use_focal_loss=batch_use_focal_loss,
+                    focal_gamma=focal_gamma,
+                    ce_class_weights=ce_class_weights,
+                    focal_alpha_weights=focal_alpha_weights,
+                )
+            _backward_and_step(
+                loss,
+                optimizer,
+                model,
+                grad_clip=float(args.grad_clip),
+                scaler=scaler,
             )
-            loss.backward()
-            if args.grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_([parameter for parameter in model.parameters() if parameter.requires_grad], max_norm=args.grad_clip)
-            optimizer.step()
             if ema is not None:
                 phase_step = phase_config.epoch_index_in_phase * num_batches + batch_index
                 ema.update(model, step_in_phase=phase_step, mix_active=(mix_mode != "none"))
 
             epoch_loss += float(loss.item())
-            metric_targets = torch.argmax(y_tensor, dim=1)
+            metric_targets = torch.argmax(target_distribution, dim=1)
             epoch_correct += int((torch.argmax(logits, dim=1) == metric_targets).sum().item())
 
         avg_loss = epoch_loss / max(1, num_batches)
-        train_acc = epoch_correct / max(1, y_train.size)
+        train_acc = epoch_correct / max(1, len(train_dataset))
 
-        if y_val is not None and len(val_paths) > 0:
+        if val_loader is not None and y_val is not None and len(val_paths) > 0:
             eval_model = ema.ema_model if ema is not None else model
-            eval_model.eval()
-            if args.streaming or x_val is None:
-                val_loss, val_acc = evaluate_streaming(
-                    eval_model,
-                    val_paths,
-                    y_val,
-                    num_classes,
-                    batch_size,
-                    input_size,
-                    device,
-                    use_focal_loss=base_use_focal_loss,
-                    focal_gamma=focal_gamma,
-                    ce_class_weights=ce_class_weights,
-                    focal_alpha_weights=focal_alpha_weights,
-                )
+            eval_forward_model: nn.Module
+            if eval_model is model and compiled_forward_model is not None:
+                eval_forward_model = compiled_forward_model
             else:
-                val_loss, val_acc = evaluate_preloaded(
-                    eval_model,
-                    x_val,
-                    y_val,
-                    num_classes,
-                    batch_size,
-                    device,
-                    use_focal_loss=base_use_focal_loss,
-                    focal_gamma=focal_gamma,
-                    ce_class_weights=ce_class_weights,
-                    focal_alpha_weights=focal_alpha_weights,
-                )
+                eval_forward_model = eval_model
+            eval_forward_model.eval()
+            val_loss, val_acc = evaluate_loader(
+                eval_forward_model,
+                val_loader,
+                num_classes,
+                device,
+                use_channels_last=use_channels_last,
+                amp_dtype=amp_dtype,
+                use_focal_loss=base_use_focal_loss,
+                focal_gamma=focal_gamma,
+                ce_class_weights=ce_class_weights,
+                focal_alpha_weights=focal_alpha_weights,
+            )
 
             improved = (val_loss < (best_val_loss - args.min_delta)) if args.early_stop_metric == "val_loss" else (val_acc > (best_val_acc + args.min_delta))
             if improved:
@@ -768,22 +1256,15 @@ def main() -> None:
                 else:
                     best_val_acc = val_acc
                 checkpoint_model = ema.ema_model if ema is not None else model
-                checkpoint_model.save_weights(
-                    args.checkpoint,
-                    metadata={
-                        "is_ema": bool(ema is not None),
-                        "ema_decay": float(ema_decay) if ema is not None else None,
-                    },
-                )
+                checkpoint_metadata["is_ema"] = bool(ema is not None)
+                checkpoint_metadata["ema_decay"] = float(ema_decay) if ema is not None else None
+                checkpoint_model.save_weights(args.checkpoint, metadata=checkpoint_metadata)
                 best_saved = True
                 bad_epochs = 0
             else:
                 bad_epochs += 1
 
             if epoch_backbone_frozen:
-                # Even during frozen epochs, keep tracking the best validation
-                # accuracy reached in this phase so later plateau checks compare
-                # against the strongest result already achieved.
                 if val_acc > (phase_best_val_acc + args.min_delta):
                     phase_best_val_acc = val_acc
                 freeze_epochs_remaining -= 1
@@ -800,8 +1281,11 @@ def main() -> None:
                     backbone_frozen = False
                     phase_plateau_epochs = 0
                     model.train()
+                    if compiled_forward_model is not None:
+                        compiled_forward_model.train()
                     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
                     optimizer = _build_optimizer(args, model, lr_value=current_lr)
+                    scaler = _make_grad_scaler(device, amp_dtype)
                     lr_message = "reduced" if deduction_applied else "kept"
                     print(
                         f"Backbone unfrozen at epoch {epoch + 1}: cumulative lr offset {lr_message} at {phase_lr_offset:.6f}."
@@ -817,8 +1301,11 @@ def main() -> None:
                         freeze_epochs_remaining = freeze_epoch_num
                         phase_plateau_epochs = 0
                         model.train()
+                        if compiled_forward_model is not None:
+                            compiled_forward_model.train()
                         _apply_backbone_freeze_state(model, backbone_frozen=True, freeze_bn_affine=args.freeze_bn_affine)
                         optimizer = _build_optimizer(args, model, lr_value=current_lr)
+                        scaler = _make_grad_scaler(device, amp_dtype)
                         print(
                             f"Backbone frozen at epoch {epoch + 1}: val_acc plateaued for {freeze_patience} epochs; "
                             f"training the head for {freeze_epoch_num} epochs."
@@ -851,23 +1338,22 @@ def main() -> None:
                     backbone_frozen = False
                     phase_plateau_epochs = 0
                     model.train()
+                    if compiled_forward_model is not None:
+                        compiled_forward_model.train()
                     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
                     optimizer = _build_optimizer(args, model, lr_value=current_lr)
+                    scaler = _make_grad_scaler(device, amp_dtype)
             mode_text = "head-only" if epoch_backbone_frozen else "full"
             print(
                 f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
                 f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}"
             )
 
-    if y_val is None or len(val_paths) == 0:
+    if val_loader is None or y_val is None or len(val_paths) == 0:
         checkpoint_model = ema.ema_model if ema is not None else model
-        checkpoint_model.save_weights(
-            args.checkpoint,
-            metadata={
-                "is_ema": bool(ema is not None),
-                "ema_decay": float(ema_decay) if ema is not None else None,
-            },
-        )
+        checkpoint_metadata["is_ema"] = bool(ema is not None)
+        checkpoint_metadata["ema_decay"] = float(ema_decay) if ema is not None else None
+        checkpoint_model.save_weights(args.checkpoint, metadata=checkpoint_metadata)
         best_saved = True
     if best_saved:
         print(f"Saved checkpoint: {args.checkpoint}")

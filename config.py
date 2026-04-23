@@ -57,7 +57,7 @@ def detect_class_names(
     project defaults so first-time dataset generation still works.
     """
     dataset_dir = Path(data_dir) if data_dir is not None else DATA_DIR
-    fallback_names = _normalize_class_names(fallback or DEFAULT_CLASS_NAMES)
+    fallback_names = _normalize_class_names(DEFAULT_CLASS_NAMES if fallback is None else fallback)
     try:
         class_dirs = sorted(entry for entry in dataset_dir.iterdir() if entry.is_dir())
     except (FileNotFoundError, NotADirectoryError, PermissionError):
@@ -106,6 +106,39 @@ def get_class_names(
     while len(resolved) < class_count:
         resolved.append(str(len(resolved)))
     return resolved
+
+
+def resolve_runtime_class_names(
+    data_dir: str | Path | None,
+    *,
+    num_classes: int,
+    checkpoint_class_names: Sequence[str] | None = None,
+    require_images: bool = False,
+) -> List[str]:
+    """
+    Resolve labels for inference when checkpoint metadata may override the dataset.
+
+    Preference order:
+    1. checkpoint-provided class names when they match `num_classes`
+    2. dataset-derived class names when they match `num_classes`
+    3. numeric placeholders
+    """
+    if num_classes <= 0:
+        raise ValueError("num_classes must be > 0")
+
+    preferred = _normalize_class_names(checkpoint_class_names or ())
+    if len(preferred) == num_classes:
+        return preferred
+
+    detected = detect_class_names(
+        data_dir,
+        require_images=require_images,
+        fallback=(),
+    )
+    if len(detected) == num_classes:
+        return detected
+
+    return [str(index) for index in range(num_classes)]
 
 
 def get_num_classes(

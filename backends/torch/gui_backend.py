@@ -26,7 +26,7 @@ from utils.safety import install_dataset_write_guard
 install_dataset_write_guard()
 
 import config
-from backends.torch.model import TorchCNN
+from backends.torch.model import TorchCNN, resolve_checkpoint_runtime_config
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
 
@@ -42,8 +42,33 @@ def _resolve_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _validate_checkpoint_overrides(
+    *,
+    class_count_override: int | None,
+    width_scale_override: float | None,
+    checkpoint_num_classes: int,
+    checkpoint_width_scale: float,
+) -> None:
+    if class_count_override is not None and int(class_count_override) != int(checkpoint_num_classes):
+        raise ValueError(
+            f"--class-count={class_count_override} conflicts with checkpoint num_classes={checkpoint_num_classes}"
+        )
+    if width_scale_override is not None and abs(float(width_scale_override) - float(checkpoint_width_scale)) > 1e-9:
+        raise ValueError(
+            f"--model-width-scale={width_scale_override} conflicts with checkpoint width_scale={checkpoint_width_scale:.6f}"
+        )
+
+
 class InferenceApp:
-    def __init__(self, root: tk.Tk, class_names: list[str], width_scale: float) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        class_names: list[str],
+        width_scale: float | None,
+        *,
+        class_source_dir: Path | None,
+        class_count_override: int | None,
+    ) -> None:
         self.root = root
         self.root.title("Image Identify CNN - PyTorch Inference GUI")
         self.root.geometry("960x640")
@@ -52,7 +77,10 @@ class InferenceApp:
         self.class_names = list(class_names)
         self.num_classes = len(self.class_names)
         self.device = _resolve_device()
-        self.width_scale = float(width_scale)
+        self.width_scale_override = width_scale
+        self.width_scale = 0.75 if width_scale is None else float(width_scale)
+        self.class_source_dir = class_source_dir
+        self.class_count_override = class_count_override
 
         self.model: Optional[TorchCNN] = None
         self.weights_path: Optional[Path] = None
@@ -108,6 +136,26 @@ class InferenceApp:
             return
         checkpoint = Path(path_str)
         try:
+            checkpoint_config = resolve_checkpoint_runtime_config(
+                checkpoint,
+                map_location=self.device,
+                default_input_size=self.input_size,
+            )
+            _validate_checkpoint_overrides(
+                class_count_override=self.class_count_override,
+                width_scale_override=self.width_scale_override,
+                checkpoint_num_classes=checkpoint_config.num_classes,
+                checkpoint_width_scale=checkpoint_config.width_scale,
+            )
+            self.input_size = checkpoint_config.input_size
+            self.num_classes = checkpoint_config.num_classes
+            self.width_scale = checkpoint_config.width_scale
+            self.class_names = config.resolve_runtime_class_names(
+                self.class_source_dir,
+                num_classes=self.num_classes,
+                checkpoint_class_names=checkpoint_config.class_names,
+                require_images=False,
+            )
             self.model = TorchCNN(input_size=self.input_size, num_classes=self.num_classes, seed=42, width_scale=self.width_scale)
             self.model.load_weights(checkpoint, map_location=self.device)
             self.model.to(self.device)
@@ -226,7 +274,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the PyTorch inference GUI")
     parser.add_argument("--data-dir", type=str, default=None, help="Dataset root used to resolve class labels")
     parser.add_argument("--class-count", type=int, default=None, help="Optional class-count override for model output size")
-    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
+    parser.add_argument("--model-width-scale", type=float, default=None, help="Optional width multiplier override when no checkpoint is loaded")
     args = parser.parse_args()
 
     class_source_dir = Path(args.data_dir) if args.data_dir else None
@@ -236,7 +284,13 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
 
     root = tk.Tk()
-    InferenceApp(root, class_names=class_names, width_scale=args.model_width_scale)
+    InferenceApp(
+        root,
+        class_names=class_names,
+        width_scale=args.model_width_scale,
+        class_source_dir=class_source_dir,
+        class_count_override=args.class_count,
+    )
     root.mainloop()
 
 

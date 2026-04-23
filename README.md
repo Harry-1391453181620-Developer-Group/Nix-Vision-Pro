@@ -7,7 +7,7 @@ A Python 3.14 image classification project with two maintained backends:
 The active architecture in both backends is width-scaled in stage 2:
 `[Conv(32), Conv(32), SE, Pool] -> [Conv(round(64*scale)), Conv(round(64*scale)), SE, Pool] -> [Conv(128), Conv(128), SE, Pool] -> Flatten -> FC(256) -> Dropout(0.5) -> FC(num_classes)`.
 
-Default width scale is `0.75`, so the active stage-2 width is `48`. Use `--model-width-scale 1.0` for older `64`-channel checkpoints.
+Default width scale is `0.75`, so the default stage-2 width is `48`. When you load a checkpoint, inference now reconstructs `num_classes`, `width_scale`, `stage2_channels`, and `input_size` from checkpoint metadata or legacy weight shapes, so `--model-width-scale` is usually unnecessary for saved checkpoints.
 
 ## Runtime Baseline
 
@@ -42,7 +42,8 @@ The current dependency set covers the whole project:
 ## Dataset Contract
 
 Training and inference read labeled image files from `Dataset/<class_name>/...` by default.
-This repository no longer includes built-in synthetic or Wikimedia dataset builders because they were stale with the current 62-class dataset layout and were not part of the runtime path.
+The runtime class list is detected from the active dataset layout, and checkpoint-backed inference prefers checkpoint metadata when it matches the saved model.
+This repository no longer includes built-in synthetic or Wikimedia dataset builders because they were stale with the active real-image runtime path.
 
 ## Training Policy Highlights
 
@@ -55,6 +56,10 @@ This repository no longer includes built-in synthetic or Wikimedia dataset build
 - `--ema` is enabled by default with `--ema-decay 0.999`.
 - EMA updates run immediately after `optimizer.step()`, evaluate the EMA weights for validation, and save best checkpoints from EMA weights.
 - EMA tracks the full model state, including BN buffers, so validation does not drift from stale running statistics.
+- The torch trainer now uses `DataLoader`, worker seeding, contiguous tensor collation, `pin_memory` on CUDA, and non-blocking transfer for both inputs and labels.
+- Torch MixUp and CutMix now run on device tensors after transfer instead of round-tripping through NumPy on the CPU path.
+- Torch training enables `channels_last`, `torch.backends.cudnn.benchmark`, and AMP automatically on supported CUDA runs.
+- `--compile-mode auto` benchmarks eager vs compiled train steps after warmup and keeps `torch.compile` only when it actually improves median step time.
 - New checkpoints are structured as `model + meta`, while legacy raw checkpoints still load.
 - Multiphase LR, warmup, cosine restarts, and temporary backbone freeze remain supported in both training backends.
 
@@ -63,7 +68,7 @@ This repository no longer includes built-in synthetic or Wikimedia dataset build
 Recommended PyTorch training command:
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0002 --warmup-epochs 3 --batch-size 64 --streaming --optimizer adamw --seed 42 --weight-decay 2e-4 --dropout 0.3 --label-smoothing 0.05 --augment --no-class-weighting --lr-schedule cosine --min-lr-ratio 0.08 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00004 --focal-loss --focal-gamma 1.8 --focal-alpha auto --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 1.5 --mixup --mixup-alpha 0.1 --mixup-prob 0.4 --cutmix-ratio 0.5 --ema --ema-decay 0.999 --device cuda --class-count 62 --checkpoint checkpoints/best_torch_model.pt --init-from checkpoints/best_torch_model.pt
+python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0002 --warmup-epochs 3 --batch-size 64 --streaming --num-workers 4 --optimizer adamw --seed 42 --weight-decay 2e-4 --dropout 0.3 --label-smoothing 0.05 --augment --no-class-weighting --lr-schedule cosine --min-lr-ratio 0.08 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00004 --focal-loss --focal-gamma 1.8 --focal-alpha auto --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 1.5 --mixup --mixup-alpha 0.1 --mixup-prob 0.4 --cutmix-ratio 0.5 --ema --ema-decay 0.999 --amp-mode auto --compile-mode auto --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from checkpoints/best_torch_model.pt
 ```
 
 Legacy NumPy training remains available:
@@ -75,15 +80,17 @@ python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-coun
 ## Checkpoints
 
 - New checkpoints save a structured payload with the model weights under `model` plus metadata under `meta`.
-- The metadata includes the checkpoint version, backend, and whether the saved weights are EMA weights.
+- The metadata includes `checkpoint_version`, `backend`, `num_classes`, `width_scale`, `stage2_channels`, `input_size`, `class_names`, and whether the saved weights are EMA weights.
 - `load_weights()` still accepts older plain state-dict checkpoints, so older training runs remain usable.
+- Torch and NumPy inference now rebuild the model from checkpoint metadata first and fall back to legacy weight-shape inference when metadata is missing.
+- If you pass `--class-count` or `--model-width-scale` while also loading weights, conflicting overrides now fail clearly instead of silently building the wrong model shape.
 - Load only trusted checkpoints. The PyTorch loader prefers `weights_only=True`, but older interpreter combinations can still fall back to normal `torch.load()` for compatibility.
 
 ## Inference
 
 ```powershell
-python.exe predict.py --backend torch Dataset/airplane/0000001.jpg --weights checkpoints/best_torch_model.pt --probabilities --top-k 3 --device cuda --model-width-scale 0.75
-python.exe predict.py --backend numpy Dataset/airplane/0000001.jpg --weights checkpoints/best_numpy_model.npz --probabilities --top-k 3 --model-width-scale 0.75
+python.exe predict.py --backend torch Dataset/airplane/0000001.jpg --weights checkpoints/best_torch_model.pt --probabilities --top-k 3 --device cuda
+python.exe predict.py --backend numpy Dataset/airplane/0000001.jpg --weights checkpoints/best_numpy_model.npz --probabilities --top-k 3
 ```
 
 ## Tests

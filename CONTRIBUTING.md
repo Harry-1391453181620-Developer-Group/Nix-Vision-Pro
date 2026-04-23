@@ -67,7 +67,7 @@ Examples:
 If you change behavior, update the relevant documents:
 - `README.md`
 - `Image_Identify_CNN.md`
-- `docs/plans/YYYY-MM-DD-*.md` when a design is approved
+- `Agent_History/docs/plans/YYYY-MM-DD-*.md` when a design is approved
 - `Agent_History/Daily/YYYY/MM/DD_history.md`
 - `Agent_History/Monthly/YYYY/MM_summary.md` when writing the month-end summary
 

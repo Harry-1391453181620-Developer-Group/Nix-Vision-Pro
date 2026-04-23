@@ -21,7 +21,7 @@ Both backends now use:
 Width scaling is controlled by `--model-width-scale`.
 
 - default `0.75` gives stage-2 width `48`
-- use `--model-width-scale 1.0` for older checkpoints trained with stage-2 width `64`
+- inference now reconstructs width and class count from checkpoint metadata or legacy weight shapes, so explicit width overrides are mainly for training or weight-free model construction
 
 The old Mamba implementation has been removed because it was no longer part of the active model path.
 
@@ -43,6 +43,7 @@ Dataset/
 ```
 
 Each class should be a directory. Training auto-detects the class count from `Dataset/`; use `--class-count` only when you need to override the detected output size.
+Checkpoint-backed inference now prefers the saved checkpoint architecture and only falls back to dataset-derived labels when checkpoint class names are absent or incomplete.
 
 The repository no longer ships synthetic or Wikimedia dataset-builder scripts. Current training and inference operate on the real image dataset only.
 
@@ -90,9 +91,24 @@ Policy details:
 - CutMix recomputes label `lam` from the actual pasted patch area after clipping
 - label smoothing becomes `0` on mixed batches to avoid double regularization
 - focal loss stays enabled only for non-mixed training batches
+- in the torch backend, MixUp and CutMix now run on device tensors after transfer instead of on CPU NumPy batches
 - validation is always clean:
   - MixUp off
   - CutMix off
+
+### Torch Runtime Optimization
+
+Torch training now uses:
+- `DataLoader` instead of a hand-rolled batch loader
+- worker-local RNG seeding for augmentation when `num_workers > 0`
+- contiguous CPU tensors for collation
+- `pin_memory=True` on CUDA runs
+- non-blocking transfer for both images and labels
+- `channels_last` on both model and input tensors for CUDA fast paths
+- AMP via `--amp-mode {auto,on,off}`
+- optional compile benchmarking via `--compile-mode {auto,on,off}`
+
+`--compile-mode auto` warms up eager and compiled paths separately, measures synchronized median train-step time, and keeps compile only when it improves throughput.
 
 ### EMA
 
@@ -121,6 +137,11 @@ New checkpoints now store:
   meta: {
     checkpoint_version: 2,
     backend: ...,
+    num_classes: ...,
+    width_scale: ...,
+    stage2_channels: ...,
+    input_size: ...,
+    class_names: [...],
     is_ema: true/false,
     ema_decay: ...
   }
@@ -129,6 +150,8 @@ New checkpoints now store:
 
 Notes:
 - both backends still load older plain checkpoints
+- both inference backends now reconstruct model architecture from checkpoint metadata before applying weights
+- when metadata is missing, both backends infer `num_classes` and stage-2 width from the saved parameter shapes
 - `--init-from` loads the live model first and then syncs EMA from that loaded model so the two states start aligned
 
 ### Multiphase LR
@@ -183,6 +206,7 @@ See `best_train_commands.txt`.
 - `--data-dir`
 - `--epochs`
 - `--batch-size`
+- `--num-workers`
 - `--phase-count`
 - `--lr` (one value per phase)
 - `--warmup-epochs`
@@ -223,6 +247,8 @@ See `best_train_commands.txt`.
 - `--after-unfreeze-lr-change`
 - `--checkpoint`
 - `--streaming / --no-streaming`
+- `--amp-mode {auto,on,off}`
+- `--compile-mode {auto,on,off}`
 - `--init-from`
 - `--num-partitions`
 - `--partition`

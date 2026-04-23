@@ -1,6 +1,7 @@
 """Focused tests for RandAugment, EMA, schedules, and backbone freeze policy."""
 
 from argparse import Namespace
+import random
 
 import numpy as np
 import pytest
@@ -22,7 +23,17 @@ torch = pytest.importorskip("torch")
 from torch import nn
 
 from backends.torch.model import TorchCNN
-from backends.torch.train_backend import _apply_backbone_freeze_state, _build_optimizer
+from backends.torch.train_backend import (
+    _apply_backbone_freeze_state,
+    _apply_batch_mix_torch,
+    _build_optimizer,
+    _collate_image_batch,
+    _make_grad_scaler,
+    _make_target_distribution,
+    _make_worker_init_fn,
+    _resolve_amp_dtype,
+    _resolve_num_workers,
+)
 
 
 def test_augment_batch_is_deterministic_for_same_seed():
@@ -296,3 +307,87 @@ def test_torch_freeze_transition_updates_expected_params_and_bn_modes():
     assert not model.conv1.weight.requires_grad
     assert model.fc1.weight.requires_grad
     assert not model.bn1.training
+
+
+def test_torch_collate_outputs_contiguous_tensors():
+    batch = [
+        (torch.randn(3, 8, 8, dtype=torch.float32), 1),
+        (torch.randn(3, 8, 8, dtype=torch.float32), 2),
+    ]
+
+    images, labels = _collate_image_batch(batch)
+
+    assert images.dtype == torch.float32
+    assert labels.dtype == torch.int64
+    assert images.is_contiguous()
+    assert labels.is_contiguous()
+    assert tuple(images.shape) == (2, 3, 8, 8)
+    assert tuple(labels.tolist()) == (1, 2)
+
+
+def test_torch_worker_init_fn_reseeds_numpy_and_random_per_worker():
+    init_worker = _make_worker_init_fn(1234)
+
+    init_worker(0)
+    worker_zero_int = int(np.random.randint(0, 1_000_000))
+    worker_zero_float = random.random()
+
+    init_worker(0)
+    worker_zero_int_repeat = int(np.random.randint(0, 1_000_000))
+    worker_zero_float_repeat = random.random()
+
+    init_worker(1)
+    worker_one_int = int(np.random.randint(0, 1_000_000))
+    worker_one_float = random.random()
+
+    assert worker_zero_int == worker_zero_int_repeat
+    assert worker_zero_float == pytest.approx(worker_zero_float_repeat)
+    assert worker_one_int != worker_zero_int
+    assert worker_one_float != worker_zero_float
+
+
+def test_torch_num_worker_defaults_follow_streaming_mode():
+    assert _resolve_num_workers(True, None) == 4
+    assert _resolve_num_workers(False, None) == 0
+    assert _resolve_num_workers(True, 2) == 2
+    with pytest.raises(SystemExit):
+        _resolve_num_workers(True, -1)
+
+
+def test_torch_batch_mix_preserves_soft_label_simplex():
+    x = torch.arange(4 * 3 * 8 * 8, dtype=torch.float32).reshape(4, 3, 8, 8)
+    y = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    targets = _make_target_distribution(y, num_classes=4, label_smoothing=0.0, dtype=torch.float32)
+
+    mixed_x, mixed_targets, mix_mode, lam = _apply_batch_mix_torch(
+        x,
+        targets,
+        prob=1.0,
+        beta_alpha=0.2,
+        cutmix_ratio=0.0,
+    )
+
+    assert mix_mode == "mixup"
+    assert tuple(mixed_x.shape) == tuple(x.shape)
+    assert tuple(mixed_targets.shape) == tuple(targets.shape)
+    assert 0.0 <= float(lam) <= 1.0
+    assert mixed_targets.dtype == torch.float32
+    assert torch.allclose(mixed_targets.sum(dim=1), torch.ones((4,), dtype=torch.float32), atol=1e-6)
+
+
+def test_amp_mode_and_grad_scaler_policy():
+    cpu_device = torch.device("cpu")
+    assert _resolve_amp_dtype(cpu_device, "off") is None
+    assert _resolve_amp_dtype(cpu_device, "auto") is None
+    with pytest.raises(SystemExit):
+        _resolve_amp_dtype(cpu_device, "on")
+
+    cpu_scaler = _make_grad_scaler(cpu_device, None)
+    assert not cpu_scaler.is_enabled()
+
+    if torch.cuda.is_available():
+        cuda_device = torch.device("cuda")
+        amp_dtype = _resolve_amp_dtype(cuda_device, "auto")
+        assert amp_dtype in {torch.float16, torch.bfloat16}
+        cuda_scaler = _make_grad_scaler(cuda_device, amp_dtype)
+        assert cuda_scaler.is_enabled() is (amp_dtype == torch.float16)
