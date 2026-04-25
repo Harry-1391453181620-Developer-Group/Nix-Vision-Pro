@@ -1,112 +1,46 @@
 $args = @(
-
-# =========================
-# Basic Settings
-# =========================
 "--backend", "torch",
 "--data-dir", "Dataset",
 "--device", "cuda",
+"--num-workers", "4",
+"--amp-mode", "auto",
+"--compile-mode", "auto",
 "--seed", "42",
 "--class-count", "13",
-
-# =========================
-# Training Settings
-# =========================
-"--epochs", "100",
-"--phase-count", "2",
-"--batch-size", "64",
+"--epochs", "120",
+"--phase-count", "1",
+"--batch-size", "128",
 "--streaming",
-
-# =========================
-# Learning Rate
-# =========================
-"--lr", "0.0004", "0.0002",
+"--lr", "0.00045",
 "--lr-schedule", "cosine",
-"--min-lr-ratio", "0.3",
-"--warmup-epochs", "3",
-"--after-unfreeze-lr-change", "0.00004",
-
-# Unused
-# "--step-size", "10",
-# "--gamma", "0.5",
-
-# =========================
-# Optimizer
-# =========================
+"--min-lr-ratio", "0.01",
+"--warmup-epochs", "5",
 "--optimizer", "adamw",
-"--weight-decay", "2e-4",
-# "--momentum", "0.9",
-
-# =========================
-# Regularization
-# =========================
-"--dropout", "0.2",
-"--label-smoothing", "0.07",
+"--weight-decay", "4e-4",
+"--dropout", "0.25",
+"--label-smoothing", "0.04",
 "--grad-clip", "5.0",
-"--class-weighting",
 "--no-focal-loss",
-
-# Unused
-# "--focal-gamma", "1.8",
-# "--focal-alpha", "auto",
-
-# =========================
-# RandAugment + Mix
-# =========================
 "--augment",
-"--rotation", "12",
-"--brightness", "0.2",
-"--contrast", "0.2",
-"--saturation", "0.2",
-
-# Mixup
-"--no-mixup",
-# "--mixup-alpha", "0.25",
-# "--mixup-prob", "0.35",
-# "--cutmix-ratio", "0.5",
-
-# =========================
-# Model Settings
-# =========================
-"--model-width-scale", "1.5",
+"--rotation", "20",
+"--brightness", "0.25",
+"--contrast", "0.25",
+"--saturation", "0.25",
+"--mixup",
+"--mixup-alpha", "0.3",
+"--mixup-prob", "0.35",
+"--cutmix-ratio", "0.2",
+"--model-width-scale", "2.0",
 "--freeze-bn-affine", "false",
-
-# =========================
-# Freeze / Unfreeze
-# =========================
-"--freeze-patience", "30",
-"--freeze-epoch-num", "6",
-
-# =========================
-# EMA
-# =========================
+"--freeze-patience", "1000",
+"--freeze-epoch-num", "1",
 "--ema",
-"--ema-decay", "0.998",
-
-# =========================
-# Early Stopping
-# =========================
+"--ema-decay", "0.9993",
 "--early-stop",
 "--early-stop-metric", "val_acc",
-"--patience", "20",
+"--patience", "30",
 "--min-delta", "0.001",
-
-# =========================
-# Checkpoint
-# =========================
-"--checkpoint", "checkpoints/best_torch_model.pt",
-"--init-from", "D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\checkpoints\best_torch_model.pt"
-
-# =========================
-# Unused parameters
-# =========================
-# "--help-md",
-# "--val-split", "0.2",
-# "--allow-unlabeled-root",
-# "--num-partitions", "1",
-# "--partition", "0",
-# "--auto-next-partition",
-# "--partition-state", "checkpoints/partition_state.json",
-# "--enforce-readonly-dataset"
+"--checkpoint", "checkpoints/best_torch_model.pt"
 )
+
 python.exe train.py @args

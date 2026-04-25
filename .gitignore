@@ -62,3 +62,8 @@ pytest-cache-files-*/
 *.log
 
 tmp_build_synth.txt
+
+# Other
+littledatawashbear.py
+smart.docx
+best_train_commands.txt
