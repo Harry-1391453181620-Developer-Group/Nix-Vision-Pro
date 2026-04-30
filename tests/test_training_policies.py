@@ -29,11 +29,13 @@ from backends.torch.train_backend import (
     _apply_batch_mix_torch,
     _build_optimizer,
     _collate_image_batch,
+    _compute_total_loss_components,
     _make_grad_scaler,
     _make_target_distribution,
     _make_worker_init_fn,
     _resolve_amp_dtype,
     _resolve_num_workers,
+    _validate_omega_args,
 )
 
 
@@ -354,6 +356,80 @@ def test_torch_num_worker_defaults_follow_streaming_mode():
     assert _resolve_num_workers(True, 2) == 2
     with pytest.raises(SystemExit):
         _resolve_num_workers(True, -1)
+
+
+def test_validate_omega_args():
+    omega_lambda, depth, hidden_dim = _validate_omega_args(
+        omega_loss=True,
+        omega_lambda=0.05,
+        omega_projector_depth=2,
+        omega_hidden_dim=128,
+    )
+    assert omega_lambda == pytest.approx(0.05)
+    assert depth == 2
+    assert hidden_dim == 128
+
+    with pytest.raises(ValueError):
+        _validate_omega_args(
+            omega_loss=False,
+            omega_lambda=0.05,
+            omega_projector_depth=1,
+            omega_hidden_dim=256,
+        )
+    with pytest.raises(ValueError):
+        _validate_omega_args(
+            omega_loss=True,
+            omega_lambda=-0.01,
+            omega_projector_depth=1,
+            omega_hidden_dim=256,
+        )
+    with pytest.raises(ValueError):
+        _validate_omega_args(
+            omega_loss=True,
+            omega_lambda=0.0,
+            omega_projector_depth=3,
+            omega_hidden_dim=256,
+        )
+    with pytest.raises(ValueError):
+        _validate_omega_args(
+            omega_loss=True,
+            omega_lambda=0.0,
+            omega_projector_depth=1,
+            omega_hidden_dim=0,
+        )
+
+
+def test_omega_loss_backpropagates_to_projector_and_representation_path():
+    model = TorchCNN(input_size=(32, 32), num_classes=4, seed=11, omega_enabled=True)
+    x = torch.randn(4, 32, 32, 3)
+    y = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    targets = _make_target_distribution(y, num_classes=4, label_smoothing=0.0, dtype=torch.float32)
+
+    total_loss, ce_loss, attr_loss, logits, h_stats = _compute_total_loss_components(
+        model.forward_with_omega(x),
+        targets,
+        omega_enabled=True,
+        omega_lambda=0.05,
+        use_focal_loss=False,
+        focal_gamma=1.5,
+        ce_class_weights=None,
+        focal_alpha_weights=None,
+    )
+    model.zero_grad(set_to_none=True)
+    attr_loss.backward()
+
+    projector_grad_norm = sum(
+        float(parameter.grad.detach().abs().sum().item())
+        for parameter in model.omega_projector.parameters()
+        if parameter.grad is not None
+    )
+    assert projector_grad_norm > 0.0
+    assert model.fc1.weight.grad is not None
+    assert float(model.fc1.weight.grad.detach().abs().sum().item()) > 0.0
+    assert total_loss.item() > ce_loss.item()
+    assert attr_loss.item() > 0.0
+    assert tuple(logits.shape) == (4, 4)
+    assert h_stats.mean >= 0.0
 
 
 def test_torch_batch_mix_preserves_soft_label_simplex():

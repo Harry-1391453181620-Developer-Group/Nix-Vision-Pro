@@ -60,6 +60,7 @@ This repository no longer includes built-in synthetic or Wikimedia dataset build
 - Torch MixUp and CutMix now run on device tensors after transfer instead of round-tripping through NumPy on the CPU path.
 - Torch training enables `channels_last`, `torch.backends.cudnn.benchmark`, and AMP automatically on supported CUDA runs.
 - `--compile-mode auto` benchmarks eager vs compiled train steps after warmup and keeps `torch.compile` only when it actually improves median step time.
+- Phase 1 Omega-loss is available in the torch trainer with `--omega-loss`; it adds a shallow projector on the existing 256-d penultimate representation and logs CE, attractor loss, and representation-variance diagnostics.
 - New checkpoints are structured as `model + meta`, while legacy raw checkpoints still load.
 - Multiphase LR, warmup, cosine restarts, and temporary backbone freeze remain supported in both training backends.
 
@@ -81,6 +82,7 @@ python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-coun
 
 - New checkpoints save a structured payload with the model weights under `model` plus metadata under `meta`.
 - The metadata includes `checkpoint_version`, `backend`, `num_classes`, `width_scale`, `stage2_channels`, `input_size`, `class_names`, and whether the saved weights are EMA weights.
+- Torch checkpoints may also include Phase 1 Omega metadata: `omega_enabled`, `omega_projector_depth`, and `omega_hidden_dim`; inference reconstructs this branch when present but still predicts from logits only.
 - `load_weights()` still accepts older plain state-dict checkpoints, so older training runs remain usable.
 - Torch and NumPy inference now rebuild the model from checkpoint metadata first and fall back to legacy weight-shape inference when metadata is missing.
 - If you pass `--class-count` or `--model-width-scale` while also loading weights, conflicting overrides now fail clearly instead of silently building the wrong model shape.

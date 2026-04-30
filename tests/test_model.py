@@ -71,7 +71,7 @@ def test_numpy_checkpoint_runtime_config_round_trip_from_structured_checkpoint()
     assert runtime_config.width_scale == pytest.approx(1.5)
     assert runtime_config.stage2_channels == model.stage2_channels
     assert runtime_config.input_size == (32, 32)
-    assert runtime_config.class_names == class_names
+    assert runtime_config.class_names == tuple(class_names)
 
 
 def test_numpy_checkpoint_runtime_config_infers_legacy_architecture():
@@ -86,7 +86,7 @@ def test_numpy_checkpoint_runtime_config_infers_legacy_architecture():
     assert runtime_config.width_scale == pytest.approx(1.0)
     assert runtime_config.stage2_channels == 64
     assert runtime_config.input_size == (32, 32)
-    assert runtime_config.class_names is None
+    assert runtime_config.class_names == ()
 
 
 def test_numpy_predict_override_validation_rejects_checkpoint_conflicts():

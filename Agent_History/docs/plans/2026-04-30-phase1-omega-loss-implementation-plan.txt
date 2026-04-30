@@ -1,0 +1,47 @@
+# Phase 1 Omega-Loss Implementation Plan
+
+## Summary
+
+Implement Phase 1 in the active torch backend only. The experiment keeps the current CNN architecture and defines `h` as the existing 256-d representation after `fc1 + ReLU` and before dropout. The Phase 1 loss is:
+
+`L_total = L_CE_mix + lambda * mean((h - T(h))^2)`
+
+There is no stop-gradient in Phase 1. Both the representation path and the projector receive gradients from the attractor loss. Contraction-like behavior is treated as an empirical hypothesis, not a guaranteed property.
+
+## Implementation Changes
+
+- Add an optional torch-only Omega projector to `TorchCNN` with depth `1` or `2`, hidden dim default `256`, and final `LayerNorm`.
+- Preserve the public inference path: `forward()` returns logits only; trainer code uses `forward_with_representation()` and `forward_with_omega()`.
+- Extend torch checkpoint metadata with `omega_enabled`, `omega_projector_depth`, and `omega_hidden_dim`.
+- Reconstruct Omega-enabled checkpoints in torch predict and GUI paths, while still predicting from logits only.
+- Add torch trainer flags:
+  - `--omega-loss`
+  - `--omega-lambda`
+  - `--omega-projector-depth`
+  - `--omega-hidden-dim`
+  - `--experiment-dir`
+- Keep optimizer, cosine schedule, RandAugment, MixUp/CutMix, EMA, AMP, compile policy, checkpointing, early stopping, and batch size behavior unchanged except where metrics must include Omega components.
+
+## Experiment Artifacts
+
+When `--omega-loss` is enabled, write one run directory under `--experiment-dir` containing:
+
+- `config.json`
+- `epoch_metrics.jsonl`
+- `summary.json`
+- `qualitative_notes.txt`
+
+Track training and validation total loss, CE loss, attractor loss, accuracy, generalization gap, and batch representation variance. Flag `representation_collapse_warning` after 3 consecutive epochs with mean `h` variance below `1e-4`; do not auto-stop on this warning.
+
+## Validation
+
+- Add model tests for representation shape and Omega checkpoint metadata round-trip.
+- Add trainer tests for Omega CLI validation and gradient flow into both projector and representation path.
+- Run no-bytecode syntax/import checks, targeted pytest coverage, and a CPU smoke run with `--omega-loss --omega-lambda 0.05`.
+- Verify the smoke run writes checkpoint and experiment artifacts.
+
+## Assumptions
+
+- NumPy parity is deferred until after torch Phase 1 validation.
+- Phase 1 does not add spectral norm, Lipschitz constraints, Jacobian penalties, tokenization, memory banks, or semantic attention.
+- If the first lambda sweep is unstable, adjust lambda and projector size before adding stronger theory-enforcement mechanisms.

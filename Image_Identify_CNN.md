@@ -110,6 +110,33 @@ Torch training now uses:
 
 `--compile-mode auto` warms up eager and compiled paths separately, measures synchronized median train-step time, and keeps compile only when it improves throughput.
 
+### Phase 1 Omega-Loss
+
+The torch backend supports the Phase 1 attractor experiment through:
+
+- `--omega-loss / --no-omega-loss`
+- `--omega-lambda`
+- `--omega-projector-depth`
+- `--omega-hidden-dim`
+- `--experiment-dir`
+
+Policy details:
+- `h` is the current 256-d representation after `FC(256) -> ReLU` and before dropout
+- `T(h)` is a shallow trainable MLP projector with a final `LayerNorm`
+- the loss is `L_total = L_CE_mix + lambda * mean((h - T(h))^2)`
+- no stop-gradient, spectral normalization, memory bank, tokenization, or attention mechanism is introduced in Phase 1
+- contraction behavior is an empirical hypothesis in this phase, not a guaranteed property
+- validation and checkpointing keep the existing EMA, AMP, compile, early-stop, augmentation, and MixUp/CutMix policies
+
+When `--omega-loss` is enabled, the trainer writes structured run artifacts under `--experiment-dir`:
+
+- `config.json`
+- `epoch_metrics.jsonl`
+- `summary.json`
+- `qualitative_notes.txt`
+
+The metrics include total loss, CE loss, attractor loss, accuracy, generalization gap, and representation-variance diagnostics used to watch for collapse.
+
 ### EMA
 
 New arguments:
@@ -143,7 +170,10 @@ New checkpoints now store:
     input_size: ...,
     class_names: [...],
     is_ema: true/false,
-    ema_decay: ...
+    ema_decay: ...,
+    omega_enabled: true/false,
+    omega_projector_depth: 1 or 2,
+    omega_hidden_dim: ...
   }
 }
 ```
@@ -152,6 +182,7 @@ Notes:
 - both backends still load older plain checkpoints
 - both inference backends now reconstruct model architecture from checkpoint metadata before applying weights
 - when metadata is missing, both backends infer `num_classes` and stage-2 width from the saved parameter shapes
+- torch inference also reconstructs the optional Phase 1 Omega branch when a checkpoint contains it, but prediction uses only classifier logits
 - `--init-from` loads the live model first and then syncs EMA from that loaded model so the two states start aligned
 
 ### Multiphase LR
@@ -237,6 +268,11 @@ See `best_train_commands.txt`.
 - `--contrast`
 - `--saturation`
 - `--model-width-scale`
+- `--omega-loss / --no-omega-loss`
+- `--omega-lambda`
+- `--omega-projector-depth`
+- `--omega-hidden-dim`
+- `--experiment-dir`
 - `--early-stop / --no-early-stop`
 - `--early-stop-metric {val_loss,val_acc}`
 - `--patience`

@@ -19,6 +19,30 @@ from torch import nn
 
 
 DEFAULT_INPUT_SIZE: Tuple[int, int] = (32, 32)
+DEFAULT_OMEGA_FEATURE_DIM = 256
+
+
+def _normalize_omega_metadata_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return False
+
+
+def _normalize_optional_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return None
+    return resolved if resolved > 0 else None
 
 
 @dataclass(frozen=True)
@@ -28,6 +52,9 @@ class CheckpointRuntimeConfig:
     width_scale: float
     stage2_channels: int
     class_names: tuple[str, ...]
+    omega_enabled: bool
+    omega_projector_depth: int | None
+    omega_hidden_dim: int | None
     metadata: dict[str, Any]
 
 
@@ -153,6 +180,9 @@ def resolve_runtime_config_from_state(
         metadata_dict.get("class_names"),
         expected_count=num_classes,
     )
+    omega_enabled = _normalize_omega_metadata_flag(metadata_dict.get("omega_enabled", False))
+    omega_projector_depth = _normalize_optional_positive_int(metadata_dict.get("omega_projector_depth"))
+    omega_hidden_dim = _normalize_optional_positive_int(metadata_dict.get("omega_hidden_dim"))
 
     return CheckpointRuntimeConfig(
         input_size=input_size,
@@ -160,6 +190,9 @@ def resolve_runtime_config_from_state(
         width_scale=width_scale,
         stage2_channels=stage2_channels,
         class_names=class_names,
+        omega_enabled=omega_enabled,
+        omega_projector_depth=omega_projector_depth,
+        omega_hidden_dim=omega_hidden_dim,
         metadata=metadata_dict,
     )
 
@@ -181,6 +214,34 @@ class SqueezeExcitation(nn.Module):
         return x * scale
 
 
+class OmegaProjector(nn.Module):
+    """Shallow projector used by the Phase 1 Omega-loss path."""
+
+    def __init__(self, *, input_dim: int, hidden_dim: int, depth: int):
+        super().__init__()
+        if depth not in {1, 2}:
+            raise ValueError("omega projector depth must be 1 or 2")
+        if input_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("omega projector dimensions must be > 0")
+
+        layers: list[nn.Module] = []
+        if depth == 1:
+            layers.append(nn.Linear(input_dim, input_dim))
+        else:
+            layers.extend(
+                [
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, input_dim),
+                ]
+            )
+        layers.append(nn.LayerNorm(input_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h)
+
+
 class TorchCNN(nn.Module):
     """Three-stage CNN + SE classifier matching the active project architecture."""
 
@@ -191,6 +252,9 @@ class TorchCNN(nn.Module):
         seed: int | None = None,
         dropout_p: float = 0.5,
         width_scale: float = 0.75,
+        omega_enabled: bool = False,
+        omega_projector_depth: int = 1,
+        omega_hidden_dim: int = DEFAULT_OMEGA_FEATURE_DIM,
     ):
         super().__init__()
         if seed is not None:
@@ -226,14 +290,26 @@ class TorchCNN(nn.Module):
         self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         feat_h, feat_w = height // 8, width // 8
-        self.fc1 = nn.Linear(feat_h * feat_w * 128, 256)
+        self.fc1 = nn.Linear(feat_h * feat_w * 128, DEFAULT_OMEGA_FEATURE_DIM)
         self.dropout = nn.Dropout(p=dropout_p)
-        self.fc2 = nn.Linear(256, num_classes)
+        self.fc2 = nn.Linear(DEFAULT_OMEGA_FEATURE_DIM, num_classes)
+        self.omega_projector = (
+            OmegaProjector(
+                input_dim=DEFAULT_OMEGA_FEATURE_DIM,
+                hidden_dim=int(omega_hidden_dim),
+                depth=int(omega_projector_depth),
+            )
+            if omega_enabled
+            else None
+        )
 
         self._input_size = tuple(input_size)
         self._num_classes = int(num_classes)
         self._width_scale = float(width_scale)
         self._stage2_channels = int(stage2_channels)
+        self._omega_enabled = bool(omega_enabled)
+        self._omega_projector_depth = int(omega_projector_depth) if omega_enabled else None
+        self._omega_hidden_dim = int(omega_hidden_dim) if omega_enabled else None
 
     @property
     def width_scale(self) -> float:
@@ -254,6 +330,21 @@ class TorchCNN(nn.Module):
     def num_classes(self) -> int:
         """Expose the classifier output size for checkpoint metadata and tests."""
         return self._num_classes
+
+    @property
+    def omega_enabled(self) -> bool:
+        """Expose whether the Phase 1 Omega projector exists."""
+        return self._omega_enabled
+
+    @property
+    def omega_projector_depth(self) -> int | None:
+        """Expose the configured Omega projector depth for checkpoint metadata."""
+        return self._omega_projector_depth
+
+    @property
+    def omega_hidden_dim(self) -> int | None:
+        """Expose the configured Omega hidden dimension for checkpoint metadata."""
+        return self._omega_hidden_dim
 
     def backbone_modules(self) -> tuple[nn.Module, ...]:
         """Return the feature extractor modules affected by temporary freezing."""
@@ -281,7 +372,10 @@ class TorchCNN(nn.Module):
 
     def head_modules(self) -> tuple[nn.Module, ...]:
         """Return the classifier head modules that stay trainable during freeze."""
-        return (self.fc1, self.fc2)
+        modules: list[nn.Module] = [self.fc1, self.fc2]
+        if self.omega_projector is not None:
+            modules.append(self.omega_projector)
+        return tuple(modules)
 
     def iter_head_parameters(self) -> Iterable[nn.Parameter]:
         """Yield classifier head parameters in a stable order."""
@@ -318,7 +412,7 @@ class TorchCNN(nn.Module):
         x = self.pool3(x)
         return x
 
-    def forward(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
+    def _normalize_runtime_input(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
         if not isinstance(x, torch.Tensor):
@@ -330,17 +424,36 @@ class TorchCNN(nn.Module):
         if x.ndim != 4:
             raise ValueError(f"Expected 4D input, got {tuple(x.shape)}")
         if x.shape[1] == 3:
-            pass
-        elif x.shape[-1] == 3:
-            x = x.permute(0, 3, 1, 2)
-        else:
-            raise ValueError("Input must be NHWC or NCHW with 3 channels")
+            return x
+        if x.shape[-1] == 3:
+            return x.permute(0, 3, 1, 2)
+        raise ValueError("Input must be NHWC or NCHW with 3 channels")
 
-        x = self._forward_features(x)
-        x = torch.flatten(x, start_dim=1)
-        x = torch.relu(self.fc1(x))
-        x = self.dropout(x)
-        return self.fc2(x)
+    def _forward_representation(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
+        x_tensor = self._normalize_runtime_input(x)
+        features = self._forward_features(x_tensor)
+        flattened = torch.flatten(features, start_dim=1)
+        return torch.relu(self.fc1(flattened))
+
+    def _forward_logits_from_representation(self, h: torch.Tensor) -> torch.Tensor:
+        dropped = self.dropout(h)
+        return self.fc2(dropped)
+
+    def forward_with_representation(self, x: torch.Tensor | np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return logits plus the 256-d representation used by Phase 1 Omega-loss."""
+        h = self._forward_representation(x)
+        return self._forward_logits_from_representation(h), h
+
+    def forward_with_omega(self, x: torch.Tensor | np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return logits, representation, and Omega projector output for training."""
+        if self.omega_projector is None:
+            raise RuntimeError("Omega projector is disabled for this model instance")
+        logits, h = self.forward_with_representation(x)
+        return logits, h, self.omega_projector(h)
+
+    def forward(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
+        logits, _ = self.forward_with_representation(x)
+        return logits
 
     def save_weights(self, path: str | Path, metadata: Mapping[str, Any] | None = None) -> None:
         checkpoint = Path(path)
@@ -354,6 +467,9 @@ class TorchCNN(nn.Module):
             "width_scale": float(self.width_scale),
             "stage2_channels": int(self.stage2_channels),
             "input_size": list(self.input_size),
+            "omega_enabled": bool(self.omega_enabled),
+            "omega_projector_depth": self.omega_projector_depth,
+            "omega_hidden_dim": self.omega_hidden_dim,
             **({} if metadata is None else dict(metadata)),
         }
         payload = {
@@ -376,6 +492,7 @@ CNN = TorchCNN
 
 __all__ = [
     "CheckpointRuntimeConfig",
+    "DEFAULT_OMEGA_FEATURE_DIM",
     "TorchCNN",
     "CNN",
     "load_checkpoint_state",

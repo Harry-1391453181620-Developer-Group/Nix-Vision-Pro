@@ -8,7 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from backends.torch.model import TorchCNN, load_checkpoint_state, resolve_checkpoint_runtime_config
+from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, TorchCNN, load_checkpoint_state, resolve_checkpoint_runtime_config
 from backends.torch.predict_backend import _validate_checkpoint_overrides
 
 
@@ -17,6 +17,19 @@ def test_torch_cnn_forward_shape():
     x = torch.randn(4, 32, 32, 3)
     logits = model(x)
     assert tuple(logits.shape) == (4, 10)
+
+
+def test_torch_cnn_forward_with_representation_shape():
+    model = TorchCNN(input_size=(32, 32), num_classes=10, seed=123, omega_enabled=True)
+    x = torch.randn(4, 32, 32, 3)
+    logits, h = model.forward_with_representation(x)
+    omega_logits, omega_h, t_h = model.forward_with_omega(x)
+
+    assert tuple(logits.shape) == (4, 10)
+    assert tuple(h.shape) == (4, DEFAULT_OMEGA_FEATURE_DIM)
+    assert tuple(omega_logits.shape) == (4, 10)
+    assert tuple(omega_h.shape) == (4, DEFAULT_OMEGA_FEATURE_DIM)
+    assert tuple(t_h.shape) == (4, DEFAULT_OMEGA_FEATURE_DIM)
 
 
 def test_torch_cnn_checkpoint_round_trip_preserves_metadata():
@@ -79,7 +92,39 @@ def test_torch_checkpoint_runtime_config_round_trip_from_structured_checkpoint()
     assert runtime_config.width_scale == pytest.approx(1.5)
     assert runtime_config.stage2_channels == model.stage2_channels
     assert runtime_config.input_size == (32, 32)
-    assert runtime_config.class_names == class_names
+    assert runtime_config.class_names == tuple(class_names)
+    assert runtime_config.omega_enabled is False
+
+
+def test_torch_checkpoint_runtime_config_round_trip_with_omega_metadata():
+    checkpoint = Path('.worktmp') / 'model_test_torch_runtime_config_omega.pt'
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    model = TorchCNN(
+        input_size=(32, 32),
+        num_classes=13,
+        seed=29,
+        width_scale=1.5,
+        omega_enabled=True,
+        omega_projector_depth=2,
+        omega_hidden_dim=128,
+    )
+    model.save_weights(checkpoint)
+
+    runtime_config = resolve_checkpoint_runtime_config(checkpoint, map_location='cpu')
+    restored = TorchCNN(
+        input_size=runtime_config.input_size,
+        num_classes=runtime_config.num_classes,
+        width_scale=runtime_config.width_scale,
+        omega_enabled=runtime_config.omega_enabled,
+        omega_projector_depth=runtime_config.omega_projector_depth or 1,
+        omega_hidden_dim=runtime_config.omega_hidden_dim or DEFAULT_OMEGA_FEATURE_DIM,
+    )
+    metadata = restored.load_weights(checkpoint, map_location='cpu')
+
+    assert runtime_config.omega_enabled is True
+    assert runtime_config.omega_projector_depth == 2
+    assert runtime_config.omega_hidden_dim == 128
+    assert metadata["omega_enabled"] is True
 
 
 def test_torch_checkpoint_runtime_config_infers_legacy_architecture():
@@ -94,7 +139,8 @@ def test_torch_checkpoint_runtime_config_infers_legacy_architecture():
     assert runtime_config.width_scale == pytest.approx(1.0)
     assert runtime_config.stage2_channels == 64
     assert runtime_config.input_size == (32, 32)
-    assert runtime_config.class_names is None
+    assert runtime_config.class_names == ()
+    assert runtime_config.omega_enabled is False
 
 
 def test_torch_predict_override_validation_rejects_checkpoint_conflicts():

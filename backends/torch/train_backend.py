@@ -9,18 +9,19 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import dataclass
 from functools import partial
 import hashlib
 import json
 import random
 import time
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
 import config
-from backends.torch.model import TorchCNN, load_checkpoint_state
+from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, TorchCNN, load_checkpoint_state
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
 from utils.safety import install_dataset_write_guard, tree_signature
@@ -104,6 +105,118 @@ class TorchImageDataset(Dataset[tuple[torch.Tensor, int]]):
         image_nchw = np.transpose(image, (2, 0, 1))
         image_tensor = torch.from_numpy(np.ascontiguousarray(image_nchw, dtype=np.float32))
         return image_tensor, int(self.labels[index])
+
+
+OMEGA_COLLAPSE_VARIANCE_THRESHOLD = 1e-4
+OMEGA_COLLAPSE_EPOCHS = 3
+
+
+@dataclass(frozen=True)
+class RepresentationVarianceStats:
+    mean: float
+    min: float
+    max: float
+
+
+def _validate_omega_args(
+    *,
+    omega_loss: bool,
+    omega_lambda: float,
+    omega_projector_depth: int,
+    omega_hidden_dim: int,
+) -> tuple[float, int, int]:
+    omega_lambda = float(omega_lambda)
+    omega_projector_depth = int(omega_projector_depth)
+    omega_hidden_dim = int(omega_hidden_dim)
+    if omega_lambda < 0.0:
+        raise ValueError("omega_lambda must be >= 0")
+    if omega_projector_depth not in {1, 2}:
+        raise ValueError("omega_projector_depth must be 1 or 2")
+    if omega_hidden_dim <= 0:
+        raise ValueError("omega_hidden_dim must be > 0")
+    if omega_lambda > 0.0 and not omega_loss:
+        raise ValueError("omega_lambda > 0 requires --omega-loss")
+    return omega_lambda, omega_projector_depth, omega_hidden_dim
+
+
+def _format_run_value(value: float) -> str:
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text.replace("-", "m").replace(".", "p")
+
+
+def _make_json_serializable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _make_json_serializable(inner) for key, inner in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_json_serializable(item) for item in value]
+    return value
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_make_json_serializable(payload), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_make_json_serializable(payload), sort_keys=True) + "\n")
+
+
+def _prepare_experiment_artifacts(
+    *,
+    experiment_root: Path,
+    checkpoint_path: Path,
+    seed: int,
+    omega_lambda: float,
+) -> tuple[Path, Path, Path, Path]:
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = experiment_root / (
+        f"{timestamp}-{checkpoint_path.stem}-seed_{int(seed)}-lambda_{_format_run_value(omega_lambda)}"
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_dir / "epoch_metrics.jsonl"
+    summary_path = run_dir / "summary.json"
+    config_path = run_dir / "config.json"
+    notes_path = run_dir / "qualitative_notes.txt"
+    notes_path.write_text(
+        "Phase 1 qualitative convergence notes\n"
+        "===================================\n\n"
+        "- smoothness:\n"
+        "- oscillation:\n"
+        "- divergence:\n"
+        "- collapse signs:\n",
+        encoding="utf-8",
+    )
+    return run_dir, config_path, metrics_path, summary_path
+
+
+def _extract_representation_variance_stats(h: torch.Tensor | None) -> RepresentationVarianceStats:
+    if h is None:
+        return RepresentationVarianceStats(mean=float("nan"), min=float("nan"), max=float("nan"))
+    variance = torch.var(h.detach().float(), dim=0, unbiased=False)
+    return RepresentationVarianceStats(
+        mean=float(variance.mean().item()),
+        min=float(variance.min().item()),
+        max=float(variance.max().item()),
+    )
+
+
+def _resolve_forward_output(
+    forward_output: Any,
+    *,
+    omega_enabled: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if not omega_enabled:
+        if isinstance(forward_output, tuple):
+            return forward_output[0], None, None
+        return forward_output, None, None
+    if not isinstance(forward_output, tuple) or len(forward_output) != 3:
+        raise ValueError("Omega-enabled forward path must return (logits, h, T(h))")
+    logits, h, t_h = forward_output
+    return logits, h, t_h
 
 
 def list_labeled_paths(
@@ -357,6 +470,36 @@ def _compute_batch_loss(
     return _soft_cross_entropy_loss(logits, targets, class_weights=ce_class_weights)
 
 
+def _compute_total_loss_components(
+    forward_output: Any,
+    targets: torch.Tensor,
+    *,
+    omega_enabled: bool,
+    omega_lambda: float,
+    use_focal_loss: bool,
+    focal_gamma: float,
+    ce_class_weights: torch.Tensor | None,
+    focal_alpha_weights: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, RepresentationVarianceStats]:
+    logits, h, t_h = _resolve_forward_output(forward_output, omega_enabled=omega_enabled)
+    ce_loss = _compute_batch_loss(
+        logits,
+        targets,
+        use_focal_loss=use_focal_loss,
+        focal_gamma=focal_gamma,
+        ce_class_weights=ce_class_weights,
+        focal_alpha_weights=focal_alpha_weights,
+    )
+    if not omega_enabled:
+        zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        return ce_loss, ce_loss, zero, logits, _extract_representation_variance_stats(None)
+
+    assert h is not None and t_h is not None
+    attr_loss = torch.mean(torch.square(h - t_h))
+    total_loss = ce_loss + (float(omega_lambda) * attr_loss)
+    return total_loss, ce_loss, attr_loss, logits, _extract_representation_variance_stats(h)
+
+
 def _beta_sample_on_device(beta_alpha: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     concentration = torch.tensor(float(beta_alpha), device=device, dtype=dtype)
     return torch.distributions.Beta(concentration, concentration).sample().to(device=device, dtype=dtype)
@@ -502,7 +645,7 @@ def _synchronize_device(device: torch.device) -> None:
 
 def _benchmark_train_steps(
     *,
-    forward_model: nn.Module,
+    forward_callable: Callable[[torch.Tensor], Any],
     raw_model: TorchCNN,
     optimizer: torch.optim.Optimizer,
     scaler,
@@ -514,13 +657,14 @@ def _benchmark_train_steps(
     focal_gamma: float,
     ce_class_weights: torch.Tensor | None,
     focal_alpha_weights: torch.Tensor | None,
+    omega_enabled: bool,
+    omega_lambda: float,
     grad_clip: float,
     device: torch.device,
     amp_dtype: torch.dtype | None,
     warmup_steps: int,
     measure_steps: int,
 ) -> float:
-    forward_model.train()
     raw_model.train()
     times: list[float] = []
     targets = _make_target_distribution(
@@ -535,10 +679,12 @@ def _benchmark_train_steps(
         _synchronize_device(device)
         start = time.perf_counter()
         with _make_autocast_context(device, amp_dtype):
-            logits = forward_model(x_batch)
-            loss = _compute_batch_loss(
-                logits,
+            forward_output = forward_callable(x_batch)
+            loss, _, _, _, _ = _compute_total_loss_components(
+                forward_output,
                 targets,
+                omega_enabled=omega_enabled,
+                omega_lambda=omega_lambda,
                 use_focal_loss=use_focal_loss,
                 focal_gamma=focal_gamma,
                 ce_class_weights=ce_class_weights,
@@ -593,11 +739,13 @@ def _maybe_enable_compiled_forward_model(
     focal_gamma: float,
     ce_class_weights: torch.Tensor | None,
     focal_alpha_weights: torch.Tensor | None,
+    omega_enabled: bool,
+    omega_lambda: float,
     grad_clip: float,
     device: torch.device,
     amp_dtype: torch.dtype | None,
     use_channels_last: bool,
-) -> nn.Module | None:
+) -> Callable[[torch.Tensor], Any] | None:
     if args.compile_mode == "off":
         return None
     if device.type != "cuda":
@@ -612,7 +760,7 @@ def _maybe_enable_compiled_forward_model(
 
     if args.compile_mode == "on":
         try:
-            compiled = torch.compile(model)
+            compiled = torch.compile(model.forward_with_omega if omega_enabled else model)
             print("Enabled torch.compile (--compile-mode=on).")
             return compiled
         except Exception as exc:
@@ -630,7 +778,7 @@ def _maybe_enable_compiled_forward_model(
         eager_optimizer = _build_optimizer(args, eager_model, lr_value=benchmark_lr)
         eager_scaler = _make_grad_scaler(device, amp_dtype)
         eager_time = _benchmark_train_steps(
-            forward_model=eager_model,
+            forward_callable=eager_model.forward_with_omega if omega_enabled else eager_model,
             raw_model=eager_model,
             optimizer=eager_optimizer,
             scaler=eager_scaler,
@@ -642,6 +790,8 @@ def _maybe_enable_compiled_forward_model(
             focal_gamma=focal_gamma,
             ce_class_weights=ce_class_weights,
             focal_alpha_weights=focal_alpha_weights,
+            omega_enabled=omega_enabled,
+            omega_lambda=omega_lambda,
             grad_clip=grad_clip,
             device=device,
             amp_dtype=amp_dtype,
@@ -650,11 +800,11 @@ def _maybe_enable_compiled_forward_model(
         )
 
         compiled_model = _clone_model_for_benchmark(model, device=device, use_channels_last=use_channels_last)
-        compiled_forward = torch.compile(compiled_model)
+        compiled_forward = torch.compile(compiled_model.forward_with_omega if omega_enabled else compiled_model)
         compiled_optimizer = _build_optimizer(args, compiled_model, lr_value=benchmark_lr)
         compiled_scaler = _make_grad_scaler(device, amp_dtype)
         compiled_time = _benchmark_train_steps(
-            forward_model=compiled_forward,
+            forward_callable=compiled_forward,
             raw_model=compiled_model,
             optimizer=compiled_optimizer,
             scaler=compiled_scaler,
@@ -666,6 +816,8 @@ def _maybe_enable_compiled_forward_model(
             focal_gamma=focal_gamma,
             ce_class_weights=ce_class_weights,
             focal_alpha_weights=focal_alpha_weights,
+            omega_enabled=omega_enabled,
+            omega_lambda=omega_lambda,
             grad_clip=grad_clip,
             device=device,
             amp_dtype=amp_dtype,
@@ -680,7 +832,7 @@ def _maybe_enable_compiled_forward_model(
             )
             return None
 
-        live_compiled_forward = torch.compile(model)
+        live_compiled_forward = torch.compile(model.forward_with_omega if omega_enabled else model)
         print(
             f"Enabled torch.compile: eager median step {eager_time:.6f}s, "
             f"compiled median step {compiled_time:.6f}s"
@@ -697,17 +849,33 @@ def evaluate_loader(
     num_classes: int,
     device: torch.device,
     *,
+    forward_callable: Callable[[torch.Tensor], Any] | None,
     use_channels_last: bool,
     amp_dtype: torch.dtype | None,
     use_focal_loss: bool,
     focal_gamma: float,
     ce_class_weights: torch.Tensor | None,
     focal_alpha_weights: torch.Tensor | None,
-) -> tuple[float, float]:
+    omega_enabled: bool,
+    omega_lambda: float,
+) -> dict[str, float]:
     if len(loader.dataset) == 0:
-        return float("nan"), float("nan")
+        return {
+            "loss_total": float("nan"),
+            "loss_ce": float("nan"),
+            "loss_attr": float("nan"),
+            "acc": float("nan"),
+            "h_var_mean": float("nan"),
+            "h_var_min": float("nan"),
+            "h_var_max": float("nan"),
+        }
     total_loss = 0.0
+    total_ce_loss = 0.0
+    total_attr_loss = 0.0
     total_correct = 0
+    total_h_var_mean = 0.0
+    total_h_var_min = 0.0
+    total_h_var_max = 0.0
     num_batches = 0
     model.eval()
     with torch.no_grad():
@@ -721,19 +889,34 @@ def evaluate_loader(
                 dtype=torch.float32,
             )
             with _make_autocast_context(device, amp_dtype):
-                logits = model(x_batch)
-                loss = _compute_batch_loss(
-                    logits,
+                forward_output = (forward_callable or model)(x_batch)
+                loss, ce_loss, attr_loss, logits, h_stats = _compute_total_loss_components(
+                    forward_output,
                     targets,
+                    omega_enabled=omega_enabled,
+                    omega_lambda=omega_lambda,
                     use_focal_loss=use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
                     focal_alpha_weights=focal_alpha_weights,
                 )
             total_loss += float(loss.item())
+            total_ce_loss += float(ce_loss.item())
+            total_attr_loss += float(attr_loss.item())
             total_correct += int((torch.argmax(logits, dim=1) == y_batch).sum().item())
+            total_h_var_mean += h_stats.mean
+            total_h_var_min += h_stats.min
+            total_h_var_max += h_stats.max
             num_batches += 1
-    return total_loss / max(1, num_batches), total_correct / max(1, len(loader.dataset))
+    return {
+        "loss_total": total_loss / max(1, num_batches),
+        "loss_ce": total_ce_loss / max(1, num_batches),
+        "loss_attr": total_attr_loss / max(1, num_batches),
+        "acc": total_correct / max(1, len(loader.dataset)),
+        "h_var_mean": total_h_var_mean / max(1, num_batches),
+        "h_var_min": total_h_var_min / max(1, num_batches),
+        "h_var_max": total_h_var_max / max(1, num_batches),
+    }
 
 
 def load_weights_forgiving(model: TorchCNN, checkpoint_path: str | Path, skip_prefixes: tuple[str, ...] = ("fc2.",)) -> tuple[list[str], list[str]]:
@@ -836,12 +1019,17 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
     parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
     parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "best_torch_model.pt"))
+    parser.add_argument("--experiment-dir", type=str, default="runs", help="Root directory for Omega experiment artifacts")
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rotation", type=float, default=12.0, help="Maximum absolute random rotation in degrees")
     parser.add_argument("--brightness", type=float, default=0.2, help="Brightness jitter strength in [0, 1]")
     parser.add_argument("--contrast", type=float, default=0.2, help="Contrast jitter strength in [0, 1]")
     parser.add_argument("--saturation", type=float, default=0.2, help="Saturation jitter strength in [0, 1]")
     parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
+    parser.add_argument("--omega-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable the Phase 1 Omega-loss auxiliary branch")
+    parser.add_argument("--omega-lambda", type=float, default=0.0, help="Weight applied to the Phase 1 Omega attractor loss")
+    parser.add_argument("--omega-projector-depth", type=int, default=1, help="Omega projector depth: 1 or 2 linear layers")
+    parser.add_argument("--omega-hidden-dim", type=int, default=DEFAULT_OMEGA_FEATURE_DIM, help="Hidden width for the 2-layer Omega projector")
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True, help="If true, stream batches from disk; if false, preload all images into memory.")
     parser.add_argument("--amp-mode", choices=["auto", "on", "off"], default="auto", help="AMP policy for CUDA training")
@@ -896,6 +1084,12 @@ def main() -> None:
         ema_decay = validate_ema_decay(args.ema_decay)
         focal_gamma = validate_focal_gamma(args.focal_gamma)
         width_scale = validate_model_width_scale(args.model_width_scale)
+        omega_lambda, omega_projector_depth, omega_hidden_dim = _validate_omega_args(
+            omega_loss=bool(args.omega_loss),
+            omega_lambda=args.omega_lambda,
+            omega_projector_depth=args.omega_projector_depth,
+            omega_hidden_dim=args.omega_hidden_dim,
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -1029,6 +1223,9 @@ def main() -> None:
         seed=args.seed,
         dropout_p=args.dropout,
         width_scale=width_scale,
+        omega_enabled=bool(args.omega_loss),
+        omega_projector_depth=omega_projector_depth,
+        omega_hidden_dim=omega_hidden_dim,
     )
     if use_channels_last:
         model.to(device=device, memory_format=torch.channels_last)
@@ -1063,6 +1260,9 @@ def main() -> None:
     best_saved = False
     bad_epochs = 0
     current_lr = current_phase_base_lr
+    best_epoch = 0
+    collapse_low_variance_epochs = 0
+    final_epoch_metrics: dict[str, Any] | None = None
 
     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
     optimizer: torch.optim.Optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
@@ -1084,6 +1284,8 @@ def main() -> None:
         focal_gamma=focal_gamma,
         ce_class_weights=ce_class_weights,
         focal_alpha_weights=focal_alpha_weights,
+        omega_enabled=bool(args.omega_loss),
+        omega_lambda=omega_lambda,
         grad_clip=float(args.grad_clip),
         device=device,
         amp_dtype=amp_dtype,
@@ -1098,6 +1300,9 @@ def main() -> None:
             seed=args.seed,
             dropout_p=args.dropout,
             width_scale=width_scale,
+            omega_enabled=bool(args.omega_loss),
+            omega_projector_depth=omega_projector_depth,
+            omega_hidden_dim=omega_hidden_dim,
         )
         if use_channels_last:
             ema_model.to(device=device, memory_format=torch.channels_last)
@@ -1114,6 +1319,32 @@ def main() -> None:
         "is_ema": False,
         "ema_decay": None,
     }
+    experiment_run_dir: Path | None = None
+    experiment_metrics_path: Path | None = None
+    experiment_summary_path: Path | None = None
+    if args.omega_loss:
+        experiment_run_dir, experiment_config_path, experiment_metrics_path, experiment_summary_path = _prepare_experiment_artifacts(
+            experiment_root=Path(args.experiment_dir),
+            checkpoint_path=Path(args.checkpoint),
+            seed=args.seed,
+            omega_lambda=omega_lambda,
+        )
+        _write_json(
+            experiment_config_path,
+            {
+                "args": vars(args),
+                "resolved_device": str(device),
+                "resolved_num_classes": int(num_classes),
+                "resolved_class_names": list(resolved_class_names),
+                "resolved_width_scale": float(width_scale),
+                "resolved_stage2_channels": int(model.stage2_channels),
+                "omega_enabled": bool(args.omega_loss),
+                "omega_lambda": float(omega_lambda),
+                "omega_projector_depth": int(omega_projector_depth),
+                "omega_hidden_dim": int(omega_hidden_dim),
+                "checkpoint_path": str(Path(args.checkpoint).resolve()),
+            },
+        )
 
     for epoch in range(args.epochs):
         phase_config = phase_map[epoch]
@@ -1126,8 +1357,6 @@ def main() -> None:
             freeze_epochs_remaining = 0
             backbone_frozen = False
             model.train()
-            if compiled_forward_model is not None:
-                compiled_forward_model.train()
             _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
             optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
             scaler = _make_grad_scaler(device, amp_dtype)
@@ -1139,12 +1368,15 @@ def main() -> None:
             )
 
         model.train()
-        if compiled_forward_model is not None:
-            compiled_forward_model.train()
         epoch_backbone_frozen = backbone_frozen
         _apply_backbone_freeze_state(model, backbone_frozen=epoch_backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
         epoch_loss = 0.0
+        epoch_ce_loss = 0.0
+        epoch_attr_loss = 0.0
         epoch_correct = 0
+        epoch_h_var_mean = 0.0
+        epoch_h_var_min = float("inf")
+        epoch_h_var_max = -float("inf")
 
         for batch_index, (x_cpu, y_cpu) in enumerate(train_loader):
             y_batch_idx = _move_label_batch(y_cpu, device)
@@ -1201,13 +1433,19 @@ def main() -> None:
             _set_optimizer_lr(optimizer, current_lr)
 
             optimizer.zero_grad(set_to_none=True)
-            forward_model: nn.Module = compiled_forward_model if compiled_forward_model is not None else model
+            forward_callable: Callable[[torch.Tensor], Any]
+            if bool(args.omega_loss):
+                forward_callable = compiled_forward_model if compiled_forward_model is not None else model.forward_with_omega
+            else:
+                forward_callable = compiled_forward_model if compiled_forward_model is not None else model
             with _make_autocast_context(device, amp_dtype):
-                logits = forward_model(x_batch)
                 batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
-                loss = _compute_batch_loss(
-                    logits,
+                forward_output = forward_callable(x_batch)
+                loss, ce_loss, attr_loss, logits, h_stats = _compute_total_loss_components(
+                    forward_output,
                     target_distribution,
+                    omega_enabled=bool(args.omega_loss),
+                    omega_lambda=omega_lambda,
                     use_focal_loss=batch_use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
@@ -1225,32 +1463,49 @@ def main() -> None:
                 ema.update(model, step_in_phase=phase_step, mix_active=(mix_mode != "none"))
 
             epoch_loss += float(loss.item())
+            epoch_ce_loss += float(ce_loss.item())
+            epoch_attr_loss += float(attr_loss.item())
             metric_targets = torch.argmax(target_distribution, dim=1)
             epoch_correct += int((torch.argmax(logits, dim=1) == metric_targets).sum().item())
+            epoch_h_var_mean += h_stats.mean
+            if not np.isnan(h_stats.min):
+                epoch_h_var_min = min(epoch_h_var_min, h_stats.min)
+            if not np.isnan(h_stats.max):
+                epoch_h_var_max = max(epoch_h_var_max, h_stats.max)
 
         avg_loss = epoch_loss / max(1, num_batches)
+        avg_ce_loss = epoch_ce_loss / max(1, num_batches)
+        avg_attr_loss = epoch_attr_loss / max(1, num_batches)
         train_acc = epoch_correct / max(1, len(train_dataset))
+        train_h_var_mean = epoch_h_var_mean / max(1, num_batches)
+        train_h_var_min = epoch_h_var_min if epoch_h_var_min != float("inf") else float("nan")
+        train_h_var_max = epoch_h_var_max if epoch_h_var_max != -float("inf") else float("nan")
 
         if val_loader is not None and y_val is not None and len(val_paths) > 0:
             eval_model = ema.ema_model if ema is not None else model
-            eval_forward_model: nn.Module
+            eval_model.eval()
+            eval_forward_callable: Callable[[torch.Tensor], Any] | None = None
             if eval_model is model and compiled_forward_model is not None:
-                eval_forward_model = compiled_forward_model
-            else:
-                eval_forward_model = eval_model
-            eval_forward_model.eval()
-            val_loss, val_acc = evaluate_loader(
-                eval_forward_model,
+                eval_forward_callable = compiled_forward_model
+            elif bool(args.omega_loss):
+                eval_forward_callable = eval_model.forward_with_omega
+            val_metrics = evaluate_loader(
+                eval_model,
                 val_loader,
                 num_classes,
                 device,
+                forward_callable=eval_forward_callable,
                 use_channels_last=use_channels_last,
                 amp_dtype=amp_dtype,
                 use_focal_loss=base_use_focal_loss,
                 focal_gamma=focal_gamma,
                 ce_class_weights=ce_class_weights,
                 focal_alpha_weights=focal_alpha_weights,
+                omega_enabled=bool(args.omega_loss),
+                omega_lambda=omega_lambda,
             )
+            val_loss = val_metrics["loss_total"]
+            val_acc = val_metrics["acc"]
 
             improved = (val_loss < (best_val_loss - args.min_delta)) if args.early_stop_metric == "val_loss" else (val_acc > (best_val_acc + args.min_delta))
             if improved:
@@ -1258,6 +1513,7 @@ def main() -> None:
                     best_val_loss = val_loss
                 else:
                     best_val_acc = val_acc
+                best_epoch = epoch + 1
                 checkpoint_model = ema.ema_model if ema is not None else model
                 checkpoint_metadata["is_ema"] = bool(ema is not None)
                 checkpoint_metadata["ema_decay"] = float(ema_decay) if ema is not None else None
@@ -1266,6 +1522,10 @@ def main() -> None:
                 bad_epochs = 0
             else:
                 bad_epochs += 1
+            if args.early_stop_metric != "val_loss":
+                best_val_loss = min(best_val_loss, val_loss)
+            if args.early_stop_metric != "val_acc":
+                best_val_acc = max(best_val_acc, val_acc)
 
             if epoch_backbone_frozen:
                 if val_acc > (phase_best_val_acc + args.min_delta):
@@ -1284,8 +1544,6 @@ def main() -> None:
                     backbone_frozen = False
                     phase_plateau_epochs = 0
                     model.train()
-                    if compiled_forward_model is not None:
-                        compiled_forward_model.train()
                     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
                     optimizer = _build_optimizer(args, model, lr_value=current_lr)
                     scaler = _make_grad_scaler(device, amp_dtype)
@@ -1304,8 +1562,6 @@ def main() -> None:
                         freeze_epochs_remaining = freeze_epoch_num
                         phase_plateau_epochs = 0
                         model.train()
-                        if compiled_forward_model is not None:
-                            compiled_forward_model.train()
                         _apply_backbone_freeze_state(model, backbone_frozen=True, freeze_bn_affine=args.freeze_bn_affine)
                         optimizer = _build_optimizer(args, model, lr_value=current_lr)
                         scaler = _make_grad_scaler(device, amp_dtype)
@@ -1322,6 +1578,39 @@ def main() -> None:
                 f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  "
                 f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}  gap={gap:.3f}{marker}"
             )
+            final_epoch_metrics = {
+                "epoch": epoch + 1,
+                "phase": current_phase_index + 1,
+                "mode": mode_text,
+                "lr": float(current_lr),
+                "train_loss_total": float(avg_loss),
+                "train_loss_ce": float(avg_ce_loss),
+                "train_loss_attr": float(avg_attr_loss),
+                "train_acc": float(train_acc),
+                "val_loss_total": float(val_metrics["loss_total"]),
+                "val_loss_ce": float(val_metrics["loss_ce"]),
+                "val_loss_attr": float(val_metrics["loss_attr"]),
+                "val_acc": float(val_acc),
+                "generalization_gap": float(gap),
+                "h_var_mean": float(train_h_var_mean),
+                "h_var_min": float(train_h_var_min),
+                "h_var_max": float(train_h_var_max),
+                "val_h_var_mean": float(val_metrics["h_var_mean"]),
+                "val_h_var_min": float(val_metrics["h_var_min"]),
+                "val_h_var_max": float(val_metrics["h_var_max"]),
+                "improved": bool(improved),
+            }
+            if args.omega_loss:
+                collapse_low_variance_epochs = (
+                    collapse_low_variance_epochs + 1
+                    if train_h_var_mean < OMEGA_COLLAPSE_VARIANCE_THRESHOLD
+                    else 0
+                )
+                final_epoch_metrics["representation_collapse_warning"] = bool(
+                    collapse_low_variance_epochs >= OMEGA_COLLAPSE_EPOCHS
+                )
+                assert experiment_metrics_path is not None
+                _append_jsonl(experiment_metrics_path, final_epoch_metrics)
             if args.early_stop and bad_epochs >= args.patience:
                 print(f"Early stopping at epoch {epoch + 1}: metric {args.early_stop_metric} did not improve by {args.min_delta} for {args.patience} epochs.")
                 break
@@ -1341,8 +1630,6 @@ def main() -> None:
                     backbone_frozen = False
                     phase_plateau_epochs = 0
                     model.train()
-                    if compiled_forward_model is not None:
-                        compiled_forward_model.train()
                     _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
                     optimizer = _build_optimizer(args, model, lr_value=current_lr)
                     scaler = _make_grad_scaler(device, amp_dtype)
@@ -1351,6 +1638,39 @@ def main() -> None:
                 f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
                 f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}"
             )
+            final_epoch_metrics = {
+                "epoch": epoch + 1,
+                "phase": current_phase_index + 1,
+                "mode": mode_text,
+                "lr": float(current_lr),
+                "train_loss_total": float(avg_loss),
+                "train_loss_ce": float(avg_ce_loss),
+                "train_loss_attr": float(avg_attr_loss),
+                "train_acc": float(train_acc),
+                "val_loss_total": float("nan"),
+                "val_loss_ce": float("nan"),
+                "val_loss_attr": float("nan"),
+                "val_acc": float("nan"),
+                "generalization_gap": float("nan"),
+                "h_var_mean": float(train_h_var_mean),
+                "h_var_min": float(train_h_var_min),
+                "h_var_max": float(train_h_var_max),
+                "val_h_var_mean": float("nan"),
+                "val_h_var_min": float("nan"),
+                "val_h_var_max": float("nan"),
+                "improved": False,
+            }
+            if args.omega_loss:
+                collapse_low_variance_epochs = (
+                    collapse_low_variance_epochs + 1
+                    if train_h_var_mean < OMEGA_COLLAPSE_VARIANCE_THRESHOLD
+                    else 0
+                )
+                final_epoch_metrics["representation_collapse_warning"] = bool(
+                    collapse_low_variance_epochs >= OMEGA_COLLAPSE_EPOCHS
+                )
+                assert experiment_metrics_path is not None
+                _append_jsonl(experiment_metrics_path, final_epoch_metrics)
 
     if val_loader is None or y_val is None or len(val_paths) == 0:
         checkpoint_model = ema.ema_model if ema is not None else model
@@ -1360,6 +1680,31 @@ def main() -> None:
         best_saved = True
     if best_saved:
         print(f"Saved checkpoint: {args.checkpoint}")
+
+    if args.omega_loss and experiment_summary_path is not None:
+        representation_collapse_warning = bool(
+            final_epoch_metrics is not None
+            and final_epoch_metrics.get("representation_collapse_warning", False)
+        )
+        _write_json(
+            experiment_summary_path,
+            {
+                "run_dir": str(experiment_run_dir) if experiment_run_dir is not None else None,
+                "checkpoint_path": str(Path(args.checkpoint).resolve()),
+                "best_epoch": int(best_epoch),
+                "best_val_loss": float(best_val_loss),
+                "best_val_acc": float(best_val_acc),
+                "final_epoch_metrics": final_epoch_metrics or {},
+                "representation_collapse_warning": representation_collapse_warning,
+                "collapse_variance_threshold": float(OMEGA_COLLAPSE_VARIANCE_THRESHOLD),
+                "collapse_consecutive_epochs": int(OMEGA_COLLAPSE_EPOCHS),
+                "omega_lambda": float(omega_lambda),
+                "omega_projector_depth": int(omega_projector_depth),
+                "omega_hidden_dim": int(omega_hidden_dim),
+                "contraction_is_empirical": True,
+            },
+        )
+        print(f"Saved Omega experiment artifacts: {experiment_run_dir}")
 
     if args.enforce_readonly_dataset and pre_signature is not None:
         post_signature = tree_signature(data_dir)

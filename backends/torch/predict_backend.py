@@ -12,7 +12,7 @@ from utils.safety import install_dataset_write_guard
 install_dataset_write_guard()
 
 import config
-from backends.torch.model import TorchCNN, resolve_checkpoint_runtime_config
+from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, TorchCNN, resolve_checkpoint_runtime_config
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
 
@@ -92,7 +92,20 @@ def main() -> None:
             raise SystemExit(str(exc)) from exc
         num_classes = len(class_names)
 
-    model = TorchCNN(input_size=input_size, num_classes=num_classes, seed=args.seed, width_scale=width_scale)
+    model_kwargs = {}
+    if args.weights:
+        model_kwargs = {
+            "omega_enabled": checkpoint_config.omega_enabled,
+            "omega_projector_depth": checkpoint_config.omega_projector_depth or 1,
+            "omega_hidden_dim": checkpoint_config.omega_hidden_dim or DEFAULT_OMEGA_FEATURE_DIM,
+        }
+    model = TorchCNN(
+        input_size=input_size,
+        num_classes=num_classes,
+        seed=args.seed,
+        width_scale=width_scale,
+        **model_kwargs,
+    )
     model.to(device)
     if args.weights:
         model.load_weights(weights_path, map_location=device)

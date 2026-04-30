@@ -20,13 +20,21 @@ This summary covers recorded project work in April 2026, including the checkpoin
 - Completed docs migration from root `docs/` to `Agent_History/docs/`.
 - Added a final written plan artifact for the implemented scope:
   - `Agent_History/docs/plans/2026-04-23-checkpoint-compatible-inference-real-torch-speedups-docs-migration-plan.md`
+- Implemented Phase 1 Omega-loss in the torch backend:
+  - optional shallow projector on the existing 256-d penultimate representation
+  - `L_total = L_CE_mix + lambda * mean((h - T(h))^2)`
+  - checkpoint metadata/reconstruction support
+  - structured experiment artifacts and representation-variance diagnostics
+  - no stop-gradient or contraction guarantee in Phase 1
 
 ## Documentation and Process
 
 - Daily history was updated to capture implementation and documentation follow-up actions:
   - `Agent_History/Daily/2026/04/23_history.md`
+  - `Agent_History/Daily/2026/04/30_history.md`
 - Plan documents are tracked under:
   - `Agent_History/docs/plans/`
+  - `Agent_History/docs/plans/2026-04-30-phase1-omega-loss-implementation-plan.txt`
 
 ## Validation Notes
 

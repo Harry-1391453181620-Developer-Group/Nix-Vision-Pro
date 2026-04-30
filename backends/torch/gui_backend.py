@@ -26,7 +26,7 @@ from utils.safety import install_dataset_write_guard
 install_dataset_write_guard()
 
 import config
-from backends.torch.model import TorchCNN, resolve_checkpoint_runtime_config
+from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, TorchCNN, resolve_checkpoint_runtime_config
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
 
@@ -156,7 +156,15 @@ class InferenceApp:
                 checkpoint_class_names=checkpoint_config.class_names,
                 require_images=False,
             )
-            self.model = TorchCNN(input_size=self.input_size, num_classes=self.num_classes, seed=42, width_scale=self.width_scale)
+            self.model = TorchCNN(
+                input_size=self.input_size,
+                num_classes=self.num_classes,
+                seed=42,
+                width_scale=self.width_scale,
+                omega_enabled=checkpoint_config.omega_enabled,
+                omega_projector_depth=checkpoint_config.omega_projector_depth or 1,
+                omega_hidden_dim=checkpoint_config.omega_hidden_dim or DEFAULT_OMEGA_FEATURE_DIM,
+            )
             self.model.load_weights(checkpoint, map_location=self.device)
             self.model.to(self.device)
             self.model.eval()
