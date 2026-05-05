@@ -10,5 +10,8 @@ torch>=2.10.0
 # GUI and camera/image processing support.
 opencv-python>=4.10.0
 
+# Live experiment metric plotting.
+matplotlib>=3.10
+
 # Test runner.
 pytest>=9.0

@@ -405,7 +405,7 @@ def test_omega_loss_backpropagates_to_projector_and_representation_path():
     y = torch.tensor([0, 1, 2, 3], dtype=torch.long)
     targets = _make_target_distribution(y, num_classes=4, label_smoothing=0.0, dtype=torch.float32)
 
-    total_loss, ce_loss, attr_loss, logits, h_stats = _compute_total_loss_components(
+    total_loss, ce_loss, attr_loss, logits, h_stats, idsi = _compute_total_loss_components(
         model.forward_with_omega(x),
         targets,
         omega_enabled=True,
@@ -430,6 +430,7 @@ def test_omega_loss_backpropagates_to_projector_and_representation_path():
     assert attr_loss.item() > 0.0
     assert tuple(logits.shape) == (4, 4)
     assert h_stats.mean >= 0.0
+    assert idsi > 0.0
 
 
 def test_torch_batch_mix_preserves_soft_label_simplex():

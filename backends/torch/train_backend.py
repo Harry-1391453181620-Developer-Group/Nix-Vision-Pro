@@ -204,6 +204,16 @@ def _extract_representation_variance_stats(h: torch.Tensor | None) -> Representa
     )
 
 
+def _compute_idsi(h: torch.Tensor | None, t_h: torch.Tensor | None) -> float:
+    if h is None or t_h is None:
+        return float("nan")
+    h_detached = h.detach().float()
+    t_h_detached = t_h.detach().float()
+    numerator = torch.linalg.vector_norm(t_h_detached - h_detached, dim=1)
+    denominator = torch.linalg.vector_norm(h_detached, dim=1).clamp_min(1e-12)
+    return float(torch.mean((numerator / denominator) * 100.0).item())
+
+
 def _resolve_forward_output(
     forward_output: Any,
     *,
@@ -480,7 +490,7 @@ def _compute_total_loss_components(
     focal_gamma: float,
     ce_class_weights: torch.Tensor | None,
     focal_alpha_weights: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, RepresentationVarianceStats]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, RepresentationVarianceStats, float]:
     logits, h, t_h = _resolve_forward_output(forward_output, omega_enabled=omega_enabled)
     ce_loss = _compute_batch_loss(
         logits,
@@ -492,12 +502,12 @@ def _compute_total_loss_components(
     )
     if not omega_enabled:
         zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
-        return ce_loss, ce_loss, zero, logits, _extract_representation_variance_stats(None)
+        return ce_loss, ce_loss, zero, logits, _extract_representation_variance_stats(None), float("nan")
 
     assert h is not None and t_h is not None
     attr_loss = torch.mean(torch.square(h - t_h))
     total_loss = ce_loss + (float(omega_lambda) * attr_loss)
-    return total_loss, ce_loss, attr_loss, logits, _extract_representation_variance_stats(h)
+    return total_loss, ce_loss, attr_loss, logits, _extract_representation_variance_stats(h), _compute_idsi(h, t_h)
 
 
 def _beta_sample_on_device(beta_alpha: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -680,7 +690,7 @@ def _benchmark_train_steps(
         start = time.perf_counter()
         with _make_autocast_context(device, amp_dtype):
             forward_output = forward_callable(x_batch)
-            loss, _, _, _, _ = _compute_total_loss_components(
+            loss, _, _, _, _, _ = _compute_total_loss_components(
                 forward_output,
                 targets,
                 omega_enabled=omega_enabled,
@@ -868,6 +878,7 @@ def evaluate_loader(
             "h_var_mean": float("nan"),
             "h_var_min": float("nan"),
             "h_var_max": float("nan"),
+            "IDSI": float("nan"),
         }
     total_loss = 0.0
     total_ce_loss = 0.0
@@ -876,6 +887,8 @@ def evaluate_loader(
     total_h_var_mean = 0.0
     total_h_var_min = 0.0
     total_h_var_max = 0.0
+    total_idsi = 0.0
+    total_idsi_count = 0
     num_batches = 0
     model.eval()
     with torch.no_grad():
@@ -890,7 +903,7 @@ def evaluate_loader(
             )
             with _make_autocast_context(device, amp_dtype):
                 forward_output = (forward_callable or model)(x_batch)
-                loss, ce_loss, attr_loss, logits, h_stats = _compute_total_loss_components(
+                loss, ce_loss, attr_loss, logits, h_stats, batch_idsi = _compute_total_loss_components(
                     forward_output,
                     targets,
                     omega_enabled=omega_enabled,
@@ -907,6 +920,10 @@ def evaluate_loader(
             total_h_var_mean += h_stats.mean
             total_h_var_min += h_stats.min
             total_h_var_max += h_stats.max
+            if not np.isnan(batch_idsi):
+                batch_size = int(x_batch.shape[0])
+                total_idsi += batch_idsi * batch_size
+                total_idsi_count += batch_size
             num_batches += 1
     return {
         "loss_total": total_loss / max(1, num_batches),
@@ -916,6 +933,7 @@ def evaluate_loader(
         "h_var_mean": total_h_var_mean / max(1, num_batches),
         "h_var_min": total_h_var_min / max(1, num_batches),
         "h_var_max": total_h_var_max / max(1, num_batches),
+        "IDSI": total_idsi / max(1, total_idsi_count) if total_idsi_count > 0 else float("nan"),
     }
 
 
@@ -1377,6 +1395,8 @@ def main() -> None:
         epoch_h_var_mean = 0.0
         epoch_h_var_min = float("inf")
         epoch_h_var_max = -float("inf")
+        epoch_idsi = 0.0
+        epoch_idsi_count = 0
 
         for batch_index, (x_cpu, y_cpu) in enumerate(train_loader):
             y_batch_idx = _move_label_batch(y_cpu, device)
@@ -1441,7 +1461,7 @@ def main() -> None:
             with _make_autocast_context(device, amp_dtype):
                 batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
                 forward_output = forward_callable(x_batch)
-                loss, ce_loss, attr_loss, logits, h_stats = _compute_total_loss_components(
+                loss, ce_loss, attr_loss, logits, h_stats, batch_idsi = _compute_total_loss_components(
                     forward_output,
                     target_distribution,
                     omega_enabled=bool(args.omega_loss),
@@ -1472,6 +1492,10 @@ def main() -> None:
                 epoch_h_var_min = min(epoch_h_var_min, h_stats.min)
             if not np.isnan(h_stats.max):
                 epoch_h_var_max = max(epoch_h_var_max, h_stats.max)
+            if not np.isnan(batch_idsi):
+                batch_size = int(x_batch.shape[0])
+                epoch_idsi += batch_idsi * batch_size
+                epoch_idsi_count += batch_size
 
         avg_loss = epoch_loss / max(1, num_batches)
         avg_ce_loss = epoch_ce_loss / max(1, num_batches)
@@ -1480,6 +1504,7 @@ def main() -> None:
         train_h_var_mean = epoch_h_var_mean / max(1, num_batches)
         train_h_var_min = epoch_h_var_min if epoch_h_var_min != float("inf") else float("nan")
         train_h_var_max = epoch_h_var_max if epoch_h_var_max != -float("inf") else float("nan")
+        train_idsi = epoch_idsi / max(1, epoch_idsi_count) if epoch_idsi_count > 0 else float("nan")
 
         if val_loader is not None and y_val is not None and len(val_paths) > 0:
             eval_model = ema.ema_model if ema is not None else model
@@ -1598,6 +1623,7 @@ def main() -> None:
                 "val_h_var_mean": float(val_metrics["h_var_mean"]),
                 "val_h_var_min": float(val_metrics["h_var_min"]),
                 "val_h_var_max": float(val_metrics["h_var_max"]),
+                "IDSI": float(train_idsi),
                 "improved": bool(improved),
             }
             if args.omega_loss:
@@ -1658,6 +1684,7 @@ def main() -> None:
                 "val_h_var_mean": float("nan"),
                 "val_h_var_min": float("nan"),
                 "val_h_var_max": float("nan"),
+                "IDSI": float(train_idsi),
                 "improved": False,
             }
             if args.omega_loss:
