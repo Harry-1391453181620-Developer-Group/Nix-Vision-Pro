@@ -8,6 +8,7 @@ PyTorch. The original NumPy trainer remains available under `--backend numpy`.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sized
 import copy
 from dataclasses import dataclass
 from functools import partial
@@ -16,7 +17,7 @@ import json
 import random
 import time
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Protocol, Sequence, cast
 
 import numpy as np
 
@@ -72,7 +73,7 @@ class TorchImageDataset(Dataset[tuple[torch.Tensor, int]]):
         if paths is not None and preloaded_images is not None and len(paths) != int(preloaded_images.shape[0]):
             raise ValueError("paths and preloaded_images must have matching lengths")
         self.labels = np.asarray(labels, dtype=np.int64)
-        self.input_size = tuple(input_size)
+        self.input_size = (int(input_size[0]), int(input_size[1]))
         self.paths = tuple(Path(path) for path in paths) if paths is not None else None
         self.preloaded_images = (
             np.asarray(preloaded_images, dtype=np.float32)
@@ -109,6 +110,17 @@ class TorchImageDataset(Dataset[tuple[torch.Tensor, int]]):
 
 OMEGA_COLLAPSE_VARIANCE_THRESHOLD = 1e-4
 OMEGA_COLLAPSE_EPOCHS = 3
+
+
+class MetricPlotter(Protocol):
+    def update(self, rows: list[dict[str, Any]]) -> None:
+        ...
+
+    def save(self, rows: list[dict[str, Any]]) -> Path:
+        ...
+
+    def show(self, *, block: bool) -> None:
+        ...
 
 
 @dataclass(frozen=True)
@@ -174,7 +186,7 @@ def _build_epoch_metrics_plotter(
     metrics_path: Path,
     output_dir: Path | None,
     output_format: str,
-) -> Any:
+) -> MetricPlotter:
     try:
         from plot import EpochMetricsPlotter, resolve_plot_output_path
     except Exception as exc:
@@ -194,7 +206,7 @@ def _record_epoch_metrics(
     *,
     metrics_path: Path | None,
     metric_rows: list[dict[str, Any]],
-    metric_plotter: Any | None,
+    metric_plotter: MetricPlotter | None,
     payload: dict[str, Any],
 ) -> None:
     if metrics_path is None:
@@ -207,7 +219,7 @@ def _record_epoch_metrics(
 
 def _finalize_metric_plot(
     *,
-    metric_plotter: Any | None,
+    metric_plotter: MetricPlotter | None,
     metric_rows: list[dict[str, Any]],
     metrics_path: Path,
     output_dir: Path | None,
@@ -228,6 +240,22 @@ def _finalize_metric_plot(
     saved_plot_path = metric_plotter.save(metric_rows)
     metric_plotter.show(block=True)
     return saved_plot_path
+
+
+def _loader_dataset_len(loader: DataLoader[Any]) -> int:
+    return len(cast(Sized, loader.dataset))
+
+
+def _move_module_to_device(
+    module: nn.Module,
+    *,
+    device: torch.device,
+    use_channels_last: bool,
+) -> nn.Module:
+    module.to(device=device)
+    if use_channels_last:
+        module.to(memory_format=torch.channels_last)
+    return module
 
 
 def _prepare_experiment_artifacts(
@@ -324,6 +352,8 @@ def list_labeled_paths(
     files = [entry for entry in sorted(data_dir.iterdir()) if entry.suffix.lower() in exts]
     if not files:
         raise SystemExit(f"No images found in {data_dir}")
+    if fallback_num_classes <= 0:
+        raise SystemExit("fallback_num_classes must be > 0 when unlabeled root images are used")
     labels = np.arange(len(files), dtype=np.int64) % fallback_num_classes
     class_names = [str(index) for index in range(fallback_num_classes)]
     return files, labels, class_names, True
@@ -424,7 +454,7 @@ def _build_data_loader(
 ) -> DataLoader[tuple[torch.Tensor, torch.Tensor]]:
     generator = torch.Generator()
     generator.manual_seed(int(base_seed))
-    loader_kwargs: dict[str, object] = {
+    loader_kwargs: dict[str, Any] = {
         "batch_size": int(batch_size),
         "shuffle": bool(shuffle),
         "num_workers": int(num_workers),
@@ -436,7 +466,7 @@ def _build_data_loader(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
         loader_kwargs["worker_init_fn"] = _make_worker_init_fn(base_seed)
-    return DataLoader(dataset, **loader_kwargs)
+    return DataLoader[tuple[torch.Tensor, torch.Tensor]](dataset, **loader_kwargs)
 
 
 def _load_all_images(paths: Sequence[Path], input_size: tuple[int, int]) -> np.ndarray:
@@ -669,12 +699,13 @@ def _resolve_amp_dtype(device: torch.device, amp_mode: str) -> torch.dtype | Non
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
-def _make_grad_scaler(device: torch.device, amp_dtype: torch.dtype | None):
+def _make_grad_scaler(device: torch.device, amp_dtype: torch.dtype | None) -> Any:
     enabled = bool(device.type == "cuda" and amp_dtype == torch.float16)
-    try:
-        return torch.amp.GradScaler("cuda", enabled=enabled)
-    except AttributeError:
-        return torch.cuda.amp.GradScaler(enabled=enabled)
+    amp_module = getattr(torch, "amp", None)
+    grad_scaler_cls = getattr(amp_module, "GradScaler", None) if amp_module is not None else None
+    if grad_scaler_cls is not None:
+        return grad_scaler_cls("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def _make_autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
