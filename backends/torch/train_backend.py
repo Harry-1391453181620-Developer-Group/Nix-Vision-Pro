@@ -165,6 +165,71 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(_make_json_serializable(payload), sort_keys=True) + "\n")
 
 
+def _plot_output_dir_arg(value: str | None) -> Path | None:
+    return Path(value) if value else None
+
+
+def _build_epoch_metrics_plotter(
+    *,
+    metrics_path: Path,
+    output_dir: Path | None,
+    output_format: str,
+) -> Any:
+    try:
+        from plot import EpochMetricsPlotter, resolve_plot_output_path
+    except Exception as exc:
+        raise SystemExit(f"Failed to initialize metric plotting: {exc}") from exc
+
+    return EpochMetricsPlotter(
+        metrics_path=metrics_path,
+        output_path=resolve_plot_output_path(
+            metrics_path,
+            output_dir=output_dir,
+            output_format=output_format,
+        ),
+    )
+
+
+def _record_epoch_metrics(
+    *,
+    metrics_path: Path | None,
+    metric_rows: list[dict[str, Any]],
+    metric_plotter: Any | None,
+    payload: dict[str, Any],
+) -> None:
+    if metrics_path is None:
+        raise RuntimeError("epoch metrics path is required when tracking is enabled")
+    _append_jsonl(metrics_path, payload)
+    metric_rows.append(dict(payload))
+    if metric_plotter is not None:
+        metric_plotter.update(metric_rows)
+
+
+def _finalize_metric_plot(
+    *,
+    metric_plotter: Any | None,
+    metric_rows: list[dict[str, Any]],
+    metrics_path: Path,
+    output_dir: Path | None,
+    output_format: str,
+) -> Path:
+    if metric_plotter is None:
+        metric_plotter = _build_epoch_metrics_plotter(
+            metrics_path=metrics_path,
+            output_dir=output_dir,
+            output_format=output_format,
+        )
+    if not metric_rows:
+        try:
+            from plot import read_metric_rows
+        except Exception as exc:
+            raise SystemExit(f"Failed to read metric rows for plotting: {exc}") from exc
+        metric_rows.extend(read_metric_rows(metrics_path))
+    saved_plot_path = metric_plotter.save(metric_rows)
+    metric_plotter.show(block=True)
+    return saved_plot_path
+
+
 def _prepare_experiment_artifacts(
     *,
     experiment_root: Path,
@@ -182,8 +247,8 @@ def _prepare_experiment_artifacts(
     config_path = run_dir / "config.json"
     notes_path = run_dir / "qualitative_notes.txt"
     notes_path.write_text(
-        "Phase 1 qualitative convergence notes\n"
-        "===================================\n\n"
+        "Training run qualitative notes\n"
+        "==============================\n\n"
         "- smoothness:\n"
         "- oscillation:\n"
         "- divergence:\n"
@@ -875,9 +940,9 @@ def evaluate_loader(
             "loss_ce": float("nan"),
             "loss_attr": float("nan"),
             "acc": float("nan"),
-            "h_var_mean": float("nan"),
-            "h_var_min": float("nan"),
-            "h_var_max": float("nan"),
+            "val_h_var_mean": float("nan"),
+            "val_h_var_min": float("nan"),
+            "val_h_var_max": float("nan"),
             "IDSI": float("nan"),
         }
     total_loss = 0.0
@@ -930,9 +995,9 @@ def evaluate_loader(
         "loss_ce": total_ce_loss / max(1, num_batches),
         "loss_attr": total_attr_loss / max(1, num_batches),
         "acc": total_correct / max(1, len(loader.dataset)),
-        "h_var_mean": total_h_var_mean / max(1, num_batches),
-        "h_var_min": total_h_var_min / max(1, num_batches),
-        "h_var_max": total_h_var_max / max(1, num_batches),
+        "val_h_var_mean": total_h_var_mean / max(1, num_batches),
+        "val_h_var_min": total_h_var_min / max(1, num_batches),
+        "val_h_var_max": total_h_var_max / max(1, num_batches),
         "IDSI": total_idsi / max(1, total_idsi_count) if total_idsi_count > 0 else float("nan"),
     }
 
@@ -1037,7 +1102,13 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
     parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
     parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "best_torch_model.pt"))
-    parser.add_argument("--experiment-dir", type=str, default="runs", help="Root directory for Omega experiment artifacts")
+    parser.add_argument("--experiment-dir", type=str, default="runs", help="Root directory for training run artifacts")
+    parser.add_argument("--json-dir", type=str, default=None, help="Root directory for per-run JSONL tracking artifacts. Defaults to --experiment-dir.")
+    plot_group = parser.add_mutually_exclusive_group()
+    plot_group.add_argument("--plot-once", action="store_true", help="Show and save the metrics plot after training finishes")
+    plot_group.add_argument("--plot-real-time", action="store_true", help="Show the metrics plot when training starts and refresh it after each epoch")
+    parser.add_argument("--plot-output-format", choices=["png", "jpg", "jpeg"], default="png", help="Final metrics plot image format")
+    parser.add_argument("--plot-output-dir", type=str, default=None, help="Directory for the final metrics plot. Defaults to the run JSON directory.")
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rotation", type=float, default=12.0, help="Maximum absolute random rotation in degrees")
     parser.add_argument("--brightness", type=float, default=0.2, help="Brightness jitter strength in [0, 1]")
@@ -1338,15 +1409,23 @@ def main() -> None:
         "ema_decay": None,
     }
     experiment_run_dir: Path | None = None
+    experiment_config_path: Path | None = None
     experiment_metrics_path: Path | None = None
     experiment_summary_path: Path | None = None
-    if args.omega_loss:
+    tracking_enabled = bool(args.omega_loss or args.plot_once or args.plot_real_time)
+    plot_requested = bool(args.plot_once or args.plot_real_time)
+    plot_output_dir = _plot_output_dir_arg(args.plot_output_dir)
+    metric_plotter: Any | None = None
+    metric_rows: list[dict[str, Any]] = []
+    if tracking_enabled:
         experiment_run_dir, experiment_config_path, experiment_metrics_path, experiment_summary_path = _prepare_experiment_artifacts(
-            experiment_root=Path(args.experiment_dir),
+            experiment_root=Path(args.json_dir or args.experiment_dir),
             checkpoint_path=Path(args.checkpoint),
             seed=args.seed,
             omega_lambda=omega_lambda,
         )
+        if experiment_config_path is None or experiment_metrics_path is None:
+            raise RuntimeError("run tracking artifact paths were not initialized")
         _write_json(
             experiment_config_path,
             {
@@ -1361,8 +1440,18 @@ def main() -> None:
                 "omega_projector_depth": int(omega_projector_depth),
                 "omega_hidden_dim": int(omega_hidden_dim),
                 "checkpoint_path": str(Path(args.checkpoint).resolve()),
+                "metrics_path": str(experiment_metrics_path.resolve()),
             },
         )
+    if args.plot_real_time:
+        if experiment_metrics_path is None:
+            raise RuntimeError("plot-real-time requires an epoch metrics path")
+        metric_plotter = _build_epoch_metrics_plotter(
+            metrics_path=experiment_metrics_path,
+            output_dir=plot_output_dir,
+            output_format=args.plot_output_format,
+        )
+        metric_plotter.update(metric_rows)
 
     for epoch in range(args.epochs):
         phase_config = phase_map[epoch]
@@ -1617,12 +1706,12 @@ def main() -> None:
                 "val_loss_attr": float(val_metrics["loss_attr"]),
                 "val_acc": float(val_acc),
                 "generalization_gap": float(gap),
-                "h_var_mean": float(train_h_var_mean),
-                "h_var_min": float(train_h_var_min),
-                "h_var_max": float(train_h_var_max),
-                "val_h_var_mean": float(val_metrics["h_var_mean"]),
-                "val_h_var_min": float(val_metrics["h_var_min"]),
-                "val_h_var_max": float(val_metrics["h_var_max"]),
+                "train_h_var_mean": float(train_h_var_mean),
+                "train_h_var_min": float(train_h_var_min),
+                "train_h_var_max": float(train_h_var_max),
+                "val_h_var_mean": float(val_metrics["val_h_var_mean"]),
+                "val_h_var_min": float(val_metrics["val_h_var_min"]),
+                "val_h_var_max": float(val_metrics["val_h_var_max"]),
                 "IDSI": float(train_idsi),
                 "improved": bool(improved),
             }
@@ -1635,8 +1724,13 @@ def main() -> None:
                 final_epoch_metrics["representation_collapse_warning"] = bool(
                     collapse_low_variance_epochs >= OMEGA_COLLAPSE_EPOCHS
                 )
-                assert experiment_metrics_path is not None
-                _append_jsonl(experiment_metrics_path, final_epoch_metrics)
+            if tracking_enabled:
+                _record_epoch_metrics(
+                    metrics_path=experiment_metrics_path,
+                    metric_rows=metric_rows,
+                    metric_plotter=metric_plotter,
+                    payload=final_epoch_metrics,
+                )
             if args.early_stop and bad_epochs >= args.patience:
                 print(f"Early stopping at epoch {epoch + 1}: metric {args.early_stop_metric} did not improve by {args.min_delta} for {args.patience} epochs.")
                 break
@@ -1678,9 +1772,9 @@ def main() -> None:
                 "val_loss_attr": float("nan"),
                 "val_acc": float("nan"),
                 "generalization_gap": float("nan"),
-                "h_var_mean": float(train_h_var_mean),
-                "h_var_min": float(train_h_var_min),
-                "h_var_max": float(train_h_var_max),
+                "train_h_var_mean": float(train_h_var_mean),
+                "train_h_var_min": float(train_h_var_min),
+                "train_h_var_max": float(train_h_var_max),
                 "val_h_var_mean": float("nan"),
                 "val_h_var_min": float("nan"),
                 "val_h_var_max": float("nan"),
@@ -1696,8 +1790,13 @@ def main() -> None:
                 final_epoch_metrics["representation_collapse_warning"] = bool(
                     collapse_low_variance_epochs >= OMEGA_COLLAPSE_EPOCHS
                 )
-                assert experiment_metrics_path is not None
-                _append_jsonl(experiment_metrics_path, final_epoch_metrics)
+            if tracking_enabled:
+                _record_epoch_metrics(
+                    metrics_path=experiment_metrics_path,
+                    metric_rows=metric_rows,
+                    metric_plotter=metric_plotter,
+                    payload=final_epoch_metrics,
+                )
 
     if val_loader is None or y_val is None or len(val_paths) == 0:
         checkpoint_model = ema.ema_model if ema is not None else model
@@ -1708,7 +1807,7 @@ def main() -> None:
     if best_saved:
         print(f"Saved checkpoint: {args.checkpoint}")
 
-    if args.omega_loss and experiment_summary_path is not None:
+    if tracking_enabled and experiment_summary_path is not None:
         representation_collapse_warning = bool(
             final_epoch_metrics is not None
             and final_epoch_metrics.get("representation_collapse_warning", False)
@@ -1729,14 +1828,26 @@ def main() -> None:
                 "omega_projector_depth": int(omega_projector_depth),
                 "omega_hidden_dim": int(omega_hidden_dim),
                 "contraction_is_empirical": True,
+                "plot_requested": bool(plot_requested),
+                "plot_mode": "real_time" if args.plot_real_time else ("once" if args.plot_once else "none"),
             },
         )
-        print(f"Saved Omega experiment artifacts: {experiment_run_dir}")
+        print(f"Saved run artifacts: {experiment_run_dir}")
 
     if args.enforce_readonly_dataset and pre_signature is not None:
         post_signature = tree_signature(data_dir)
         if post_signature != pre_signature:
             raise SystemExit("Dataset changed during run; aborting (read-only enforcement).")
+
+    if plot_requested and experiment_metrics_path is not None:
+        saved_plot_path = _finalize_metric_plot(
+            metric_plotter=metric_plotter,
+            metric_rows=metric_rows,
+            metrics_path=experiment_metrics_path,
+            output_dir=plot_output_dir,
+            output_format=args.plot_output_format,
+        )
+        print(f"Saved metric plot: {saved_plot_path}")
 
     print("Training finished.")
 

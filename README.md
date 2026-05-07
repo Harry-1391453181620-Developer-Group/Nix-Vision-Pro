@@ -62,8 +62,10 @@ This repository no longer includes built-in synthetic or Wikimedia dataset build
 - Torch training enables `channels_last`, `torch.backends.cudnn.benchmark`, and AMP automatically on supported CUDA runs.
 - `--compile-mode auto` benchmarks eager vs compiled train steps after warmup and keeps `torch.compile` only when it actually improves median step time.
 - Phase 1 Omega-loss is available in the torch trainer with `--omega-loss`; it adds a shallow projector on the existing 256-d penultimate representation and logs CE, attractor loss, and representation-variance diagnostics.
-- Omega experiment runs now log `IDSI`, the Internal Dynamics Stability Indicator, as a sample-weighted epoch mean of `||T(h)-h|| / ||h|| * 100`.
-- `plot.py` live-plots epoch metrics from `runs/*/epoch_metrics.jsonl`, including loss components, accuracy, representation variance, learning rate, generalization gap, and `IDSI`.
+- Training run artifacts are written directly under `runs/<timestamp>-.../`.
+- Run metrics now log `IDSI`, the Internal Dynamics Stability Indicator, as a sample-weighted epoch mean of `||T(h)-h|| / ||h|| * 100`.
+- Train-side representation variance metrics are named `train_h_var_max`, `train_h_var_mean`, and `train_h_var_min` in JSONL files and plots.
+- `train.py` can show and save metric plots with `--plot-once` after training or `--plot-real-time` during training.
 - New checkpoints are structured as `model + meta`, while legacy raw checkpoints still load.
 - Multiphase LR, warmup, cosine restarts, and temporary backbone freeze remain supported in both training backends.
 
@@ -83,18 +85,21 @@ python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-coun
 
 ## Experiment Plotting
 
-Omega runs write per-epoch metrics to `runs/<timestamp>-.../epoch_metrics.jsonl`.
-To watch the latest run update in real time:
+Runs write per-epoch metrics to `runs/<timestamp>-.../epoch_metrics.jsonl`.
+To show a plot after training finishes and save an image beside the JSONL file:
 
 ```powershell
-.\.venv312\Scripts\python.exe plot.py
+.\.venv312\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --plot-once
 ```
 
-You can also point the plotter at a specific run file:
+To open the plot window at training start, refresh it after each epoch, and save the final image:
 
 ```powershell
-.\.venv312\Scripts\python.exe plot.py runs\phase1_omega\example-run\epoch_metrics.jsonl
+.\.venv312\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --plot-real-time
 ```
+
+Plot-related options are `--json-dir`, `--plot-output-format {png,jpg,jpeg}`, and `--plot-output-dir`.
+`plot.py` is a helper module used by `train.py`; it is not a standalone command.
 
 ## Checkpoints
 

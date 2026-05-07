@@ -1,20 +1,22 @@
-"""Live plotter for Omega experiment epoch metrics."""
+"""Helper functions for plotting training epoch metrics.
+
+This module is intentionally not a CLI. Use `train.py --plot-once` or
+`train.py --plot-real-time` so training owns the plotting lifecycle.
+"""
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
-import time
 from pathlib import Path
 from typing import Any
 
 
-METRICS = [
+PLOT_METRICS = [
     "generalization_gap",
-    "h_var_max",
-    "h_var_mean",
-    "h_var_min",
+    "train_h_var_max",
+    "train_h_var_mean",
+    "train_h_var_min",
     "lr",
     "train_acc",
     "train_loss_attr",
@@ -30,19 +32,12 @@ METRICS = [
     "IDSI",
 ]
 
-
-def _find_latest_metrics_file(runs_dir: Path) -> Path:
-    candidates = [path for path in runs_dir.rglob("epoch_metrics.jsonl") if path.is_file()]
-    if not candidates:
-        raise FileNotFoundError(f"No epoch_metrics.jsonl files found under {runs_dir}")
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+PLOT_OUTPUT_FORMATS = {"png", "jpg", "jpeg"}
 
 
-def _read_metrics(path: Path) -> list[dict[str, Any]]:
+def read_metric_rows(metrics_path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    if not path.exists():
-        return rows
-    with path.open("r", encoding="utf-8") as handle:
+    with Path(metrics_path).open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
@@ -56,6 +51,81 @@ def _read_metrics(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def resolve_plot_output_path(
+    metrics_path: Path,
+    *,
+    output_dir: Path | None,
+    output_format: str,
+) -> Path:
+    suffix = output_format.lower().lstrip(".")
+    if suffix not in PLOT_OUTPUT_FORMATS:
+        allowed = ", ".join(sorted(PLOT_OUTPUT_FORMATS))
+        raise ValueError(f"Unsupported plot output format: {output_format}. Expected one of: {allowed}")
+    target_dir = Path(metrics_path).parent if output_dir is None else Path(output_dir)
+    return target_dir / f"epoch_metrics_plot.{suffix}"
+
+
+class EpochMetricsPlotter:
+    def __init__(self, *, metrics_path: Path, output_path: Path, title: str = "Experiment Metrics") -> None:
+        import matplotlib.pyplot as plt
+
+        self.metrics_path = Path(metrics_path)
+        self.output_path = Path(output_path)
+        self.title = title
+        self._plt = plt
+        self._interactive = "agg" not in plt.get_backend().lower()
+        self._figure = plt.figure(num="Experiment Metrics", figsize=(20, 13))
+        if self._interactive:
+            plt.ion()
+            self._figure.show()
+
+    def update(self, rows: list[dict[str, Any]]) -> None:
+        self._draw(rows)
+        if self._interactive:
+            self._plt.pause(0.001)
+
+    def save(self, rows: list[dict[str, Any]]) -> Path:
+        self._draw(rows)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._figure.savefig(self.output_path, dpi=150)
+        return self.output_path
+
+    def show(self, *, block: bool) -> None:
+        if not self._interactive:
+            return
+        self._plt.ioff()
+        self._plt.show(block=block)
+
+    def close(self) -> None:
+        self._plt.close(self._figure)
+
+    def _draw(self, rows: list[dict[str, Any]]) -> None:
+        from matplotlib.ticker import MaxNLocator
+
+        self._figure.clear()
+        cols = 4
+        row_count = math.ceil(len(PLOT_METRICS) / cols)
+        axes = self._figure.subplots(row_count, cols, squeeze=False).ravel()
+        epochs = [_as_float(row.get("epoch", index + 1)) for index, row in enumerate(rows)]
+
+        for index, metric_name in enumerate(PLOT_METRICS):
+            axis = axes[index]
+            values = [_as_float(row.get(metric_name)) for row in rows]
+            axis.plot(epochs, values, marker="o", linewidth=1.4, markersize=4)
+            axis.set_title(metric_name)
+            axis.set_xlabel("epoch")
+            axis.grid(True, alpha=0.3)
+            axis.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True, min_n_ticks=3))
+            if epochs:
+                axis.set_xlim(min(epochs), max(epochs) if len(epochs) > 1 else min(epochs) + 1)
+
+        for axis in axes[len(PLOT_METRICS) :]:
+            axis.set_visible(False)
+
+        self._figure.suptitle(f"{self.title}: {self.metrics_path}", fontsize=10)
+        self._figure.tight_layout(rect=(0, 0, 1, 0.97))
+
+
 def _as_float(value: Any) -> float:
     try:
         parsed = float(value)
@@ -64,74 +134,5 @@ def _as_float(value: Any) -> float:
     return parsed if math.isfinite(parsed) else math.nan
 
 
-def _plot_rows(metrics_path: Path, rows: list[dict[str, Any]], *, output: Path | None) -> None:
-    import matplotlib.pyplot as plt
-
-    cols = 4
-    rows_count = math.ceil(len(METRICS) / cols)
-    fig = plt.figure(num="Experiment Metrics", figsize=(18, 12), clear=True)
-    axes = fig.subplots(rows_count, cols, squeeze=False).ravel()
-    epochs = [_as_float(row.get("epoch", index + 1)) for index, row in enumerate(rows)]
-
-    for index, metric_name in enumerate(METRICS):
-        axis = axes[index]
-        values = [_as_float(row.get(metric_name)) for row in rows]
-        axis.plot(epochs, values, marker="o", linewidth=1.4, markersize=4)
-        axis.set_title(metric_name)
-        axis.set_xlabel("epoch")
-        axis.grid(True, alpha=0.3)
-        if epochs:
-            axis.set_xticks(epochs)
-
-    for axis in axes[len(METRICS) :]:
-        axis.set_visible(False)
-
-    fig.suptitle(str(metrics_path), fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
-    if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output, dpi=150)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Live plot epoch metrics from runs/*/epoch_metrics.jsonl")
-    parser.add_argument("metrics_file", nargs="?", type=Path, help="Path to an epoch_metrics.jsonl file")
-    parser.add_argument("--runs-dir", type=Path, default=Path("runs"), help="Run artifact root used to find the latest metrics file")
-    parser.add_argument("--interval", type=float, default=2.0, help="Refresh interval in seconds")
-    parser.add_argument("--once", action="store_true", help="Render one update and exit")
-    parser.add_argument("--output", type=Path, help="Optional PNG path to write on each refresh")
-    args = parser.parse_args()
-
-    import matplotlib.pyplot as plt
-
-    interactive_backend = "agg" not in plt.get_backend().lower()
-    if interactive_backend:
-        plt.ion()
-    metrics_path = args.metrics_file or _find_latest_metrics_file(args.runs_dir)
-    last_seen: tuple[int, int] | None = None
-
-    while True:
-        if args.metrics_file is None:
-            metrics_path = _find_latest_metrics_file(args.runs_dir)
-        rows = _read_metrics(metrics_path)
-        stat = metrics_path.stat()
-        seen = (int(stat.st_mtime_ns), len(rows))
-        if seen != last_seen:
-            _plot_rows(metrics_path, rows, output=args.output)
-            if interactive_backend:
-                plt.pause(0.001)
-            last_seen = seen
-        if args.once:
-            break
-        if interactive_backend:
-            plt.pause(max(0.1, float(args.interval)))
-        else:
-            time.sleep(max(0.1, float(args.interval)))
-
-    if not args.once and interactive_backend:
-        plt.ioff()
-        plt.show()
-
-
 if __name__ == "__main__":
-    main()
+    raise SystemExit("plot.py is a helper module. Use train.py --plot-once or train.py --plot-real-time.")
