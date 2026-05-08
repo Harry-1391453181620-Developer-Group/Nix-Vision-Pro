@@ -33,8 +33,6 @@ wheels/
 # Data and checkpoints
 data/raw/
 data/processed/
-checkpoints/
-*.npz
 *.pkl
 
 # IDE and OS
