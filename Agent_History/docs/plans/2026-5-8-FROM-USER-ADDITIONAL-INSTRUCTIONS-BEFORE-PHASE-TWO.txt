@@ -36,6 +36,9 @@ IMPORTANT:
 Global IDSI is ONLY for monitoring and visualization
 Optimization is performed using layer-wise IDSI aggregation
 The objective of Layer-IDSI is NOT to suppress all hidden updates toward zero.
+Layer-IDSI regularization should penalize unstable relative fluctuations,
+NOT eliminate feature transformation itself.
+Useful semantic transformation must remain possible.
 The objective is to stabilize relative hidden-state evolution while preserving useful feature transformation capacity.
 Do NOT optimize only a single pooled global IDSI value
 avoid large GPU memory overhead
@@ -54,9 +57,32 @@ Do NOT run additional forward passes solely for IDSI computation.
 Clamp denominator epsilon to avoid instability under AMP/FP16.
 Avoid NaN propagation in metric logging.
 GLOBAL IDSI MAINTAINS ITS ORIGINAL CALCULATION.
-Do NOT treat normalization, activation, or pooling submodules as independent layers.
+Do NOT automatically register hooks on every nn.Module.
+Only monitor explicitly selected major backbone stages:
+example:
+- stage1
+- stage2
+- stage3
+- classifier pre-head feature
+Avoid BatchNorm/ReLU/Pooling-only monitoring.
 Use only major feature stages / backbone blocks for Layer-IDSI computation.
-
+Because that IDSI loss is a mean value, so here is a clear instruction: For CNN feature maps, Layer-IDSI statistics must be computed over all non-batch dimensions after flattening:
+(batch, channel, height, width) -> flatten(channel * height * width)
+Compute Δh elementwise over flattened hidden representations,
+then aggregate using mean over all feature dimensions and batch samples.
+As we are not yet in Phase2: For the current CNN proxy architecture:
+h_l^(t) = input activation tensor of a monitored backbone block
+f_l(h_l^(t)) = output activation tensor of the same block
+Layer-IDSI must measure relative feature transformation magnitude across backbone stages.
+Layer ordering must remain deterministic across runs and epochs.
+Persist layer names in a stable ordered list, which mean that in the plot, layer sequence and color is continuous.
+plot.py should reuse existing matplotlib figures/axes during refresh when possible.
+Do not recreate legends/colors dynamically every refresh.
+Layer-color mapping must remain stable for the entire session.
+As I mentioned before, I want you to plot gradient norm and hidden norm, here is a clear definition: Gradient norm refers to the global L2 norm of trainable gradients before gradient clipping. Hidden norm refers to the mean L2 norm of monitored hidden representations.
+All IDSI-related divisions must use:
+denominator = clamp(detached_hidden_norm, min=epsilon)
+Use float32 accumulation for statistics even under AMP/FP16.
 
 Potential dangers:
 1. DO NOT DO FULL-RESOLUTION RESERVE FOR EACH TOKEN (IN THE FUTURE)
@@ -90,3 +116,18 @@ Global IDSI must preserve the original formulation based on all hidden-state rel
 Δh = ||f(h)-h|| / (||h|| + ε)
 
 Global IDSI = mean of Δh over all hidden states globally.
+
+
+VERY VERY IMPORTANT REMAINDER:
+
+IDSI statistics and L_IDSI loss must be computed from the SAME forward-pass activations.
+
+Do NOT perform secondary forward passes for metric computation.
+
+The optimization loss and monitoring metrics must share the same activation stream whenever possible.
+
+Update README.md after the modification
+
+Remember to Commit.
+
+Moreover, there are also something to debug: The train_backend.py did not open a matplotlib window AT THE START OF TRANING while I use --plot-real-time. Please fix the plot.py and train_backend.py. This error already exisists for a long time and I do not want to see it again.
