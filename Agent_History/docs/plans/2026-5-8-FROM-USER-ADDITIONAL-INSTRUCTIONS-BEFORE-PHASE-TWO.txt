@@ -131,3 +131,4 @@ Update README.md after the modification
 Remember to Commit.
 
 Moreover, there are also something to debug: The train_backend.py did not open a matplotlib window AT THE START OF TRANING while I use --plot-real-time. Please fix the plot.py and train_backend.py. This error already exisists for a long time and I do not want to see it again.
+And delete some unwanted temp files and pytest files BUT NOT TRANING RECORD FILES IN runs/. Make the project structure nice and neat.
