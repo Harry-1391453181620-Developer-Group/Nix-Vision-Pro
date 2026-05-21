@@ -62,8 +62,10 @@ This repository no longer includes built-in synthetic or Wikimedia dataset build
 - Torch training enables `channels_last`, `torch.backends.cudnn.benchmark`, and AMP automatically on supported CUDA runs.
 - `--compile-mode auto` benchmarks eager vs compiled train steps after warmup and keeps `torch.compile` only when it actually improves median step time.
 - Phase 1 Omega-loss is available in the torch trainer with `--omega-loss`; it adds a shallow projector on the existing 256-d penultimate representation and logs CE, attractor loss, and representation-variance diagnostics.
+- Phase 1.2 Layer-IDSI is enabled for Omega runs by default with `--idsi-lambda 0.005`. It adds a numerically small layer-wise stability loss on matched feature spaces for `stage1`, `stage2`, `stage3`, and `classifier_pre_head`.
 - Training run artifacts are written directly under `runs/<timestamp>-.../`.
-- Run metrics now log `IDSI`, the Internal Dynamics Stability Indicator, as a sample-weighted epoch mean of `||T(h)-h|| / ||h|| * 100`.
+- Run metrics log `IDSI`, `IDSI mean`, `IDSI max`, and `IDSI std` from the per-sample relative fluctuation distribution, scaled by `100` for readability. Layer-wise arrays are logged under `layer_IDSI*` keys with stable `layer_IDSI_names`.
+- Run metrics also log `gradient_norm` from the existing backward pass before clipping and `hidden_norm` as the mean L2 norm over monitored feature tensors.
 - Train-side representation variance metrics are named `train_h_var_max`, `train_h_var_mean`, and `train_h_var_min` in JSONL files and plots.
 - `train.py` can show and save metric plots with `--plot-once` after training or `--plot-real-time` during training.
 - New checkpoints are structured as `model + meta`, while legacy raw checkpoints still load.
@@ -89,16 +91,17 @@ Runs write per-epoch metrics to `runs/<timestamp>-.../epoch_metrics.jsonl`.
 To show a plot after training finishes and save an image beside the JSONL file:
 
 ```powershell
-.\.venv312\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --plot-once
+.\.venv312\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-once
 ```
 
 To open the plot window at training start, refresh it after each epoch, and save the final image:
 
 ```powershell
-.\.venv312\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --plot-real-time
+.\.venv312\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-real-time
 ```
 
 Plot-related options are `--json-dir`, `--plot-output-format {png,jpg,jpeg}`, and `--plot-output-dir`.
+The plotter keeps all metrics in one matplotlib window, includes global and layer-wise IDSI panels, and adapts dynamically to however many monitored layers are present in the JSONL rows.
 `plot.py` is a helper module used by `train.py`; it is not a standalone command.
 
 ## Checkpoints

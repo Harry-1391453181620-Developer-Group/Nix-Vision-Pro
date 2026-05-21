@@ -157,8 +157,8 @@ def test_width_scale_changes_stage_two_channels_for_both_backends():
     assert tuple(torch_model.conv3.weight.shape)[:2] == (48, 32)
 
 
-def test_forgiving_checkpoint_load_skips_resized_tensors_for_torch():
-    checkpoint = Path('.worktmp') / 'torch_width_scale_1_0.pt'
+def test_forgiving_checkpoint_load_skips_resized_tensors_for_torch(tmp_path: Path):
+    checkpoint = tmp_path / 'torch_width_scale_1_0.pt'
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     original = TorchCNN(input_size=(32, 32), num_classes=8, seed=5, width_scale=1.0)
     original.save_weights(checkpoint)
@@ -170,8 +170,8 @@ def test_forgiving_checkpoint_load_skips_resized_tensors_for_torch():
     assert any(key.startswith('conv1.') for key in loaded)
 
 
-def test_forgiving_checkpoint_load_skips_resized_tensors_for_numpy():
-    checkpoint = Path('.worktmp') / 'numpy_width_scale_1_0.npz'
+def test_forgiving_checkpoint_load_skips_resized_tensors_for_numpy(tmp_path: Path):
+    checkpoint = tmp_path / 'numpy_width_scale_1_0.npz'
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     original = CNN(input_size=(32, 32), num_classes=8, seed=5, width_scale=1.0)
     original.save_weights(checkpoint)

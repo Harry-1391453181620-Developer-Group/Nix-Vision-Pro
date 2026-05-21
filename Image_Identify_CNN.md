@@ -116,6 +116,7 @@ The torch backend supports the Phase 1 attractor experiment through:
 
 - `--omega-loss / --no-omega-loss`
 - `--omega-lambda`
+- `--idsi-lambda`
 - `--omega-projector-depth`
 - `--omega-hidden-dim`
 - `--experiment-dir`
@@ -123,8 +124,10 @@ The torch backend supports the Phase 1 attractor experiment through:
 Policy details:
 - `h` is the current 256-d representation after `FC(256) -> ReLU` and before dropout
 - `T(h)` is a shallow trainable MLP projector with a final `LayerNorm`
-- the loss is `L_total = L_CE_mix + lambda * mean((h - T(h))^2)`
-- no stop-gradient, spectral normalization, memory bank, tokenization, or attention mechanism is introduced in Phase 1
+- Phase 1.2 adds a small Layer-IDSI term when `--omega-loss` is enabled:
+  `L_total = L_CE_mix + omega_lambda * L_fp + idsi_lambda * L_IDSI`
+- `L_IDSI` uses matched feature spaces only: `stage1`, `stage2`, `stage3`, and `classifier_pre_head`
+- Phase1.2 detaches only the Layer-IDSI denominator norm for numerical stability; no spectral normalization, memory bank, tokenization, or attention mechanism is introduced in Phase 1
 - contraction behavior is an empirical hypothesis in this phase, not a guaranteed property
 - validation and checkpointing keep the existing EMA, AMP, compile, early-stop, augmentation, and MixUp/CutMix policies
 
@@ -135,7 +138,7 @@ When `--omega-loss` is enabled, the trainer writes structured run artifacts unde
 - `summary.json`
 - `qualitative_notes.txt`
 
-The metrics include total loss, CE loss, attractor loss, accuracy, generalization gap, and representation-variance diagnostics used to watch for collapse.
+The metrics include total loss, CE loss, attractor loss, Layer-IDSI loss, accuracy, generalization gap, representation-variance diagnostics, global/layer IDSI distribution summaries, gradient norm, and hidden norm.
 
 ### EMA
 
@@ -270,6 +273,7 @@ See `best_train_commands.txt`.
 - `--model-width-scale`
 - `--omega-loss / --no-omega-loss`
 - `--omega-lambda`
+- `--idsi-lambda`
 - `--omega-projector-depth`
 - `--omega-hidden-dim`
 - `--experiment-dir`

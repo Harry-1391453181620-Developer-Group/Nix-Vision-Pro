@@ -68,3 +68,7 @@ smart.docx - 快捷方式.lnk
 best_train_commands.txt
 runs/
 test_image/
+
+
+# Optimizer for future large scale training, reserve for now
+dist_optimizer.py

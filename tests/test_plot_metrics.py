@@ -18,6 +18,15 @@ def test_plot_metrics_use_train_h_var_names() -> None:
     assert "h_var_max" not in PLOT_METRICS
     assert "h_var_mean" not in PLOT_METRICS
     assert "h_var_min" not in PLOT_METRICS
+    assert "IDSI mean" in PLOT_METRICS
+    assert "IDSI max" in PLOT_METRICS
+    assert "IDSI std" in PLOT_METRICS
+    assert "layer_IDSI" in PLOT_METRICS
+    assert "layer_IDSI_mean" in PLOT_METRICS
+    assert "layer_IDSI_max" in PLOT_METRICS
+    assert "layer_IDSI_std" in PLOT_METRICS
+    assert "gradient_norm" in PLOT_METRICS
+    assert "hidden_norm" in PLOT_METRICS
 
 
 def test_read_metric_rows_preserves_train_h_var_names() -> None:
@@ -30,6 +39,8 @@ def test_read_metric_rows_preserves_train_h_var_names() -> None:
                 "train_h_var_max": 3.0,
                 "train_h_var_mean": 2.0,
                 "train_h_var_min": 1.0,
+                "layer_IDSI_names": ["stage1", "stage2"],
+                "layer_IDSI": [4.0, 5.0],
             }
         )
         + "\n",
@@ -41,6 +52,8 @@ def test_read_metric_rows_preserves_train_h_var_names() -> None:
     assert rows[0]["train_h_var_max"] == pytest.approx(3.0)
     assert rows[0]["train_h_var_mean"] == pytest.approx(2.0)
     assert rows[0]["train_h_var_min"] == pytest.approx(1.0)
+    assert rows[0]["layer_IDSI_names"] == ["stage1", "stage2"]
+    assert rows[0]["layer_IDSI"] == [4.0, 5.0]
 
 
 def test_resolve_plot_output_path_defaults_to_metrics_directory() -> None:

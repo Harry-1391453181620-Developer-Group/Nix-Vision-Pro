@@ -110,6 +110,8 @@ class TorchImageDataset(Dataset[tuple[torch.Tensor, int]]):
 
 OMEGA_COLLAPSE_VARIANCE_THRESHOLD = 1e-4
 OMEGA_COLLAPSE_EPOCHS = 3
+IDSI_EPSILON = 1e-6
+IDSI_LOG_SCALE = 100.0
 
 
 class MetricPlotter(Protocol):
@@ -130,25 +132,174 @@ class RepresentationVarianceStats:
     max: float
 
 
+@dataclass(frozen=True)
+class IDSIDistributionStats:
+    count: int
+    total: float
+    sum_sq: float
+    max: float
+
+    @property
+    def mean(self) -> float:
+        return self.total / self.count if self.count > 0 else float("nan")
+
+    @property
+    def std(self) -> float:
+        if self.count <= 0:
+            return float("nan")
+        variance = max(0.0, (self.sum_sq / self.count) - (self.mean * self.mean))
+        return float(variance ** 0.5)
+
+
+@dataclass(frozen=True)
+class IDSIMetrics:
+    layer_names: tuple[str, ...]
+    global_stats: IDSIDistributionStats
+    layer_stats: tuple[IDSIDistributionStats, ...]
+    loss: torch.Tensor
+    hidden_norm_total: float
+    hidden_norm_count: int
+
+    @property
+    def hidden_norm_mean(self) -> float:
+        return (
+            self.hidden_norm_total / self.hidden_norm_count
+            if self.hidden_norm_count > 0
+            else float("nan")
+        )
+
+
+@dataclass(frozen=True)
+class ForwardComponents:
+    logits: torch.Tensor
+    h: torch.Tensor | None
+    t_h: torch.Tensor | None
+    layer_inputs: tuple[torch.Tensor, ...]
+    layer_outputs: tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True)
+class BatchLossComponents:
+    total_loss: torch.Tensor
+    ce_loss: torch.Tensor
+    attr_loss: torch.Tensor
+    idsi_loss: torch.Tensor
+    logits: torch.Tensor
+    h_stats: RepresentationVarianceStats
+    idsi_metrics: IDSIMetrics
+
+
+class EpochIDSIAggregator:
+    def __init__(self) -> None:
+        self.layer_names: tuple[str, ...] = ()
+        self.global_count = 0
+        self.global_total = 0.0
+        self.global_sum_sq = 0.0
+        self.global_max = -float("inf")
+        self.layer_count: list[int] = []
+        self.layer_total: list[float] = []
+        self.layer_sum_sq: list[float] = []
+        self.layer_max: list[float] = []
+        self.hidden_norm_total = 0.0
+        self.hidden_norm_count = 0
+
+    def update(self, metrics: IDSIMetrics) -> None:
+        if metrics.global_stats.count > 0:
+            self.global_count += int(metrics.global_stats.count)
+            self.global_total += float(metrics.global_stats.total)
+            self.global_sum_sq += float(metrics.global_stats.sum_sq)
+            self.global_max = max(self.global_max, float(metrics.global_stats.max))
+        if metrics.hidden_norm_count > 0:
+            self.hidden_norm_total += float(metrics.hidden_norm_total)
+            self.hidden_norm_count += int(metrics.hidden_norm_count)
+        if not metrics.layer_names:
+            return
+        if not self.layer_names:
+            self.layer_names = tuple(metrics.layer_names)
+            layer_count = len(self.layer_names)
+            self.layer_count = [0] * layer_count
+            self.layer_total = [0.0] * layer_count
+            self.layer_sum_sq = [0.0] * layer_count
+            self.layer_max = [-float("inf")] * layer_count
+        if tuple(metrics.layer_names) != self.layer_names:
+            raise ValueError("Layer-IDSI layer names changed within an epoch")
+        for index, stats in enumerate(metrics.layer_stats):
+            if stats.count <= 0:
+                continue
+            self.layer_count[index] += int(stats.count)
+            self.layer_total[index] += float(stats.total)
+            self.layer_sum_sq[index] += float(stats.sum_sq)
+            self.layer_max[index] = max(self.layer_max[index], float(stats.max))
+
+    def summary(self) -> dict[str, Any]:
+        global_stats = self._stats_from_running(
+            self.global_count,
+            self.global_total,
+            self.global_sum_sq,
+            self.global_max,
+        )
+        layer_stats = [
+            self._stats_from_running(count, total, sum_sq, max_value)
+            for count, total, sum_sq, max_value in zip(
+                self.layer_count,
+                self.layer_total,
+                self.layer_sum_sq,
+                self.layer_max,
+            )
+        ]
+        layer_means = [stats.mean for stats in layer_stats]
+        layer_maxes = [stats.max for stats in layer_stats]
+        layer_stds = [stats.std for stats in layer_stats]
+        return {
+            "IDSI": float(global_stats.mean),
+            "IDSI mean": float(global_stats.mean),
+            "IDSI max": float(global_stats.max),
+            "IDSI std": float(global_stats.std),
+            "layer_IDSI_names": list(self.layer_names),
+            "layer_IDSI": [float(value) for value in layer_means],
+            "layer_IDSI_mean": [float(value) for value in layer_means],
+            "layer_IDSI_max": [float(value) for value in layer_maxes],
+            "layer_IDSI_std": [float(value) for value in layer_stds],
+            "hidden_norm": (
+                float(self.hidden_norm_total / self.hidden_norm_count)
+                if self.hidden_norm_count > 0
+                else float("nan")
+            ),
+        }
+
+    @staticmethod
+    def _stats_from_running(count: int, total: float, sum_sq: float, max_value: float) -> IDSIDistributionStats:
+        return IDSIDistributionStats(
+            count=int(count),
+            total=float(total),
+            sum_sq=float(sum_sq),
+            max=float(max_value) if count > 0 else float("nan"),
+        )
+
+
 def _validate_omega_args(
     *,
     omega_loss: bool,
     omega_lambda: float,
+    idsi_lambda: float,
     omega_projector_depth: int,
     omega_hidden_dim: int,
-) -> tuple[float, int, int]:
+) -> tuple[float, float, int, int]:
     omega_lambda = float(omega_lambda)
+    idsi_lambda = float(idsi_lambda)
     omega_projector_depth = int(omega_projector_depth)
     omega_hidden_dim = int(omega_hidden_dim)
     if omega_lambda < 0.0:
         raise ValueError("omega_lambda must be >= 0")
+    if idsi_lambda < 0.0:
+        raise ValueError("idsi_lambda must be >= 0")
     if omega_projector_depth not in {1, 2}:
         raise ValueError("omega_projector_depth must be 1 or 2")
     if omega_hidden_dim <= 0:
         raise ValueError("omega_hidden_dim must be > 0")
     if omega_lambda > 0.0 and not omega_loss:
         raise ValueError("omega_lambda > 0 requires --omega-loss")
-    return omega_lambda, omega_projector_depth, omega_hidden_dim
+    return omega_lambda, idsi_lambda, omega_projector_depth, omega_hidden_dim
 
 
 def _format_run_value(value: float) -> str:
@@ -264,10 +415,13 @@ def _prepare_experiment_artifacts(
     checkpoint_path: Path,
     seed: int,
     omega_lambda: float,
+    idsi_lambda: float,
 ) -> tuple[Path, Path, Path, Path]:
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     run_dir = experiment_root / (
-        f"{timestamp}-{checkpoint_path.stem}-seed_{int(seed)}-lambda_{_format_run_value(omega_lambda)}"
+        f"{timestamp}-{checkpoint_path.stem}-seed_{int(seed)}"
+        f"-lambda_{_format_run_value(omega_lambda)}"
+        f"-idsi_{_format_run_value(idsi_lambda)}"
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "epoch_metrics.jsonl"
@@ -297,29 +451,139 @@ def _extract_representation_variance_stats(h: torch.Tensor | None) -> Representa
     )
 
 
+def _empty_idsi_metrics(*, device: torch.device, dtype: torch.dtype) -> IDSIMetrics:
+    zero = torch.zeros((), device=device, dtype=dtype)
+    empty_stats = IDSIDistributionStats(count=0, total=0.0, sum_sq=0.0, max=float("nan"))
+    return IDSIMetrics(
+        layer_names=(),
+        global_stats=empty_stats,
+        layer_stats=(),
+        loss=zero,
+        hidden_norm_total=0.0,
+        hidden_norm_count=0,
+    )
+
+
+def _distribution_stats_from_delta(delta: torch.Tensor) -> IDSIDistributionStats:
+    values = delta.detach().float().reshape(-1)
+    count = int(values.numel())
+    if count <= 0:
+        return IDSIDistributionStats(count=0, total=0.0, sum_sq=0.0, max=float("nan"))
+    return IDSIDistributionStats(
+        count=count,
+        total=float(values.sum().item()),
+        sum_sq=float(torch.sum(values * values).item()),
+        max=float(values.max().item()),
+    )
+
+
+def _compute_idsi_metrics_from_pairs(
+    layer_names: Sequence[str],
+    layer_inputs: Sequence[torch.Tensor],
+    layer_outputs: Sequence[torch.Tensor],
+    *,
+    epsilon: float = IDSI_EPSILON,
+) -> IDSIMetrics:
+    if len(layer_inputs) != len(layer_outputs):
+        raise ValueError("Layer-IDSI input/output tensor counts do not match")
+    if len(layer_inputs) != len(layer_names):
+        raise ValueError("Layer-IDSI layer name count does not match tensor count")
+    if not layer_inputs:
+        raise ValueError("Layer-IDSI requires at least one monitored tensor pair")
+
+    layer_stats: list[IDSIDistributionStats] = []
+    layer_losses: list[torch.Tensor] = []
+    global_count = 0
+    global_total = 0.0
+    global_sum_sq = 0.0
+    global_max = -float("inf")
+    hidden_norm_total = 0.0
+    hidden_norm_count = 0
+
+    for layer_name, layer_input, layer_output in zip(layer_names, layer_inputs, layer_outputs):
+        if tuple(layer_input.shape) != tuple(layer_output.shape):
+            raise ValueError(
+                f"Layer-IDSI tensors for {layer_name!r} must be shape-matched; "
+                f"got {tuple(layer_input.shape)} and {tuple(layer_output.shape)}"
+            )
+        input_flat = layer_input.float().flatten(start_dim=1)
+        output_flat = layer_output.float().flatten(start_dim=1)
+        residual = output_flat - input_flat
+        denominator = torch.linalg.vector_norm(input_flat.detach(), dim=1).clamp_min(float(epsilon))
+        relative_delta = torch.linalg.vector_norm(residual.detach(), dim=1) / denominator
+        layer_loss = torch.mean(torch.square(torch.linalg.vector_norm(residual, dim=1) / denominator))
+        stats = _distribution_stats_from_delta(relative_delta * IDSI_LOG_SCALE)
+
+        layer_losses.append(layer_loss)
+        layer_stats.append(stats)
+        global_count += stats.count
+        global_total += stats.total
+        global_sum_sq += stats.sum_sq
+        if stats.count > 0:
+            global_max = max(global_max, stats.max)
+        hidden_norm_total += float(denominator.detach().sum().item())
+        hidden_norm_count += int(denominator.numel())
+
+    global_stats = IDSIDistributionStats(
+        count=global_count,
+        total=global_total,
+        sum_sq=global_sum_sq,
+        max=global_max if global_count > 0 else float("nan"),
+    )
+    return IDSIMetrics(
+        layer_names=tuple(str(name) for name in layer_names),
+        global_stats=global_stats,
+        layer_stats=tuple(layer_stats),
+        loss=torch.stack(layer_losses).mean(),
+        hidden_norm_total=hidden_norm_total,
+        hidden_norm_count=hidden_norm_count,
+    )
+
+
 def _compute_idsi(h: torch.Tensor | None, t_h: torch.Tensor | None) -> float:
     if h is None or t_h is None:
         return float("nan")
-    h_detached = h.detach().float()
-    t_h_detached = t_h.detach().float()
-    numerator = torch.linalg.vector_norm(t_h_detached - h_detached, dim=1)
-    denominator = torch.linalg.vector_norm(h_detached, dim=1).clamp_min(1e-12)
-    return float(torch.mean((numerator / denominator) * 100.0).item())
+    metrics = _compute_idsi_metrics_from_pairs(("classifier_pre_head",), (h,), (t_h,))
+    return float(metrics.global_stats.mean)
 
 
 def _resolve_forward_output(
     forward_output: Any,
     *,
     omega_enabled: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> ForwardComponents:
     if not omega_enabled:
         if isinstance(forward_output, tuple):
-            return forward_output[0], None, None
-        return forward_output, None, None
-    if not isinstance(forward_output, tuple) or len(forward_output) != 3:
-        raise ValueError("Omega-enabled forward path must return (logits, h, T(h))")
-    logits, h, t_h = forward_output
-    return logits, h, t_h
+            return ForwardComponents(forward_output[0], None, None, (), ())
+        return ForwardComponents(forward_output, None, None, (), ())
+    if not isinstance(forward_output, tuple):
+        raise ValueError("Omega-enabled forward path must return tuple outputs")
+    if len(forward_output) == 3:
+        logits, h, t_h = forward_output
+        return ForwardComponents(logits, h, t_h, (), ())
+    if len(forward_output) == 5:
+        logits, h, t_h, layer_inputs, layer_outputs = forward_output
+        return ForwardComponents(
+            logits=logits,
+            h=h,
+            t_h=t_h,
+            layer_inputs=tuple(layer_inputs),
+            layer_outputs=tuple(layer_outputs),
+        )
+    raise ValueError("Omega-enabled forward path must return (logits, h, T(h)) or Layer-IDSI outputs")
+
+
+def _select_forward_callable(
+    model: TorchCNN,
+    *,
+    omega_enabled: bool,
+    idsi_enabled: bool,
+) -> Callable[[torch.Tensor], Any]:
+    if omega_enabled and idsi_enabled:
+        return model.forward_with_omega_and_layer_idsi
+    if omega_enabled:
+        return model.forward_with_omega
+    return model
 
 
 def list_labeled_paths(
@@ -581,12 +845,15 @@ def _compute_total_loss_components(
     *,
     omega_enabled: bool,
     omega_lambda: float,
+    idsi_lambda: float,
+    idsi_layer_names: Sequence[str] | None = None,
     use_focal_loss: bool,
     focal_gamma: float,
     ce_class_weights: torch.Tensor | None,
     focal_alpha_weights: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, RepresentationVarianceStats, float]:
-    logits, h, t_h = _resolve_forward_output(forward_output, omega_enabled=omega_enabled)
+) -> BatchLossComponents:
+    components = _resolve_forward_output(forward_output, omega_enabled=omega_enabled)
+    logits = components.logits
     ce_loss = _compute_batch_loss(
         logits,
         targets,
@@ -597,12 +864,53 @@ def _compute_total_loss_components(
     )
     if not omega_enabled:
         zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
-        return ce_loss, ce_loss, zero, logits, _extract_representation_variance_stats(None), float("nan")
+        return BatchLossComponents(
+            total_loss=ce_loss,
+            ce_loss=ce_loss,
+            attr_loss=zero,
+            idsi_loss=zero,
+            logits=logits,
+            h_stats=_extract_representation_variance_stats(None),
+            idsi_metrics=_empty_idsi_metrics(device=logits.device, dtype=logits.dtype),
+        )
 
+    h = components.h
+    t_h = components.t_h
     assert h is not None and t_h is not None
     attr_loss = torch.mean(torch.square(h - t_h))
-    total_loss = ce_loss + (float(omega_lambda) * attr_loss)
-    return total_loss, ce_loss, attr_loss, logits, _extract_representation_variance_stats(h), _compute_idsi(h, t_h)
+    if components.layer_inputs:
+        layer_names = tuple(
+            idsi_layer_names
+            if idsi_layer_names is not None
+            else (f"layer_{index + 1}" for index in range(len(components.layer_inputs)))
+        )
+        idsi_metrics = _compute_idsi_metrics_from_pairs(
+            layer_names,
+            components.layer_inputs,
+            components.layer_outputs,
+        )
+    else:
+        if float(idsi_lambda) > 0.0:
+            raise ValueError("idsi_lambda > 0 requires forward_with_omega_and_layer_idsi outputs")
+        idsi_metrics = _compute_idsi_metrics_from_pairs(("classifier_pre_head",), (h,), (t_h,))
+        idsi_metrics = IDSIMetrics(
+            layer_names=idsi_metrics.layer_names,
+            global_stats=idsi_metrics.global_stats,
+            layer_stats=idsi_metrics.layer_stats,
+            loss=torch.zeros((), device=logits.device, dtype=logits.dtype),
+            hidden_norm_total=idsi_metrics.hidden_norm_total,
+            hidden_norm_count=idsi_metrics.hidden_norm_count,
+        )
+    total_loss = ce_loss + (float(omega_lambda) * attr_loss) + (float(idsi_lambda) * idsi_metrics.loss)
+    return BatchLossComponents(
+        total_loss=total_loss,
+        ce_loss=ce_loss,
+        attr_loss=attr_loss,
+        idsi_loss=idsi_metrics.loss,
+        logits=logits,
+        h_stats=_extract_representation_variance_stats(h),
+        idsi_metrics=idsi_metrics,
+    )
 
 
 def _beta_sample_on_device(beta_alpha: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -728,20 +1036,34 @@ def _backward_and_step(
     *,
     grad_clip: float,
     scaler,
-) -> None:
+) -> float:
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if scaler is not None and getattr(scaler, "is_enabled", lambda: False)():
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        gradient_norm = _compute_gradient_norm(parameters)
         if grad_clip > 0.0:
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters, max_norm=grad_clip)
         scaler.step(optimizer)
         scaler.update()
-        return
+        return gradient_norm
     loss.backward()
+    gradient_norm = _compute_gradient_norm(parameters)
     if grad_clip > 0.0:
         torch.nn.utils.clip_grad_norm_(parameters, max_norm=grad_clip)
     optimizer.step()
+    return gradient_norm
+
+
+def _compute_gradient_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
+    grad_norms = [
+        torch.linalg.vector_norm(parameter.grad.detach().float(), ord=2)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not grad_norms:
+        return float("nan")
+    return float(torch.linalg.vector_norm(torch.stack(grad_norms), ord=2).item())
 
 
 def _synchronize_device(device: torch.device) -> None:
@@ -765,6 +1087,9 @@ def _benchmark_train_steps(
     focal_alpha_weights: torch.Tensor | None,
     omega_enabled: bool,
     omega_lambda: float,
+    idsi_enabled: bool,
+    idsi_lambda: float,
+    idsi_layer_names: Sequence[str] | None,
     grad_clip: float,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -786,16 +1111,19 @@ def _benchmark_train_steps(
         start = time.perf_counter()
         with _make_autocast_context(device, amp_dtype):
             forward_output = forward_callable(x_batch)
-            loss, _, _, _, _, _ = _compute_total_loss_components(
+            loss_components = _compute_total_loss_components(
                 forward_output,
                 targets,
                 omega_enabled=omega_enabled,
                 omega_lambda=omega_lambda,
+                idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
+                idsi_layer_names=idsi_layer_names,
                 use_focal_loss=use_focal_loss,
                 focal_gamma=focal_gamma,
                 ce_class_weights=ce_class_weights,
                 focal_alpha_weights=focal_alpha_weights,
             )
+            loss = loss_components.total_loss
         _backward_and_step(
             loss,
             optimizer,
@@ -847,6 +1175,8 @@ def _maybe_enable_compiled_forward_model(
     focal_alpha_weights: torch.Tensor | None,
     omega_enabled: bool,
     omega_lambda: float,
+    idsi_enabled: bool,
+    idsi_lambda: float,
     grad_clip: float,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -866,7 +1196,9 @@ def _maybe_enable_compiled_forward_model(
 
     if args.compile_mode == "on":
         try:
-            compiled = torch.compile(model.forward_with_omega if omega_enabled else model)
+            compiled = torch.compile(
+                _select_forward_callable(model, omega_enabled=omega_enabled, idsi_enabled=idsi_enabled)
+            )
             print("Enabled torch.compile (--compile-mode=on).")
             return compiled
         except Exception as exc:
@@ -884,7 +1216,11 @@ def _maybe_enable_compiled_forward_model(
         eager_optimizer = _build_optimizer(args, eager_model, lr_value=benchmark_lr)
         eager_scaler = _make_grad_scaler(device, amp_dtype)
         eager_time = _benchmark_train_steps(
-            forward_callable=eager_model.forward_with_omega if omega_enabled else eager_model,
+            forward_callable=_select_forward_callable(
+                eager_model,
+                omega_enabled=omega_enabled,
+                idsi_enabled=idsi_enabled,
+            ),
             raw_model=eager_model,
             optimizer=eager_optimizer,
             scaler=eager_scaler,
@@ -898,6 +1234,9 @@ def _maybe_enable_compiled_forward_model(
             focal_alpha_weights=focal_alpha_weights,
             omega_enabled=omega_enabled,
             omega_lambda=omega_lambda,
+            idsi_enabled=idsi_enabled,
+            idsi_lambda=idsi_lambda,
+            idsi_layer_names=eager_model.idsi_layer_names if idsi_enabled else None,
             grad_clip=grad_clip,
             device=device,
             amp_dtype=amp_dtype,
@@ -906,7 +1245,13 @@ def _maybe_enable_compiled_forward_model(
         )
 
         compiled_model = _clone_model_for_benchmark(model, device=device, use_channels_last=use_channels_last)
-        compiled_forward = torch.compile(compiled_model.forward_with_omega if omega_enabled else compiled_model)
+        compiled_forward = torch.compile(
+            _select_forward_callable(
+                compiled_model,
+                omega_enabled=omega_enabled,
+                idsi_enabled=idsi_enabled,
+            )
+        )
         compiled_optimizer = _build_optimizer(args, compiled_model, lr_value=benchmark_lr)
         compiled_scaler = _make_grad_scaler(device, amp_dtype)
         compiled_time = _benchmark_train_steps(
@@ -924,6 +1269,9 @@ def _maybe_enable_compiled_forward_model(
             focal_alpha_weights=focal_alpha_weights,
             omega_enabled=omega_enabled,
             omega_lambda=omega_lambda,
+            idsi_enabled=idsi_enabled,
+            idsi_lambda=idsi_lambda,
+            idsi_layer_names=compiled_model.idsi_layer_names if idsi_enabled else None,
             grad_clip=grad_clip,
             device=device,
             amp_dtype=amp_dtype,
@@ -938,7 +1286,9 @@ def _maybe_enable_compiled_forward_model(
             )
             return None
 
-        live_compiled_forward = torch.compile(model.forward_with_omega if omega_enabled else model)
+        live_compiled_forward = torch.compile(
+            _select_forward_callable(model, omega_enabled=omega_enabled, idsi_enabled=idsi_enabled)
+        )
         print(
             f"Enabled torch.compile: eager median step {eager_time:.6f}s, "
             f"compiled median step {compiled_time:.6f}s"
@@ -964,12 +1314,15 @@ def evaluate_loader(
     focal_alpha_weights: torch.Tensor | None,
     omega_enabled: bool,
     omega_lambda: float,
+    idsi_lambda: float,
+    idsi_layer_names: Sequence[str] | None = None,
 ) -> dict[str, float]:
     if len(loader.dataset) == 0:
         return {
             "loss_total": float("nan"),
             "loss_ce": float("nan"),
             "loss_attr": float("nan"),
+            "loss_idsi": float("nan"),
             "acc": float("nan"),
             "val_h_var_mean": float("nan"),
             "val_h_var_min": float("nan"),
@@ -979,6 +1332,7 @@ def evaluate_loader(
     total_loss = 0.0
     total_ce_loss = 0.0
     total_attr_loss = 0.0
+    total_idsi_loss = 0.0
     total_correct = 0
     total_h_var_mean = 0.0
     total_h_var_min = 0.0
@@ -999,32 +1353,38 @@ def evaluate_loader(
             )
             with _make_autocast_context(device, amp_dtype):
                 forward_output = (forward_callable or model)(x_batch)
-                loss, ce_loss, attr_loss, logits, h_stats, batch_idsi = _compute_total_loss_components(
+                loss_components = _compute_total_loss_components(
                     forward_output,
                     targets,
                     omega_enabled=omega_enabled,
                     omega_lambda=omega_lambda,
+                    idsi_lambda=idsi_lambda,
+                    idsi_layer_names=idsi_layer_names,
                     use_focal_loss=use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
                     focal_alpha_weights=focal_alpha_weights,
                 )
-            total_loss += float(loss.item())
-            total_ce_loss += float(ce_loss.item())
-            total_attr_loss += float(attr_loss.item())
+            total_loss += float(loss_components.total_loss.item())
+            total_ce_loss += float(loss_components.ce_loss.item())
+            total_attr_loss += float(loss_components.attr_loss.item())
+            total_idsi_loss += float(loss_components.idsi_loss.item())
+            logits = loss_components.logits
+            h_stats = loss_components.h_stats
             total_correct += int((torch.argmax(logits, dim=1) == y_batch).sum().item())
             total_h_var_mean += h_stats.mean
             total_h_var_min += h_stats.min
             total_h_var_max += h_stats.max
-            if not np.isnan(batch_idsi):
-                batch_size = int(x_batch.shape[0])
-                total_idsi += batch_idsi * batch_size
-                total_idsi_count += batch_size
+            idsi_stats = loss_components.idsi_metrics.global_stats
+            if idsi_stats.count > 0:
+                total_idsi += idsi_stats.total
+                total_idsi_count += idsi_stats.count
             num_batches += 1
     return {
         "loss_total": total_loss / max(1, num_batches),
         "loss_ce": total_ce_loss / max(1, num_batches),
         "loss_attr": total_attr_loss / max(1, num_batches),
+        "loss_idsi": total_idsi_loss / max(1, num_batches),
         "acc": total_correct / max(1, len(loader.dataset)),
         "val_h_var_mean": total_h_var_mean / max(1, num_batches),
         "val_h_var_min": total_h_var_min / max(1, num_batches),
@@ -1148,6 +1508,7 @@ def main() -> None:
     parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
     parser.add_argument("--omega-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable the Phase 1 Omega-loss auxiliary branch")
     parser.add_argument("--omega-lambda", type=float, default=0.0, help="Weight applied to the Phase 1 Omega attractor loss")
+    parser.add_argument("--idsi-lambda", type=float, default=0.005, help="Weight applied to the Phase 1.2 Layer-IDSI loss when --omega-loss is enabled")
     parser.add_argument("--omega-projector-depth", type=int, default=1, help="Omega projector depth: 1 or 2 linear layers")
     parser.add_argument("--omega-hidden-dim", type=int, default=DEFAULT_OMEGA_FEATURE_DIM, help="Hidden width for the 2-layer Omega projector")
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
@@ -1204,9 +1565,10 @@ def main() -> None:
         ema_decay = validate_ema_decay(args.ema_decay)
         focal_gamma = validate_focal_gamma(args.focal_gamma)
         width_scale = validate_model_width_scale(args.model_width_scale)
-        omega_lambda, omega_projector_depth, omega_hidden_dim = _validate_omega_args(
+        omega_lambda, idsi_lambda, omega_projector_depth, omega_hidden_dim = _validate_omega_args(
             omega_loss=bool(args.omega_loss),
             omega_lambda=args.omega_lambda,
+            idsi_lambda=args.idsi_lambda,
             omega_projector_depth=args.omega_projector_depth,
             omega_hidden_dim=args.omega_hidden_dim,
         )
@@ -1219,6 +1581,7 @@ def main() -> None:
     device = _resolve_device(args.device)
     amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
     use_channels_last = _configure_runtime_kernels(device, fixed_input_shape=True)
+    idsi_enabled = bool(args.omega_loss and idsi_lambda > 0.0)
 
     data_dir = Path(args.data_dir) if args.data_dir else Path(config.DATA_DIR)
     data_dir = data_dir.resolve()
@@ -1406,6 +1769,8 @@ def main() -> None:
         focal_alpha_weights=focal_alpha_weights,
         omega_enabled=bool(args.omega_loss),
         omega_lambda=omega_lambda,
+        idsi_enabled=idsi_enabled,
+        idsi_lambda=idsi_lambda,
         grad_clip=float(args.grad_clip),
         device=device,
         amp_dtype=amp_dtype,
@@ -1454,6 +1819,7 @@ def main() -> None:
             checkpoint_path=Path(args.checkpoint),
             seed=args.seed,
             omega_lambda=omega_lambda,
+            idsi_lambda=idsi_lambda if bool(args.omega_loss) else 0.0,
         )
         if experiment_config_path is None or experiment_metrics_path is None:
             raise RuntimeError("run tracking artifact paths were not initialized")
@@ -1468,6 +1834,9 @@ def main() -> None:
                 "resolved_stage2_channels": int(model.stage2_channels),
                 "omega_enabled": bool(args.omega_loss),
                 "omega_lambda": float(omega_lambda),
+                "idsi_enabled": bool(idsi_enabled),
+                "idsi_lambda": float(idsi_lambda),
+                "idsi_layer_names": list(model.idsi_layer_names if idsi_enabled else ()),
                 "omega_projector_depth": int(omega_projector_depth),
                 "omega_hidden_dim": int(omega_hidden_dim),
                 "checkpoint_path": str(Path(args.checkpoint).resolve()),
@@ -1511,12 +1880,14 @@ def main() -> None:
         epoch_loss = 0.0
         epoch_ce_loss = 0.0
         epoch_attr_loss = 0.0
+        epoch_idsi_loss = 0.0
         epoch_correct = 0
         epoch_h_var_mean = 0.0
         epoch_h_var_min = float("inf")
         epoch_h_var_max = -float("inf")
-        epoch_idsi = 0.0
-        epoch_idsi_count = 0
+        epoch_idsi_metrics = EpochIDSIAggregator()
+        epoch_gradient_norm = 0.0
+        epoch_gradient_norm_count = 0
 
         for batch_index, (x_cpu, y_cpu) in enumerate(train_loader):
             y_batch_idx = _move_label_batch(y_cpu, device)
@@ -1574,37 +1945,50 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             forward_callable: Callable[[torch.Tensor], Any]
-            if bool(args.omega_loss):
-                forward_callable = compiled_forward_model if compiled_forward_model is not None else model.forward_with_omega
+            if compiled_forward_model is not None:
+                forward_callable = compiled_forward_model
             else:
-                forward_callable = compiled_forward_model if compiled_forward_model is not None else model
+                forward_callable = _select_forward_callable(
+                    model,
+                    omega_enabled=bool(args.omega_loss),
+                    idsi_enabled=idsi_enabled,
+                )
             with _make_autocast_context(device, amp_dtype):
                 batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
                 forward_output = forward_callable(x_batch)
-                loss, ce_loss, attr_loss, logits, h_stats, batch_idsi = _compute_total_loss_components(
+                loss_components = _compute_total_loss_components(
                     forward_output,
                     target_distribution,
                     omega_enabled=bool(args.omega_loss),
                     omega_lambda=omega_lambda,
+                    idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
+                    idsi_layer_names=model.idsi_layer_names if idsi_enabled else None,
                     use_focal_loss=batch_use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
                     focal_alpha_weights=focal_alpha_weights,
                 )
-            _backward_and_step(
-                loss,
+            gradient_norm = _backward_and_step(
+                loss_components.total_loss,
                 optimizer,
                 model,
                 grad_clip=float(args.grad_clip),
                 scaler=scaler,
             )
+            if not np.isnan(gradient_norm):
+                epoch_gradient_norm += gradient_norm
+                epoch_gradient_norm_count += 1
             if ema is not None:
                 phase_step = phase_config.epoch_index_in_phase * num_batches + batch_index
                 ema.update(model, step_in_phase=phase_step, mix_active=(mix_mode != "none"))
 
-            epoch_loss += float(loss.item())
-            epoch_ce_loss += float(ce_loss.item())
-            epoch_attr_loss += float(attr_loss.item())
+            logits = loss_components.logits
+            h_stats = loss_components.h_stats
+            epoch_loss += float(loss_components.total_loss.item())
+            epoch_ce_loss += float(loss_components.ce_loss.item())
+            epoch_attr_loss += float(loss_components.attr_loss.item())
+            epoch_idsi_loss += float(loss_components.idsi_loss.item())
+            epoch_idsi_metrics.update(loss_components.idsi_metrics)
             metric_targets = torch.argmax(target_distribution, dim=1)
             epoch_correct += int((torch.argmax(logits, dim=1) == metric_targets).sum().item())
             epoch_h_var_mean += h_stats.mean
@@ -1612,19 +1996,22 @@ def main() -> None:
                 epoch_h_var_min = min(epoch_h_var_min, h_stats.min)
             if not np.isnan(h_stats.max):
                 epoch_h_var_max = max(epoch_h_var_max, h_stats.max)
-            if not np.isnan(batch_idsi):
-                batch_size = int(x_batch.shape[0])
-                epoch_idsi += batch_idsi * batch_size
-                epoch_idsi_count += batch_size
 
         avg_loss = epoch_loss / max(1, num_batches)
         avg_ce_loss = epoch_ce_loss / max(1, num_batches)
         avg_attr_loss = epoch_attr_loss / max(1, num_batches)
+        avg_idsi_loss = epoch_idsi_loss / max(1, num_batches)
         train_acc = epoch_correct / max(1, len(train_dataset))
         train_h_var_mean = epoch_h_var_mean / max(1, num_batches)
         train_h_var_min = epoch_h_var_min if epoch_h_var_min != float("inf") else float("nan")
         train_h_var_max = epoch_h_var_max if epoch_h_var_max != -float("inf") else float("nan")
-        train_idsi = epoch_idsi / max(1, epoch_idsi_count) if epoch_idsi_count > 0 else float("nan")
+        train_idsi_summary = epoch_idsi_metrics.summary()
+        train_idsi = float(train_idsi_summary["IDSI"])
+        train_gradient_norm = (
+            epoch_gradient_norm / epoch_gradient_norm_count
+            if epoch_gradient_norm_count > 0
+            else float("nan")
+        )
 
         if val_loader is not None and y_val is not None and len(val_paths) > 0:
             eval_model = ema.ema_model if ema is not None else model
@@ -1632,8 +2019,12 @@ def main() -> None:
             eval_forward_callable: Callable[[torch.Tensor], Any] | None = None
             if eval_model is model and compiled_forward_model is not None:
                 eval_forward_callable = compiled_forward_model
-            elif bool(args.omega_loss):
-                eval_forward_callable = eval_model.forward_with_omega
+            else:
+                eval_forward_callable = _select_forward_callable(
+                    cast(TorchCNN, eval_model),
+                    omega_enabled=bool(args.omega_loss),
+                    idsi_enabled=idsi_enabled,
+                )
             val_metrics = evaluate_loader(
                 eval_model,
                 val_loader,
@@ -1648,6 +2039,8 @@ def main() -> None:
                 focal_alpha_weights=focal_alpha_weights,
                 omega_enabled=bool(args.omega_loss),
                 omega_lambda=omega_lambda,
+                idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
+                idsi_layer_names=model.idsi_layer_names if idsi_enabled else None,
             )
             val_loss = val_metrics["loss_total"]
             val_acc = val_metrics["acc"]
@@ -1731,10 +2124,12 @@ def main() -> None:
                 "train_loss_total": float(avg_loss),
                 "train_loss_ce": float(avg_ce_loss),
                 "train_loss_attr": float(avg_attr_loss),
+                "train_loss_idsi": float(avg_idsi_loss),
                 "train_acc": float(train_acc),
                 "val_loss_total": float(val_metrics["loss_total"]),
                 "val_loss_ce": float(val_metrics["loss_ce"]),
                 "val_loss_attr": float(val_metrics["loss_attr"]),
+                "val_loss_idsi": float(val_metrics["loss_idsi"]),
                 "val_acc": float(val_acc),
                 "generalization_gap": float(gap),
                 "train_h_var_mean": float(train_h_var_mean),
@@ -1744,8 +2139,10 @@ def main() -> None:
                 "val_h_var_min": float(val_metrics["val_h_var_min"]),
                 "val_h_var_max": float(val_metrics["val_h_var_max"]),
                 "IDSI": float(train_idsi),
+                "gradient_norm": float(train_gradient_norm),
                 "improved": bool(improved),
             }
+            final_epoch_metrics.update(train_idsi_summary)
             if args.omega_loss:
                 collapse_low_variance_epochs = (
                     collapse_low_variance_epochs + 1
@@ -1797,10 +2194,12 @@ def main() -> None:
                 "train_loss_total": float(avg_loss),
                 "train_loss_ce": float(avg_ce_loss),
                 "train_loss_attr": float(avg_attr_loss),
+                "train_loss_idsi": float(avg_idsi_loss),
                 "train_acc": float(train_acc),
                 "val_loss_total": float("nan"),
                 "val_loss_ce": float("nan"),
                 "val_loss_attr": float("nan"),
+                "val_loss_idsi": float("nan"),
                 "val_acc": float("nan"),
                 "generalization_gap": float("nan"),
                 "train_h_var_mean": float(train_h_var_mean),
@@ -1810,8 +2209,10 @@ def main() -> None:
                 "val_h_var_min": float("nan"),
                 "val_h_var_max": float("nan"),
                 "IDSI": float(train_idsi),
+                "gradient_norm": float(train_gradient_norm),
                 "improved": False,
             }
+            final_epoch_metrics.update(train_idsi_summary)
             if args.omega_loss:
                 collapse_low_variance_epochs = (
                     collapse_low_variance_epochs + 1
@@ -1856,6 +2257,9 @@ def main() -> None:
                 "collapse_variance_threshold": float(OMEGA_COLLAPSE_VARIANCE_THRESHOLD),
                 "collapse_consecutive_epochs": int(OMEGA_COLLAPSE_EPOCHS),
                 "omega_lambda": float(omega_lambda),
+                "idsi_lambda": float(idsi_lambda),
+                "idsi_enabled": bool(idsi_enabled),
+                "idsi_layer_names": list(model.idsi_layer_names if idsi_enabled else ()),
                 "omega_projector_depth": int(omega_projector_depth),
                 "omega_hidden_dim": int(omega_hidden_dim),
                 "contraction_is_empirical": True,

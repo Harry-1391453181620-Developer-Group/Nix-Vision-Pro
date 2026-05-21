@@ -245,6 +245,13 @@ class OmegaProjector(nn.Module):
 class TorchCNN(nn.Module):
     """Three-stage CNN + SE classifier matching the active project architecture."""
 
+    IDSI_LAYER_NAMES: tuple[str, ...] = (
+        "stage1",
+        "stage2",
+        "stage3",
+        "classifier_pre_head",
+    )
+
     def __init__(
         self,
         input_size: Tuple[int, int],
@@ -346,6 +353,11 @@ class TorchCNN(nn.Module):
         """Expose the configured Omega hidden dimension for checkpoint metadata."""
         return self._omega_hidden_dim
 
+    @property
+    def idsi_layer_names(self) -> tuple[str, ...]:
+        """Stable monitored-layer names used by Phase 1.2 Layer-IDSI logging."""
+        return self.IDSI_LAYER_NAMES
+
     def backbone_modules(self) -> tuple[nn.Module, ...]:
         """Return the feature extractor modules affected by temporary freezing."""
         return (
@@ -412,6 +424,33 @@ class TorchCNN(nn.Module):
         x = self.pool3(x)
         return x
 
+    def _forward_features_with_layer_idsi(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Return features plus matched-space stage transitions for Layer-IDSI.
+
+        Whole CNN stages change channel count or spatial resolution. Phase 1.2
+        therefore monitors the residual-aligned same-shape transition inside
+        each stage, after the stage projection convolution and before pooling.
+        """
+        stage1_in = torch.relu(self.bn1(self.conv1(x)))
+        stage1_out = torch.relu(self.bn2(self.conv2(stage1_in)))
+        stage1_out = self.se1(stage1_out)
+        x = self.pool1(stage1_out)
+
+        stage2_in = torch.relu(self.bn3(self.conv3(x)))
+        stage2_out = torch.relu(self.bn4(self.conv4(stage2_in)))
+        stage2_out = self.se2(stage2_out)
+        x = self.pool2(stage2_out)
+
+        stage3_in = torch.relu(self.bn5(self.conv5(x)))
+        stage3_out = torch.relu(self.bn6(self.conv6(stage3_in)))
+        stage3_out = self.se3(stage3_out)
+        x = self.pool3(stage3_out)
+
+        return x, (stage1_in, stage2_in, stage3_in), (stage1_out, stage2_out, stage3_out)
+
     def _normalize_runtime_input(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
@@ -435,6 +474,16 @@ class TorchCNN(nn.Module):
         flattened = torch.flatten(features, start_dim=1)
         return torch.relu(self.fc1(flattened))
 
+    def _forward_representation_with_layer_idsi(
+        self,
+        x: torch.Tensor | np.ndarray,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        x_tensor = self._normalize_runtime_input(x)
+        features, layer_inputs, layer_outputs = self._forward_features_with_layer_idsi(x_tensor)
+        flattened = torch.flatten(features, start_dim=1)
+        h = torch.relu(self.fc1(flattened))
+        return h, layer_inputs, layer_outputs
+
     def _forward_logits_from_representation(self, h: torch.Tensor) -> torch.Tensor:
         dropped = self.dropout(h)
         return self.fc2(dropped)
@@ -450,6 +499,18 @@ class TorchCNN(nn.Module):
             raise RuntimeError("Omega projector is disabled for this model instance")
         logits, h = self.forward_with_representation(x)
         return logits, h, self.omega_projector(h)
+
+    def forward_with_omega_and_layer_idsi(
+        self,
+        x: torch.Tensor | np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Return Omega outputs plus matched-space Layer-IDSI transition tensors."""
+        if self.omega_projector is None:
+            raise RuntimeError("Omega projector is disabled for this model instance")
+        h, layer_inputs, layer_outputs = self._forward_representation_with_layer_idsi(x)
+        t_h = self.omega_projector(h)
+        logits = self._forward_logits_from_representation(h)
+        return logits, h, t_h, layer_inputs + (h,), layer_outputs + (t_h,)
 
     def forward(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
         logits, _ = self.forward_with_representation(x)

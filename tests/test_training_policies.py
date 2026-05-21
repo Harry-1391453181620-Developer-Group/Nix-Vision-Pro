@@ -359,13 +359,15 @@ def test_torch_num_worker_defaults_follow_streaming_mode():
 
 
 def test_validate_omega_args():
-    omega_lambda, depth, hidden_dim = _validate_omega_args(
+    omega_lambda, idsi_lambda, depth, hidden_dim = _validate_omega_args(
         omega_loss=True,
         omega_lambda=0.05,
+        idsi_lambda=0.005,
         omega_projector_depth=2,
         omega_hidden_dim=128,
     )
     assert omega_lambda == pytest.approx(0.05)
+    assert idsi_lambda == pytest.approx(0.005)
     assert depth == 2
     assert hidden_dim == 128
 
@@ -373,6 +375,7 @@ def test_validate_omega_args():
         _validate_omega_args(
             omega_loss=False,
             omega_lambda=0.05,
+            idsi_lambda=0.005,
             omega_projector_depth=1,
             omega_hidden_dim=256,
         )
@@ -380,6 +383,7 @@ def test_validate_omega_args():
         _validate_omega_args(
             omega_loss=True,
             omega_lambda=-0.01,
+            idsi_lambda=0.005,
             omega_projector_depth=1,
             omega_hidden_dim=256,
         )
@@ -387,6 +391,15 @@ def test_validate_omega_args():
         _validate_omega_args(
             omega_loss=True,
             omega_lambda=0.0,
+            idsi_lambda=-0.001,
+            omega_projector_depth=1,
+            omega_hidden_dim=256,
+        )
+    with pytest.raises(ValueError):
+        _validate_omega_args(
+            omega_loss=True,
+            omega_lambda=0.0,
+            idsi_lambda=0.005,
             omega_projector_depth=3,
             omega_hidden_dim=256,
         )
@@ -394,6 +407,7 @@ def test_validate_omega_args():
         _validate_omega_args(
             omega_loss=True,
             omega_lambda=0.0,
+            idsi_lambda=0.005,
             omega_projector_depth=1,
             omega_hidden_dim=0,
         )
@@ -405,18 +419,20 @@ def test_omega_loss_backpropagates_to_projector_and_representation_path():
     y = torch.tensor([0, 1, 2, 3], dtype=torch.long)
     targets = _make_target_distribution(y, num_classes=4, label_smoothing=0.0, dtype=torch.float32)
 
-    total_loss, ce_loss, attr_loss, logits, h_stats, idsi = _compute_total_loss_components(
-        model.forward_with_omega(x),
+    components = _compute_total_loss_components(
+        model.forward_with_omega_and_layer_idsi(x),
         targets,
         omega_enabled=True,
         omega_lambda=0.05,
+        idsi_lambda=0.005,
+        idsi_layer_names=model.idsi_layer_names,
         use_focal_loss=False,
         focal_gamma=1.5,
         ce_class_weights=None,
         focal_alpha_weights=None,
     )
     model.zero_grad(set_to_none=True)
-    attr_loss.backward()
+    components.attr_loss.backward()
 
     projector_grad_norm = sum(
         float(parameter.grad.detach().abs().sum().item())
@@ -426,11 +442,14 @@ def test_omega_loss_backpropagates_to_projector_and_representation_path():
     assert projector_grad_norm > 0.0
     assert model.fc1.weight.grad is not None
     assert float(model.fc1.weight.grad.detach().abs().sum().item()) > 0.0
-    assert total_loss.item() > ce_loss.item()
-    assert attr_loss.item() > 0.0
-    assert tuple(logits.shape) == (4, 4)
-    assert h_stats.mean >= 0.0
-    assert idsi > 0.0
+    assert components.total_loss.item() > components.ce_loss.item()
+    assert components.attr_loss.item() > 0.0
+    assert components.idsi_loss.item() > 0.0
+    assert tuple(components.logits.shape) == (4, 4)
+    assert components.h_stats.mean >= 0.0
+    assert components.idsi_metrics.global_stats.mean > 0.0
+    assert components.idsi_metrics.layer_names == model.idsi_layer_names
+    assert len(components.idsi_metrics.layer_stats) == len(model.idsi_layer_names)
 
 
 def test_torch_batch_mix_preserves_soft_label_simplex():

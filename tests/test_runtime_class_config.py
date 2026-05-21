@@ -9,10 +9,10 @@ from typing import Iterator
 from uuid import uuid4
 
 import config
+from tests.conftest import workspace_tmp_path
 
 
-_TEST_TMP_ROOT = Path('.pytest-tmp') / 'runtime_case_dirs'
-_TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+_TEST_TMP_ROOT = workspace_tmp_path('runtime_case_dirs')
 
 
 @contextmanager
@@ -59,7 +59,7 @@ def test_get_class_names_pads_when_class_count_is_larger() -> None:
 
 
 def test_get_class_names_falls_back_when_dataset_root_is_missing() -> None:
-    class_names = config.get_class_names(Path('.pytest-tmp') / 'missing_dataset_root')
+    class_names = config.get_class_names(_TEST_TMP_ROOT / 'missing_dataset_root')
     assert class_names == config.DEFAULT_CLASS_NAMES
 
 

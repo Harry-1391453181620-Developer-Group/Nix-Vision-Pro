@@ -17,7 +17,7 @@ def test_cnn_forward_shape():
     assert logits.shape == (4, 10)
 
 
-def test_cnn_checkpoint_round_trip_preserves_metadata():
+def test_cnn_checkpoint_round_trip_preserves_metadata(tmp_path: Path):
     x = np.random.randn(2, 32, 32, 3).astype(np.float64)
     model = CNN(input_size=(32, 32), num_classes=10, seed=7)
     model.train()
@@ -26,7 +26,7 @@ def test_cnn_checkpoint_round_trip_preserves_metadata():
     model.eval()
     logits_before = model.forward(x)
 
-    checkpoint = Path('.worktmp') / 'model_test_numpy.npz'
+    checkpoint = tmp_path / 'model_test_numpy.npz'
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     model.save_weights(checkpoint, metadata={"is_ema": True, "ema_decay": 0.999})
 
@@ -45,9 +45,9 @@ def test_cnn_checkpoint_round_trip_preserves_metadata():
     np.testing.assert_allclose(logits_before, logits_after, atol=1e-10)
 
 
-def test_cnn_loads_legacy_npz_checkpoint():
+def test_cnn_loads_legacy_npz_checkpoint(tmp_path: Path):
     model = CNN(input_size=(32, 32), num_classes=10, seed=21)
-    checkpoint = Path('.worktmp') / 'model_test_numpy_legacy.npz'
+    checkpoint = tmp_path / 'model_test_numpy_legacy.npz'
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     np.savez(checkpoint, **model.state_dict())
 
@@ -58,8 +58,8 @@ def test_cnn_loads_legacy_npz_checkpoint():
         np.testing.assert_allclose(value, restored.state_dict()[key], atol=1e-10)
 
 
-def test_numpy_checkpoint_runtime_config_round_trip_from_structured_checkpoint():
-    checkpoint = Path('.worktmp') / 'model_test_numpy_runtime_config.npz'
+def test_numpy_checkpoint_runtime_config_round_trip_from_structured_checkpoint(tmp_path: Path):
+    checkpoint = tmp_path / 'model_test_numpy_runtime_config.npz'
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     class_names = [f'class_{index}' for index in range(13)]
     model = CNN(input_size=(32, 32), num_classes=13, seed=41, width_scale=1.5)
@@ -74,8 +74,8 @@ def test_numpy_checkpoint_runtime_config_round_trip_from_structured_checkpoint()
     assert runtime_config.class_names == tuple(class_names)
 
 
-def test_numpy_checkpoint_runtime_config_infers_legacy_architecture():
-    checkpoint = Path('.worktmp') / 'model_test_numpy_runtime_config_legacy.npz'
+def test_numpy_checkpoint_runtime_config_infers_legacy_architecture(tmp_path: Path):
+    checkpoint = tmp_path / 'model_test_numpy_runtime_config_legacy.npz'
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     model = CNN(input_size=(32, 32), num_classes=13, seed=43, width_scale=1.0)
     np.savez(checkpoint, **model.state_dict())

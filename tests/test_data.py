@@ -11,10 +11,10 @@ from PIL import Image
 
 from data.loaders import load_image, load_images_from_dir
 from data.preprocessing import batch_preprocess, normalize, preprocess_image, resize
+from tests.conftest import workspace_tmp_path
 
 
-_TEST_TMP_ROOT = Path('.pytest-tmp') / 'data_tests'
-_TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+_TEST_TMP_ROOT = workspace_tmp_path('data_tests')
 
 
 def test_load_image_creates_ndarray():
