@@ -91,13 +91,13 @@ Runs write per-epoch metrics to `runs/<timestamp>-.../epoch_metrics.jsonl`.
 To show a plot after training finishes and save an image beside the JSONL file:
 
 ```powershell
-.\.venv312\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-once
+.\venv313\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-once
 ```
 
 To open the plot window at training start, refresh it after each epoch, and save the final image:
 
 ```powershell
-.\.venv312\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-real-time
+.\venv313\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-real-time
 ```
 
 Plot-related options are `--json-dir`, `--plot-output-format {png,jpg,jpeg}`, and `--plot-output-dir`.
