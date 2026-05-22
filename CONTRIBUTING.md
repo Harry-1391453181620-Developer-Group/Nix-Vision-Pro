@@ -2,9 +2,9 @@
 
 ## Environment
 
-- Python version: `3.14`
+- Python version: `3.13.2`
 - Preferred environment: project-local `.venv`
-- Current `.venv` model: `python -m venv --system-site-packages .venv`
+- Current `venv313` model: `python -m venv --system-site-packages venv313`
 
 Setup:
 
@@ -61,14 +61,3 @@ Examples:
 .\.venv\Scripts\python.exe predict.py --help
 .\.venv\Scripts\python.exe -m pytest tests -v -p no:cacheprovider
 ```
-
-## Documentation
-
-If you change behavior, update the relevant documents:
-- `README.md`
-- `Image_Identify_CNN.md`
-- `Agent_History/docs/plans/YYYY-MM-DD-*.md` when a design is approved
-- `Agent_History/Daily/YYYY/MM/DD_history.md`
-- `Agent_History/Monthly/YYYY/MM_summary.md` when writing the month-end summary
-
-Keep instruction documents unchanged unless the project owner explicitly changes project policy.
