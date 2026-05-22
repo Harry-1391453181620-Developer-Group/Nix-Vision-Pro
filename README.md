@@ -1,8 +1,10 @@
 # Image_Identify_CNN
 
-A Python 3.14 image classification project with two maintained backends:
+A Python 3.13.2 image classification project with two maintained backends:
 - `backends/torch/` is the default training and inference path.
 - `backends/numpy/` preserves the NumPy implementation for comparison and fallback.
+
+Project history is versioned under `Agent_History/`. Substantive contributions are expected to update the relevant history entries along with code and docs.
 
 The active architecture in both backends is width-scaled in stage 2:
 `[Conv(32), Conv(32), SE, Pool] -> [Conv(round(64*scale)), Conv(round(64*scale)), SE, Pool] -> [Conv(128), Conv(128), SE, Pool] -> Flatten -> FC(256) -> Dropout(0.5) -> FC(num_classes)`.
@@ -11,7 +13,7 @@ Default width scale is `0.75`, so the default stage-2 width is `48`. When you lo
 
 ## Runtime Baseline
 
-- Python: `3.14`
+- Python: `3.13.2`
 - Virtual environment: `.venv`
 - Default backend: `torch`
 - Legacy backend: `numpy`
@@ -91,13 +93,13 @@ Runs write per-epoch metrics to `runs/<timestamp>-.../epoch_metrics.jsonl`.
 To show a plot after training finishes and save an image beside the JSONL file:
 
 ```powershell
-.\venv313\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-once
+.\.venv\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-once
 ```
 
 To open the plot window at training start, refresh it after each epoch, and save the final image:
 
 ```powershell
-.\venv313\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-real-time
+.\.venv\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-real-time
 ```
 
 Plot-related options are `--json-dir`, `--plot-output-format {png,jpg,jpeg}`, and `--plot-output-dir`.
@@ -119,6 +121,13 @@ The plotter keeps all metrics in one matplotlib window, includes global and laye
 ```powershell
 python.exe predict.py --backend torch Dataset/airplane/0000001.jpg --weights checkpoints/best_torch_model.pt --probabilities --top-k 3 --device cuda
 python.exe predict.py --backend numpy Dataset/airplane/0000001.jpg --weights checkpoints/best_numpy_model.npz --probabilities --top-k 3
+```
+
+## GUI
+
+```powershell
+python.exe gui.py --backend torch --data-dir Dataset
+python.exe gui.py --backend numpy --data-dir Dataset
 ```
 
 ## Tests

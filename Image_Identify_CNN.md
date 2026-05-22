@@ -4,11 +4,12 @@ The project uses `PyTorch` as the default backend and keeps the original `NumPy`
 
 ## Current Runtime
 
-- Python version: `3.14`
+- Python version: `3.13.2`
 - Recommended interpreter: `./.venv/Scripts/python.exe`
 - Default backend: `torch`
 - Legacy backend: `numpy`
 - Active dataset source: real images stored under `Dataset/` by default
+- `Agent_History/` is versioned; substantive contributions should update the relevant history entries together with code and docs
 
 ## Active Architecture
 
@@ -52,6 +53,8 @@ The repository no longer ships synthetic or Wikimedia dataset-builder scripts. C
 ```text
 --backend {torch,numpy}
 ```
+
+This switch is supported by `train.py`, `predict.py`, and `gui.py`.
 
 ## Training Behavior
 
@@ -298,6 +301,22 @@ See `best_train_commands.txt`.
 - `--enforce-readonly-dataset / --no-enforce-readonly-dataset`
 - `--seed`
 - `--device {auto,cpu,cuda}`
+
+## Inference And GUI
+
+Inference examples:
+
+```powershell
+python.exe predict.py --backend torch Dataset/airplane/0000001.jpg --weights checkpoints/best_torch_model.pt --probabilities --top-k 3 --device cuda
+python.exe predict.py --backend numpy Dataset/airplane/0000001.jpg --weights checkpoints/best_numpy_model.npz --probabilities --top-k 3
+```
+
+GUI examples:
+
+```powershell
+python.exe gui.py --backend torch --data-dir Dataset
+python.exe gui.py --backend numpy --data-dir Dataset
+```
 
 ## Tests
 

@@ -28,7 +28,9 @@ python -m pip install -r requirements.txt
 - Preserve the current high-level CNN architecture unless a change is explicitly requested.
 - Write clear, detailed comments in code changes.
 - Keep security and reliability ahead of convenience.
-- Update the daily history file under `Agent_History/Daily/` for every substantive change.
+- `Agent_History/` is versioned and is part of normal project maintenance.
+- For every substantive contribution, update the relevant daily history entry under `Agent_History/Daily/`.
+- When a contribution changes project direction, plans, or notable milestones, update the matching files under `Agent_History/docs/`, `Agent_History/Monthly/`, or both.
 - Keep documentation aligned with the actual runtime behavior.
 
 ## Backend Expectations

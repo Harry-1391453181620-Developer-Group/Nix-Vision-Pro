@@ -73,6 +73,3 @@ test_image/
 
 # Optimizer for future large scale training, reserve for now
 dist_optimizer.py
-
-# Agent History
-Agent_History/
