@@ -31,7 +31,7 @@
 ## Documentation Updates
 - Rewrote `README.md` to describe the new backend split, the Python 3.14 `.venv` workflow, and the current training and inference commands.
 - Rewrote `CONTRIBUTING.md` to match the current repository structure, backend expectations, validation flow, and project rules.
-- Rewrote `Image_Identify_CNN.md` so it now documents the final Python 3.14 `.venv` decision, the backend layout, the PyTorch default path, and the full recommended training command.
+- Rewrote `Nix_Vision_Pro.md` so it now documents the final Python 3.14 `.venv` decision, the backend layout, the PyTorch default path, and the full recommended training command.
 - Reviewed `rulesForAgents.md` and `Agent_History/Always/Project_Final_Goal.md`; no content changes were needed because both already match the current project policy.
 
 ## Verification

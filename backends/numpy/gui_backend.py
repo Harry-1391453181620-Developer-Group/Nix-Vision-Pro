@@ -68,7 +68,7 @@ class InferenceApp:
         class_count_override: int | None,
     ) -> None:
         self.root = root
-        self.root.title("Image Identify CNN - Inference GUI")
+        self.root.title("Nix Vision Pro - Inference GUI")
         self.root.geometry("960x640")
 
         self.input_size = config.INPUT_SIZE

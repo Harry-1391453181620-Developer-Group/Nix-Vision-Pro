@@ -30,7 +30,7 @@ Added controlled augmentation, temporary backbone freeze, and multiphase LR trai
   - phase schedule validation
   - NumPy BN running-stat freeze behavior
   - PyTorch freeze -> unfreeze -> freeze transition behavior
-- Updated `README.md`, `Image_Identify_CNN.md`, and `CONTRIBUTING.md` to document the new runtime behavior.
+- Updated `README.md`, `Nix_Vision_Pro.md`, and `CONTRIBUTING.md` to document the new runtime behavior.
 
 ## Validation
 
@@ -48,8 +48,8 @@ Added controlled augmentation, temporary backbone freeze, and multiphase LR trai
 - Changed temporary freeze behavior from "until next phase" to a timed window controlled by `--freeze-epoch-num`, with default `10` epochs.
 - Added `--after-unfreeze-lr-change` as an additive LR decrement applied after unfreeze only when the resulting LR stays positive and does not go below the next phase start LR.
 - Increased training rotation range from `+-10°` to `+-12°` in the shared augmentation policy.
-- Updated `Image_Identify_CNN.md`, `README.md`, `CONTRIBUTING.md`, and the design note to document the new behavior.
-- Preserved the existing numeric values already present in the example training commands inside `Image_Identify_CNN.md` and only appended the new flags there.
+- Updated `Nix_Vision_Pro.md`, `README.md`, `CONTRIBUTING.md`, and the design note to document the new behavior.
+- Preserved the existing numeric values already present in the example training commands inside `Nix_Vision_Pro.md` and only appended the new flags there.
 
 ## Second follow-up update
 

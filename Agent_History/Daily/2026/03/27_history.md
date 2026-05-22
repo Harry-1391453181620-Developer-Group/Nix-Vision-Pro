@@ -35,7 +35,7 @@ Added configurable preprocessing strengths, random erasing, MixUp, focal loss, a
   - random-erasing mean fill
   - width-scaled stage-2 channel counts
   - forgiving checkpoint loading when width-scaled tensors differ
-- Updated `Image_Identify_CNN.md` and `README.md` to document the new behavior and example commands.
+- Updated `Nix_Vision_Pro.md` and `README.md` to document the new behavior and example commands.
 
 ## Validation
 
@@ -81,7 +81,7 @@ Enabled MixUp by default in both training backends, added `--mixup-alpha` with d
 - Added `validate_mixup_alpha()` to `utils/training.py` so invalid Beta parameters fail fast before training starts.
 - Updated `backends/torch/train_backend.py` and `backends/numpy/train_backend.py` so `--mixup` now defaults to enabled, `--mixup-alpha` is exposed on the CLI, and the validated alpha value drives the existing MixUp helper.
 - Extended `tests/test_mixup_focal_width.py` to cover valid and invalid `mixup_alpha` values.
-- Updated `README.md` and `Image_Identify_CNN.md` so the documented defaults and example commands match the trainer behavior.
+- Updated `README.md` and `Nix_Vision_Pro.md` so the documented defaults and example commands match the trainer behavior.
 - Wrote `Agent_History/docs/plans/2026-03-27-default-mixup-alpha-design.md` to capture the approved design delta for this follow-up change.
 
 ## Validation

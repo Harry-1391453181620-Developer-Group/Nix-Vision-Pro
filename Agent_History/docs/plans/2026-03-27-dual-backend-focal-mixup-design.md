@@ -204,7 +204,7 @@ Add or update focused tests for:
 
 After implementation:
 
-- update `Image_Identify_CNN.md`
+- update `Nix_Vision_Pro.md`
 - update `README.md`
 - append `Agent_History/Daily/2026/03/27_history.md`
 - commit the design doc first

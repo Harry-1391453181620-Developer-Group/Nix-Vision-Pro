@@ -31,7 +31,7 @@
 - Investigated why validation accuracy dropped from about `0.6` back toward `0.2` when training was restarted with only `--checkpoint`.
 - Confirmed the root cause in both training backends: `--checkpoint` only saved weights, while loading only happened when `--init-from` was passed, so the next run started from scratch.
 - Patched both `backends/torch/train_backend.py` and `backends/numpy/train_backend.py` to add `--resume / --no-resume` and automatically reuse the existing `--checkpoint` file when resuming is enabled and `--init-from` is not provided.
-- Updated `README.md` and `Image_Identify_CNN.md` to document the corrected checkpoint semantics.
+- Updated `README.md` and `Nix_Vision_Pro.md` to document the corrected checkpoint semantics.
 - Added `tests/test_train_resume.py` to lock the resume-path selection behavior.
 - Added `checkpoint_resume_debug_report.md` to record the issue, evidence, fix, and remaining limitation.
 

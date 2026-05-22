@@ -1,7 +1,7 @@
 IMPORTANT INSTRUCTIONS FOR PHASE ONE, BECAUSE OF TECHNOLOGICAL CHANHGES.
-Read files: D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\Agent_History\docs\plans\2026-04-30-phase1-omega-loss-implementation-plan.
-            D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\Agent_History\docs\plans\2026-4-24-FROM-USER-roadmap-after-4-24-VERY-IMPORTANT-GUIDE.txt
-            D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\smart.docx - 快捷方式.lnk (the file linked by this)
+Read files: D:\Programing_materials\Python\python_Projects\Nix_Vision_Pro\Agent_History\docs\plans\2026-04-30-phase1-omega-loss-implementation-plan.
+            D:\Programing_materials\Python\python_Projects\Nix_Vision_Pro\Agent_History\docs\plans\2026-4-24-FROM-USER-roadmap-after-4-24-VERY-IMPORTANT-GUIDE.txt
+            D:\Programing_materials\Python\python_Projects\Nix_Vision_Pro\smart.docx - 快捷方式.lnk (the file linked by this)
 You will find out that smart.docx is updated, and two new parts are added. It states that the IDSI can also be used at a part of the loss function. It is similar to L_fp, but L_fp is just doing static regularization, while L_IDSI is controlling the relative update instead of absolute update. This ensures that the model cannot produce fake stability by increasing hidden norm. More accurate information will be found in the docx file.
 The second part introduced the IDSI can be sliced into Layer-IDSI, for each layer, an IDSI can be calculated. So each layer cas its own IDSI and the final loss L_IDSI is transformed again.
 Introduce Phase1.2, a sub-step added in the Phase1: Add L_IDSI into the loss of this model, train_backends should have a new attribute: --idsi-lambda, default 0.005, new indicators should be plotted and recorded: IDSI mean, IDSI max, IDSI std, gradient norm, hidden norm. IDSI mean/max/std should be computed over the hidden-state fluctuation distribution of the current epoch after aggregation across batches.

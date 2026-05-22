@@ -1,6 +1,6 @@
 # You MUST FOLLOW EVERY INSTRUCTIONS IN THIS FILE
 
-1. Read this file, D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\Agent_History\docs\plans\2026-4-24-FROM-USER-roadmap-after-4-24-VERY-IMPORTANT-GUIDE.txt, and the file that D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\smart.docx - 快捷方式.lnk is pointing to.
+1. Read this file, D:\Programing_materials\Python\python_Projects\Nix_Vision_Pro\Agent_History\docs\plans\2026-4-24-FROM-USER-roadmap-after-4-24-VERY-IMPORTANT-GUIDE.txt, and the file that D:\Programing_materials\Python\python_Projects\Nix_Vision_Pro\smart.docx - 快捷方式.lnk is pointing to.
 
 2. Make sure that you understand everything explained is any files
 
@@ -8,7 +8,7 @@
 
 4. Despite a tiny attention block is added, the dataset remained unchanged.
 
-5. Also read D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\Agent_History\docs\plans\2026-05-14-phase1-2-layer-idsi-design.md to make sure that you understand what we did recently. But you don't need to follow the instructions in that file.
+5. Also read D:\Programing_materials\Python\python_Projects\Nix_Vision_Pro\Agent_History\docs\plans\2026-05-14-phase1-2-layer-idsi-design.md to make sure that you understand what we did recently. But you don't need to follow the instructions in that file.
 
 6. Preserve the current architecture while adding new ones.
 

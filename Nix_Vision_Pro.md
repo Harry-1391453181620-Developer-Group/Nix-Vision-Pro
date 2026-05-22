@@ -1,4 +1,4 @@
-# Image_Identify_CNN Training Guide
+# Nix Vision Pro Training Guide
 
 The project uses `PyTorch` as the default backend and keeps the original `NumPy` structure intact. The active architecture in both backends is a three-stage CNN + SE classifier with a flattened dense head.
 

@@ -1535,7 +1535,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.help_md:
-        md_path = Path(__file__).resolve().parents[2] / "Image_Identify_CNN.md"
+        md_path = Path(__file__).resolve().parents[2] / "Nix_Vision_Pro.md"
         try:
             print(md_path.read_text(encoding="utf-8"))
         except Exception as exc:

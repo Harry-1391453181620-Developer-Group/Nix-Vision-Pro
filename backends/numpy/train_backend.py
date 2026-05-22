@@ -98,7 +98,7 @@ if AdamWImpl is None:
 # One-time guards and Markdown help (-help java-style)
 install_dataset_write_guard()
 if any(arg == "-help" for arg in sys.argv[1:]):
-    md_path = Path(__file__).resolve().parents[2] / "Image_Identify_CNN.md"
+    md_path = Path(__file__).resolve().parents[2] / "Nix_Vision_Pro.md"
     try:
         text = md_path.read_text(encoding="utf-8")
     except Exception as e:
@@ -433,7 +433,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.help_md:
-        md_path = Path(__file__).resolve().parents[2] / "Image_Identify_CNN.md"
+        md_path = Path(__file__).resolve().parents[2] / "Nix_Vision_Pro.md"
         try:
             text = md_path.read_text(encoding="utf-8")
         except Exception as e:

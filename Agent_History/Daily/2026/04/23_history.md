@@ -36,7 +36,7 @@ Implemented checkpoint-compatible inference, the torch training runtime refactor
   - worker RNG seeding
   - torch AMP/scaler policy
   - torch batch-mix simplex preservation
-- Updated `README.md`, `Image_Identify_CNN.md`, `CONTRIBUTING.md`, and history references so active docs now point to `Agent_History/docs/plans/`.
+- Updated `README.md`, `Nix_Vision_Pro.md`, `CONTRIBUTING.md`, and history references so active docs now point to `Agent_History/docs/plans/`.
 
 ## Validation
 

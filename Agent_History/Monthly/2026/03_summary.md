@@ -52,7 +52,7 @@ This summary covers the recorded project work from 2026-03-23 through 2026-03-27
 
 ## Documentation And Process
 
-- `README.md`, `Image_Identify_CNN.md`, and `CONTRIBUTING.md` were repeatedly updated to match runtime behavior.
+- `README.md`, `Nix_Vision_Pro.md`, and `CONTRIBUTING.md` were repeatedly updated to match runtime behavior.
 - Daily histories were written for the active workdays in March.
 - Design notes were added under `Agent_History/docs/plans/` for major approved behavior changes.
 

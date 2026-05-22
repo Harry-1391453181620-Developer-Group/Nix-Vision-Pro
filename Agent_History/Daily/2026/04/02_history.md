@@ -20,7 +20,7 @@ Audited the whole repository, removed stale non-runtime code and tracked junk, f
 - Simplified `tests/test_dataset_guard.py` so it no longer requests the unused `tmp_path` fixture.
 - Reworked `tests/test_data.py` to use workspace-local temporary directories instead of `TemporaryDirectory()`.
 - Reworked `tests/test_runtime_class_config.py` to cover the supported dataset-driven config behavior only, after removing the stale dataset-builder utilities.
-- Updated `README.md`, `Image_Identify_CNN.md`, and `CONTRIBUTING.md` so they now describe:
+- Updated `README.md`, `Nix_Vision_Pro.md`, and `CONTRIBUTING.md` so they now describe:
   - training from the real `Dataset/` image tree
   - removal of stale synthetic/Wikimedia builder scripts
   - removal of the dead Mamba implementation

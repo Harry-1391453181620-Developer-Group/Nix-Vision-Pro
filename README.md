@@ -1,4 +1,4 @@
-# Image_Identify_CNN
+# Nix Vision Pro
 
 A Python 3.13.2 image classification project with two maintained backends:
 - `backends/torch/` is the default training and inference path.
