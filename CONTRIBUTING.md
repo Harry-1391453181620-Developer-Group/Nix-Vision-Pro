@@ -44,6 +44,7 @@ python -m pip install -r requirements.txt
 ## Dependencies
 
 The repository currently depends on:
+
 - `torch`
 - `numpy`
 - `pillow`
