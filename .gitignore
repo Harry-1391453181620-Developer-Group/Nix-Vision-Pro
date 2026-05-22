@@ -34,7 +34,11 @@ wheels/
 # Data and checkpoints
 data/raw/
 data/processed/
+checkpoints/
 *.pkl
+*.pt
+*.pth
+*.ckpt
 
 # IDE and OS
 .idea/
