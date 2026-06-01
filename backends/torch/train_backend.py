@@ -133,6 +133,18 @@ class RepresentationVarianceStats:
 
 
 @dataclass(frozen=True)
+class TokenDiversityStats:
+    token_variance: float
+    inter_token_variance: float
+    token_norm_mean: float
+    token_norm_min: float
+    token_norm_max: float
+    pairwise_cosine_similarity: float
+    pairwise_cosine_distance: float
+    collapse_score: float
+
+
+@dataclass(frozen=True)
 class IDSIDistributionStats:
     count: int
     total: float
@@ -176,6 +188,7 @@ class ForwardComponents:
     t_h: torch.Tensor | None
     layer_inputs: tuple[torch.Tensor, ...]
     layer_outputs: tuple[torch.Tensor, ...]
+    token_metric_tokens: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -187,6 +200,7 @@ class BatchLossComponents:
     logits: torch.Tensor
     h_stats: RepresentationVarianceStats
     idsi_metrics: IDSIMetrics
+    token_stats: TokenDiversityStats
 
 
 class EpochIDSIAggregator:
@@ -277,6 +291,64 @@ class EpochIDSIAggregator:
         )
 
 
+class EpochTokenStatsAggregator:
+    def __init__(self) -> None:
+        self.count = 0
+        self.token_variance = 0.0
+        self.inter_token_variance = 0.0
+        self.token_norm_mean = 0.0
+        self.token_norm_min = float("inf")
+        self.token_norm_max = -float("inf")
+        self.pairwise_cosine_similarity = 0.0
+        self.pairwise_cosine_distance = 0.0
+        self.collapse_score = 0.0
+
+    def update(self, stats: TokenDiversityStats) -> None:
+        if np.isnan(stats.token_variance):
+            return
+        self.count += 1
+        self.token_variance += float(stats.token_variance)
+        self.inter_token_variance += float(stats.inter_token_variance)
+        self.token_norm_mean += float(stats.token_norm_mean)
+        if not np.isnan(stats.token_norm_min):
+            self.token_norm_min = min(self.token_norm_min, float(stats.token_norm_min))
+        if not np.isnan(stats.token_norm_max):
+            self.token_norm_max = max(self.token_norm_max, float(stats.token_norm_max))
+        if not np.isnan(stats.pairwise_cosine_similarity):
+            self.pairwise_cosine_similarity += float(stats.pairwise_cosine_similarity)
+        if not np.isnan(stats.pairwise_cosine_distance):
+            self.pairwise_cosine_distance += float(stats.pairwise_cosine_distance)
+        if not np.isnan(stats.collapse_score):
+            self.collapse_score += float(stats.collapse_score)
+
+    def summary(self, prefix: str) -> dict[str, float]:
+        if self.count <= 0:
+            return {
+                f"{prefix}_token_variance": float("nan"),
+                f"{prefix}_inter_token_variance": float("nan"),
+                f"{prefix}_token_norm_mean": float("nan"),
+                f"{prefix}_token_norm_min": float("nan"),
+                f"{prefix}_token_norm_max": float("nan"),
+                f"{prefix}_token_pairwise_cosine_similarity": float("nan"),
+                f"{prefix}_token_pairwise_cosine_distance": float("nan"),
+                f"{prefix}_token_collapse_score": float("nan"),
+            }
+        return {
+            f"{prefix}_token_variance": float(self.token_variance / self.count),
+            f"{prefix}_inter_token_variance": float(self.inter_token_variance / self.count),
+            f"{prefix}_token_norm_mean": float(self.token_norm_mean / self.count),
+            f"{prefix}_token_norm_min": float(self.token_norm_min),
+            f"{prefix}_token_norm_max": float(self.token_norm_max),
+            f"{prefix}_token_pairwise_cosine_similarity": float(
+                self.pairwise_cosine_similarity / self.count
+            ),
+            f"{prefix}_token_pairwise_cosine_distance": float(
+                self.pairwise_cosine_distance / self.count
+            ),
+            f"{prefix}_token_collapse_score": float(self.collapse_score / self.count),
+        }
+
+
 def _validate_omega_args(
     *,
     omega_loss: bool,
@@ -300,6 +372,34 @@ def _validate_omega_args(
     if omega_lambda > 0.0 and not omega_loss:
         raise ValueError("omega_lambda > 0 requires --omega-loss")
     return omega_lambda, idsi_lambda, omega_projector_depth, omega_hidden_dim
+
+
+def _validate_token_args(
+    *,
+    token_dim: int,
+    transformer_depth: int,
+    attention_heads: int,
+    transformer_mlp_ratio: float,
+    token_dropout: float,
+) -> tuple[int, int, int, float, float]:
+    token_dim = int(token_dim)
+    transformer_depth = int(transformer_depth)
+    attention_heads = int(attention_heads)
+    transformer_mlp_ratio = float(transformer_mlp_ratio)
+    token_dropout = float(token_dropout)
+    if token_dim <= 0:
+        raise ValueError("token_dim must be > 0")
+    if transformer_depth <= 0:
+        raise ValueError("transformer_depth must be > 0")
+    if attention_heads <= 0:
+        raise ValueError("attention_heads must be > 0")
+    if token_dim % attention_heads != 0:
+        raise ValueError("attention_heads must divide token_dim")
+    if transformer_mlp_ratio <= 0.0:
+        raise ValueError("transformer_mlp_ratio must be > 0")
+    if not (0.0 <= token_dropout < 1.0):
+        raise ValueError("token_dropout must satisfy 0 <= value < 1")
+    return token_dim, transformer_depth, attention_heads, transformer_mlp_ratio, token_dropout
 
 
 def _format_run_value(value: float) -> str:
@@ -443,11 +543,64 @@ def _prepare_experiment_artifacts(
 def _extract_representation_variance_stats(h: torch.Tensor | None) -> RepresentationVarianceStats:
     if h is None:
         return RepresentationVarianceStats(mean=float("nan"), min=float("nan"), max=float("nan"))
-    variance = torch.var(h.detach().float(), dim=0, unbiased=False)
+    value = h.detach().float()
+    if value.ndim > 2:
+        value = value.reshape(value.shape[0], -1)
+    variance = torch.var(value, dim=0, unbiased=False)
     return RepresentationVarianceStats(
         mean=float(variance.mean().item()),
         min=float(variance.min().item()),
         max=float(variance.max().item()),
+    )
+
+
+def _empty_token_diversity_stats() -> TokenDiversityStats:
+    return TokenDiversityStats(
+        token_variance=float("nan"),
+        inter_token_variance=float("nan"),
+        token_norm_mean=float("nan"),
+        token_norm_min=float("nan"),
+        token_norm_max=float("nan"),
+        pairwise_cosine_similarity=float("nan"),
+        pairwise_cosine_distance=float("nan"),
+        collapse_score=float("nan"),
+    )
+
+
+def _extract_token_diversity_stats(tokens: torch.Tensor | None) -> TokenDiversityStats:
+    if tokens is None or tokens.ndim != 3:
+        return _empty_token_diversity_stats()
+    value = tokens.detach().float()
+    token_variance = torch.var(value, unbiased=False)
+    inter_token_variance = torch.var(value, dim=1, unbiased=False).mean()
+    norms = torch.linalg.vector_norm(value, dim=-1)
+    if value.shape[1] < 2:
+        pairwise_similarity = torch.tensor(float("nan"), device=value.device)
+    else:
+        normalized = F.normalize(value, p=2, dim=-1, eps=1e-8)
+        cosine = torch.bmm(normalized, normalized.transpose(1, 2))
+        token_count = value.shape[1]
+        off_diagonal = ~torch.eye(token_count, dtype=torch.bool, device=value.device).unsqueeze(0)
+        pairwise_similarity = cosine.masked_select(off_diagonal).mean()
+    pairwise_similarity_float = float(pairwise_similarity.item())
+    pairwise_distance = (
+        1.0 - pairwise_similarity_float
+        if not np.isnan(pairwise_similarity_float)
+        else float("nan")
+    )
+    collapse_score = float(
+        float(inter_token_variance.item()) < 1e-6
+        or (not np.isnan(pairwise_similarity_float) and pairwise_similarity_float > 0.98)
+    )
+    return TokenDiversityStats(
+        token_variance=float(token_variance.item()),
+        inter_token_variance=float(inter_token_variance.item()),
+        token_norm_mean=float(norms.mean().item()),
+        token_norm_min=float(norms.min().item()),
+        token_norm_max=float(norms.max().item()),
+        pairwise_cosine_similarity=pairwise_similarity_float,
+        pairwise_cosine_distance=pairwise_distance,
+        collapse_score=collapse_score,
     )
 
 
@@ -552,15 +705,19 @@ def _resolve_forward_output(
     *,
     omega_enabled: bool,
 ) -> ForwardComponents:
-    if not omega_enabled:
-        if isinstance(forward_output, tuple):
-            return ForwardComponents(forward_output[0], None, None, (), ())
-        return ForwardComponents(forward_output, None, None, (), ())
+    if not isinstance(forward_output, tuple):
+        return ForwardComponents(forward_output, None, None, (), (), None)
+    if not omega_enabled and len(forward_output) == 1:
+        return ForwardComponents(forward_output[0], None, None, (), (), None)
+    if not omega_enabled and len(forward_output) == 2:
+        logits, h = forward_output
+        return ForwardComponents(logits, h, None, (), (), None)
     if not isinstance(forward_output, tuple):
         raise ValueError("Omega-enabled forward path must return tuple outputs")
     if len(forward_output) == 3:
         logits, h, t_h = forward_output
-        return ForwardComponents(logits, h, t_h, (), ())
+        token_metric_tokens = t_h if isinstance(t_h, torch.Tensor) and t_h.ndim == 3 else None
+        return ForwardComponents(logits, h, t_h, (), (), token_metric_tokens)
     if len(forward_output) == 5:
         logits, h, t_h, layer_inputs, layer_outputs = forward_output
         return ForwardComponents(
@@ -569,6 +726,17 @@ def _resolve_forward_output(
             t_h=t_h,
             layer_inputs=tuple(layer_inputs),
             layer_outputs=tuple(layer_outputs),
+            token_metric_tokens=t_h if isinstance(t_h, torch.Tensor) and t_h.ndim == 3 else None,
+        )
+    if len(forward_output) == 6:
+        logits, h, t_h, layer_inputs, layer_outputs, token_metric_tokens = forward_output
+        return ForwardComponents(
+            logits=logits,
+            h=h,
+            t_h=t_h,
+            layer_inputs=tuple(layer_inputs),
+            layer_outputs=tuple(layer_outputs),
+            token_metric_tokens=token_metric_tokens,
         )
     raise ValueError("Omega-enabled forward path must return (logits, h, T(h)) or Layer-IDSI outputs")
 
@@ -578,7 +746,12 @@ def _select_forward_callable(
     *,
     omega_enabled: bool,
     idsi_enabled: bool,
+    token_metrics_enabled: bool = False,
 ) -> Callable[[torch.Tensor], Any]:
+    if model.tokenize:
+        if omega_enabled or idsi_enabled or token_metrics_enabled:
+            return model.forward_with_token_dynamics_and_layer_idsi
+        return model
     if omega_enabled and idsi_enabled:
         return model.forward_with_omega_and_layer_idsi
     if omega_enabled:
@@ -862,22 +1035,17 @@ def _compute_total_loss_components(
         ce_class_weights=ce_class_weights,
         focal_alpha_weights=focal_alpha_weights,
     )
-    if not omega_enabled:
-        zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
-        return BatchLossComponents(
-            total_loss=ce_loss,
-            ce_loss=ce_loss,
-            attr_loss=zero,
-            idsi_loss=zero,
-            logits=logits,
-            h_stats=_extract_representation_variance_stats(None),
-            idsi_metrics=_empty_idsi_metrics(device=logits.device, dtype=logits.dtype),
-        )
-
+    zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
     h = components.h
     t_h = components.t_h
-    assert h is not None and t_h is not None
-    attr_loss = torch.mean(torch.square(h - t_h))
+    if omega_enabled:
+        if h is None or t_h is None:
+            raise ValueError("Omega-enabled forward path must provide h and T(h)")
+        attr_target = t_h.detach() if h.ndim == 3 else t_h
+        attr_loss = torch.mean(torch.square(h - attr_target))
+    else:
+        attr_loss = zero
+
     if components.layer_inputs:
         layer_names = tuple(
             idsi_layer_names
@@ -889,7 +1057,7 @@ def _compute_total_loss_components(
             components.layer_inputs,
             components.layer_outputs,
         )
-    else:
+    elif h is not None and t_h is not None:
         if float(idsi_lambda) > 0.0:
             raise ValueError("idsi_lambda > 0 requires forward_with_omega_and_layer_idsi outputs")
         idsi_metrics = _compute_idsi_metrics_from_pairs(("classifier_pre_head",), (h,), (t_h,))
@@ -901,15 +1069,21 @@ def _compute_total_loss_components(
             hidden_norm_total=idsi_metrics.hidden_norm_total,
             hidden_norm_count=idsi_metrics.hidden_norm_count,
         )
+    else:
+        if float(idsi_lambda) > 0.0:
+            raise ValueError("idsi_lambda > 0 requires Layer-IDSI forward outputs")
+        idsi_metrics = _empty_idsi_metrics(device=logits.device, dtype=logits.dtype)
+    idsi_loss = idsi_metrics.loss if components.layer_inputs else zero
     total_loss = ce_loss + (float(omega_lambda) * attr_loss) + (float(idsi_lambda) * idsi_metrics.loss)
     return BatchLossComponents(
         total_loss=total_loss,
         ce_loss=ce_loss,
         attr_loss=attr_loss,
-        idsi_loss=idsi_metrics.loss,
+        idsi_loss=idsi_loss,
         logits=logits,
         h_stats=_extract_representation_variance_stats(h),
         idsi_metrics=idsi_metrics,
+        token_stats=_extract_token_diversity_stats(components.token_metric_tokens),
     )
 
 
@@ -1177,6 +1351,7 @@ def _maybe_enable_compiled_forward_model(
     omega_lambda: float,
     idsi_enabled: bool,
     idsi_lambda: float,
+    token_metrics_enabled: bool,
     grad_clip: float,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -1197,7 +1372,12 @@ def _maybe_enable_compiled_forward_model(
     if args.compile_mode == "on":
         try:
             compiled = torch.compile(
-                _select_forward_callable(model, omega_enabled=omega_enabled, idsi_enabled=idsi_enabled)
+                _select_forward_callable(
+                    model,
+                    omega_enabled=omega_enabled,
+                    idsi_enabled=idsi_enabled,
+                    token_metrics_enabled=token_metrics_enabled,
+                )
             )
             print("Enabled torch.compile (--compile-mode=on).")
             return compiled
@@ -1220,6 +1400,7 @@ def _maybe_enable_compiled_forward_model(
                 eager_model,
                 omega_enabled=omega_enabled,
                 idsi_enabled=idsi_enabled,
+                token_metrics_enabled=token_metrics_enabled,
             ),
             raw_model=eager_model,
             optimizer=eager_optimizer,
@@ -1236,7 +1417,7 @@ def _maybe_enable_compiled_forward_model(
             omega_lambda=omega_lambda,
             idsi_enabled=idsi_enabled,
             idsi_lambda=idsi_lambda,
-            idsi_layer_names=eager_model.idsi_layer_names if idsi_enabled else None,
+            idsi_layer_names=eager_model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
             grad_clip=grad_clip,
             device=device,
             amp_dtype=amp_dtype,
@@ -1250,6 +1431,7 @@ def _maybe_enable_compiled_forward_model(
                 compiled_model,
                 omega_enabled=omega_enabled,
                 idsi_enabled=idsi_enabled,
+                token_metrics_enabled=token_metrics_enabled,
             )
         )
         compiled_optimizer = _build_optimizer(args, compiled_model, lr_value=benchmark_lr)
@@ -1271,7 +1453,7 @@ def _maybe_enable_compiled_forward_model(
             omega_lambda=omega_lambda,
             idsi_enabled=idsi_enabled,
             idsi_lambda=idsi_lambda,
-            idsi_layer_names=compiled_model.idsi_layer_names if idsi_enabled else None,
+            idsi_layer_names=compiled_model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
             grad_clip=grad_clip,
             device=device,
             amp_dtype=amp_dtype,
@@ -1287,7 +1469,12 @@ def _maybe_enable_compiled_forward_model(
             return None
 
         live_compiled_forward = torch.compile(
-            _select_forward_callable(model, omega_enabled=omega_enabled, idsi_enabled=idsi_enabled)
+            _select_forward_callable(
+                model,
+                omega_enabled=omega_enabled,
+                idsi_enabled=idsi_enabled,
+                token_metrics_enabled=token_metrics_enabled,
+            )
         )
         print(
             f"Enabled torch.compile: eager median step {eager_time:.6f}s, "
@@ -1327,6 +1514,14 @@ def evaluate_loader(
             "val_h_var_mean": float("nan"),
             "val_h_var_min": float("nan"),
             "val_h_var_max": float("nan"),
+            "val_token_variance": float("nan"),
+            "val_inter_token_variance": float("nan"),
+            "val_token_norm_mean": float("nan"),
+            "val_token_norm_min": float("nan"),
+            "val_token_norm_max": float("nan"),
+            "val_token_pairwise_cosine_similarity": float("nan"),
+            "val_token_pairwise_cosine_distance": float("nan"),
+            "val_token_collapse_score": float("nan"),
             "IDSI": float("nan"),
         }
     total_loss = 0.0
@@ -1339,6 +1534,7 @@ def evaluate_loader(
     total_h_var_max = 0.0
     total_idsi = 0.0
     total_idsi_count = 0
+    token_stats_agg = EpochTokenStatsAggregator()
     num_batches = 0
     model.eval()
     with torch.no_grad():
@@ -1375,12 +1571,13 @@ def evaluate_loader(
             total_h_var_mean += h_stats.mean
             total_h_var_min += h_stats.min
             total_h_var_max += h_stats.max
+            token_stats_agg.update(loss_components.token_stats)
             idsi_stats = loss_components.idsi_metrics.global_stats
             if idsi_stats.count > 0:
                 total_idsi += idsi_stats.total
                 total_idsi_count += idsi_stats.count
             num_batches += 1
-    return {
+    metrics = {
         "loss_total": total_loss / max(1, num_batches),
         "loss_ce": total_ce_loss / max(1, num_batches),
         "loss_attr": total_attr_loss / max(1, num_batches),
@@ -1391,6 +1588,8 @@ def evaluate_loader(
         "val_h_var_max": total_h_var_max / max(1, num_batches),
         "IDSI": total_idsi / max(1, total_idsi_count) if total_idsi_count > 0 else float("nan"),
     }
+    metrics.update(token_stats_agg.summary("val"))
+    return metrics
 
 
 def load_weights_forgiving(model: TorchCNN, checkpoint_path: str | Path, skip_prefixes: tuple[str, ...] = ("fc2.",)) -> tuple[list[str], list[str]]:
@@ -1511,6 +1710,18 @@ def main() -> None:
     parser.add_argument("--idsi-lambda", type=float, default=0.005, help="Weight applied to the Phase 1.2 Layer-IDSI loss when --omega-loss is enabled")
     parser.add_argument("--omega-projector-depth", type=int, default=1, help="Omega projector depth: 1 or 2 linear layers")
     parser.add_argument("--omega-hidden-dim", type=int, default=DEFAULT_OMEGA_FEATURE_DIM, help="Hidden width for the 2-layer Omega projector")
+    parser.add_argument("--tokenize", action=argparse.BooleanOptionalAction, default=False, help="Enable Phase2 tokenized feature representation")
+    parser.add_argument("--token-dim", type=int, default=128, help="Token embedding dimension for Phase2")
+    parser.add_argument("--transformer-depth", type=int, default=1, help="Number of lightweight transformer blocks")
+    parser.add_argument("--attention-heads", type=int, default=4, help="Attention head count for token transformer")
+    parser.add_argument("--transformer-mlp-ratio", type=float, default=2.0, help="Expansion ratio for transformer FFN")
+    parser.add_argument("--token-pool", choices=["mean", "cls"], default="mean", help="Pooling strategy for token classification")
+    parser.add_argument("--token-positional-encoding", choices=["none", "learned", "sinusoidal"], default="learned", help="Positional encoding type for tokens")
+    parser.add_argument("--token-dropout", type=float, default=0.1, help="Dropout inside transformer token block")
+    parser.add_argument("--transformer-layernorm", choices=["pre", "post"], default="pre", help="Transformer LayerNorm placement")
+    parser.add_argument("--token-omega-loss", action=argparse.BooleanOptionalAction, default=True, help="Apply Omega loss in token space")
+    parser.add_argument("--token-idsi", action=argparse.BooleanOptionalAction, default=True, help="Enable Layer-IDSI monitoring for token transformer")
+    parser.add_argument("--token-diversity-monitor", action=argparse.BooleanOptionalAction, default=True, help="Track token diversity metrics")
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True, help="If true, stream batches from disk; if false, preload all images into memory.")
     parser.add_argument("--amp-mode", choices=["auto", "on", "off"], default="auto", help="AMP policy for CUDA training")
@@ -1572,6 +1783,13 @@ def main() -> None:
             omega_projector_depth=args.omega_projector_depth,
             omega_hidden_dim=args.omega_hidden_dim,
         )
+        token_dim, transformer_depth, attention_heads, transformer_mlp_ratio, token_dropout = _validate_token_args(
+            token_dim=args.token_dim,
+            transformer_depth=args.transformer_depth,
+            attention_heads=args.attention_heads,
+            transformer_mlp_ratio=args.transformer_mlp_ratio,
+            token_dropout=args.token_dropout,
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -1581,7 +1799,15 @@ def main() -> None:
     device = _resolve_device(args.device)
     amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
     use_channels_last = _configure_runtime_kernels(device, fixed_input_shape=True)
-    idsi_enabled = bool(args.omega_loss and idsi_lambda > 0.0)
+    omega_enabled = bool(args.omega_loss and (not args.tokenize or args.token_omega_loss))
+    token_metrics_enabled = bool(args.tokenize and args.token_diversity_monitor)
+    idsi_enabled = bool(
+        idsi_lambda > 0.0
+        and (
+            (bool(args.omega_loss) and not args.tokenize)
+            or (bool(args.tokenize) and bool(args.token_idsi))
+        )
+    )
 
     data_dir = Path(args.data_dir) if args.data_dir else Path(config.DATA_DIR)
     data_dir = data_dir.resolve()
@@ -1706,15 +1932,29 @@ def main() -> None:
         seed=args.seed,
         dropout_p=args.dropout,
         width_scale=width_scale,
-        omega_enabled=bool(args.omega_loss),
+        omega_enabled=bool(args.omega_loss and not args.tokenize),
         omega_projector_depth=omega_projector_depth,
         omega_hidden_dim=omega_hidden_dim,
+        tokenize=bool(args.tokenize),
+        token_dim=token_dim,
+        transformer_depth=transformer_depth,
+        attention_heads=attention_heads,
+        transformer_mlp_ratio=transformer_mlp_ratio,
+        token_pool=args.token_pool,
+        token_positional_encoding=args.token_positional_encoding,
+        token_dropout=token_dropout,
+        transformer_layernorm=args.transformer_layernorm,
     )
     if use_channels_last:
         model.to(device=device, memory_format=torch.channels_last)
     else:
         model.to(device=device)
     print(f"Using stage2_channels={model.stage2_channels} (width_scale={model.width_scale:.3f})")
+    if model.tokenize:
+        print(
+            f"Using Phase2 tokens: grid={model.token_grid_size[0]}x{model.token_grid_size[1]} "
+            f"dim={model.token_dim} depth={model.transformer_depth} heads={model.attention_heads}"
+        )
     if args.init_from:
         try:
             model.load_weights(args.init_from, map_location=device)
@@ -1767,10 +2007,11 @@ def main() -> None:
         focal_gamma=focal_gamma,
         ce_class_weights=ce_class_weights,
         focal_alpha_weights=focal_alpha_weights,
-        omega_enabled=bool(args.omega_loss),
+        omega_enabled=omega_enabled,
         omega_lambda=omega_lambda,
         idsi_enabled=idsi_enabled,
         idsi_lambda=idsi_lambda,
+        token_metrics_enabled=token_metrics_enabled,
         grad_clip=float(args.grad_clip),
         device=device,
         amp_dtype=amp_dtype,
@@ -1785,9 +2026,18 @@ def main() -> None:
             seed=args.seed,
             dropout_p=args.dropout,
             width_scale=width_scale,
-            omega_enabled=bool(args.omega_loss),
+            omega_enabled=bool(args.omega_loss and not args.tokenize),
             omega_projector_depth=omega_projector_depth,
             omega_hidden_dim=omega_hidden_dim,
+            tokenize=bool(args.tokenize),
+            token_dim=token_dim,
+            transformer_depth=transformer_depth,
+            attention_heads=attention_heads,
+            transformer_mlp_ratio=transformer_mlp_ratio,
+            token_pool=args.token_pool,
+            token_positional_encoding=args.token_positional_encoding,
+            token_dropout=token_dropout,
+            transformer_layernorm=args.transformer_layernorm,
         )
         if use_channels_last:
             ema_model.to(device=device, memory_format=torch.channels_last)
@@ -1808,7 +2058,7 @@ def main() -> None:
     experiment_config_path: Path | None = None
     experiment_metrics_path: Path | None = None
     experiment_summary_path: Path | None = None
-    tracking_enabled = bool(args.omega_loss or args.plot_once or args.plot_real_time)
+    tracking_enabled = bool(args.omega_loss or args.tokenize or args.plot_once or args.plot_real_time)
     plot_requested = bool(args.plot_once or args.plot_real_time)
     plot_output_dir = _plot_output_dir_arg(args.plot_output_dir)
     metric_plotter: Any | None = None
@@ -1819,7 +2069,7 @@ def main() -> None:
             checkpoint_path=Path(args.checkpoint),
             seed=args.seed,
             omega_lambda=omega_lambda,
-            idsi_lambda=idsi_lambda if bool(args.omega_loss) else 0.0,
+            idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
         )
         if experiment_config_path is None or experiment_metrics_path is None:
             raise RuntimeError("run tracking artifact paths were not initialized")
@@ -1832,13 +2082,23 @@ def main() -> None:
                 "resolved_class_names": list(resolved_class_names),
                 "resolved_width_scale": float(width_scale),
                 "resolved_stage2_channels": int(model.stage2_channels),
-                "omega_enabled": bool(args.omega_loss),
+                "omega_enabled": bool(omega_enabled),
                 "omega_lambda": float(omega_lambda),
                 "idsi_enabled": bool(idsi_enabled),
                 "idsi_lambda": float(idsi_lambda),
-                "idsi_layer_names": list(model.idsi_layer_names if idsi_enabled else ()),
+                "idsi_layer_names": list(model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else ()),
                 "omega_projector_depth": int(omega_projector_depth),
                 "omega_hidden_dim": int(omega_hidden_dim),
+                "tokenize": bool(model.tokenize),
+                "token_dim": int(model.token_dim),
+                "transformer_depth": int(model.transformer_depth),
+                "attention_heads": int(model.attention_heads),
+                "transformer_mlp_ratio": float(model.transformer_mlp_ratio),
+                "token_pool": model.token_pool,
+                "token_positional_encoding": model.token_positional_encoding,
+                "token_dropout": float(model.token_dropout_p),
+                "transformer_layernorm": model.transformer_layernorm,
+                "token_diversity_monitor": bool(token_metrics_enabled),
                 "checkpoint_path": str(Path(args.checkpoint).resolve()),
                 "metrics_path": str(experiment_metrics_path.resolve()),
             },
@@ -1886,6 +2146,7 @@ def main() -> None:
         epoch_h_var_min = float("inf")
         epoch_h_var_max = -float("inf")
         epoch_idsi_metrics = EpochIDSIAggregator()
+        epoch_token_stats = EpochTokenStatsAggregator()
         epoch_gradient_norm = 0.0
         epoch_gradient_norm_count = 0
 
@@ -1950,8 +2211,9 @@ def main() -> None:
             else:
                 forward_callable = _select_forward_callable(
                     model,
-                    omega_enabled=bool(args.omega_loss),
+                    omega_enabled=omega_enabled,
                     idsi_enabled=idsi_enabled,
+                    token_metrics_enabled=token_metrics_enabled,
                 )
             with _make_autocast_context(device, amp_dtype):
                 batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
@@ -1959,10 +2221,10 @@ def main() -> None:
                 loss_components = _compute_total_loss_components(
                     forward_output,
                     target_distribution,
-                    omega_enabled=bool(args.omega_loss),
+                    omega_enabled=omega_enabled,
                     omega_lambda=omega_lambda,
                     idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
-                    idsi_layer_names=model.idsi_layer_names if idsi_enabled else None,
+                    idsi_layer_names=model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
                     use_focal_loss=batch_use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
@@ -1989,6 +2251,7 @@ def main() -> None:
             epoch_attr_loss += float(loss_components.attr_loss.item())
             epoch_idsi_loss += float(loss_components.idsi_loss.item())
             epoch_idsi_metrics.update(loss_components.idsi_metrics)
+            epoch_token_stats.update(loss_components.token_stats)
             metric_targets = torch.argmax(target_distribution, dim=1)
             epoch_correct += int((torch.argmax(logits, dim=1) == metric_targets).sum().item())
             epoch_h_var_mean += h_stats.mean
@@ -2006,6 +2269,7 @@ def main() -> None:
         train_h_var_min = epoch_h_var_min if epoch_h_var_min != float("inf") else float("nan")
         train_h_var_max = epoch_h_var_max if epoch_h_var_max != -float("inf") else float("nan")
         train_idsi_summary = epoch_idsi_metrics.summary()
+        train_token_summary = epoch_token_stats.summary("train")
         train_idsi = float(train_idsi_summary["IDSI"])
         train_gradient_norm = (
             epoch_gradient_norm / epoch_gradient_norm_count
@@ -2022,8 +2286,9 @@ def main() -> None:
             else:
                 eval_forward_callable = _select_forward_callable(
                     cast(TorchCNN, eval_model),
-                    omega_enabled=bool(args.omega_loss),
+                    omega_enabled=omega_enabled,
                     idsi_enabled=idsi_enabled,
+                    token_metrics_enabled=token_metrics_enabled,
                 )
             val_metrics = evaluate_loader(
                 eval_model,
@@ -2037,10 +2302,10 @@ def main() -> None:
                 focal_gamma=focal_gamma,
                 ce_class_weights=ce_class_weights,
                 focal_alpha_weights=focal_alpha_weights,
-                omega_enabled=bool(args.omega_loss),
+                omega_enabled=omega_enabled,
                 omega_lambda=omega_lambda,
                 idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
-                idsi_layer_names=model.idsi_layer_names if idsi_enabled else None,
+                idsi_layer_names=model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
             )
             val_loss = val_metrics["loss_total"]
             val_acc = val_metrics["acc"]
@@ -2138,12 +2403,25 @@ def main() -> None:
                 "val_h_var_mean": float(val_metrics["val_h_var_mean"]),
                 "val_h_var_min": float(val_metrics["val_h_var_min"]),
                 "val_h_var_max": float(val_metrics["val_h_var_max"]),
+                "val_token_variance": float(val_metrics["val_token_variance"]),
+                "val_inter_token_variance": float(val_metrics["val_inter_token_variance"]),
+                "val_token_norm_mean": float(val_metrics["val_token_norm_mean"]),
+                "val_token_norm_min": float(val_metrics["val_token_norm_min"]),
+                "val_token_norm_max": float(val_metrics["val_token_norm_max"]),
+                "val_token_pairwise_cosine_similarity": float(
+                    val_metrics["val_token_pairwise_cosine_similarity"]
+                ),
+                "val_token_pairwise_cosine_distance": float(
+                    val_metrics["val_token_pairwise_cosine_distance"]
+                ),
+                "val_token_collapse_score": float(val_metrics["val_token_collapse_score"]),
                 "IDSI": float(train_idsi),
                 "gradient_norm": float(train_gradient_norm),
                 "improved": bool(improved),
             }
             final_epoch_metrics.update(train_idsi_summary)
-            if args.omega_loss:
+            final_epoch_metrics.update(train_token_summary)
+            if omega_enabled:
                 collapse_low_variance_epochs = (
                     collapse_low_variance_epochs + 1
                     if train_h_var_mean < OMEGA_COLLAPSE_VARIANCE_THRESHOLD
@@ -2151,6 +2429,10 @@ def main() -> None:
                 )
                 final_epoch_metrics["representation_collapse_warning"] = bool(
                     collapse_low_variance_epochs >= OMEGA_COLLAPSE_EPOCHS
+                )
+            if token_metrics_enabled:
+                final_epoch_metrics["token_collapse_warning"] = bool(
+                    train_token_summary["train_token_collapse_score"] >= 0.5
                 )
             if tracking_enabled:
                 _record_epoch_metrics(
@@ -2208,12 +2490,21 @@ def main() -> None:
                 "val_h_var_mean": float("nan"),
                 "val_h_var_min": float("nan"),
                 "val_h_var_max": float("nan"),
+                "val_token_variance": float("nan"),
+                "val_inter_token_variance": float("nan"),
+                "val_token_norm_mean": float("nan"),
+                "val_token_norm_min": float("nan"),
+                "val_token_norm_max": float("nan"),
+                "val_token_pairwise_cosine_similarity": float("nan"),
+                "val_token_pairwise_cosine_distance": float("nan"),
+                "val_token_collapse_score": float("nan"),
                 "IDSI": float(train_idsi),
                 "gradient_norm": float(train_gradient_norm),
                 "improved": False,
             }
             final_epoch_metrics.update(train_idsi_summary)
-            if args.omega_loss:
+            final_epoch_metrics.update(train_token_summary)
+            if omega_enabled:
                 collapse_low_variance_epochs = (
                     collapse_low_variance_epochs + 1
                     if train_h_var_mean < OMEGA_COLLAPSE_VARIANCE_THRESHOLD
@@ -2221,6 +2512,10 @@ def main() -> None:
                 )
                 final_epoch_metrics["representation_collapse_warning"] = bool(
                     collapse_low_variance_epochs >= OMEGA_COLLAPSE_EPOCHS
+                )
+            if token_metrics_enabled:
+                final_epoch_metrics["token_collapse_warning"] = bool(
+                    train_token_summary["train_token_collapse_score"] >= 0.5
                 )
             if tracking_enabled:
                 _record_epoch_metrics(
@@ -2259,9 +2554,19 @@ def main() -> None:
                 "omega_lambda": float(omega_lambda),
                 "idsi_lambda": float(idsi_lambda),
                 "idsi_enabled": bool(idsi_enabled),
-                "idsi_layer_names": list(model.idsi_layer_names if idsi_enabled else ()),
+                "idsi_layer_names": list(model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else ()),
                 "omega_projector_depth": int(omega_projector_depth),
                 "omega_hidden_dim": int(omega_hidden_dim),
+                "tokenize": bool(model.tokenize),
+                "token_dim": int(model.token_dim),
+                "transformer_depth": int(model.transformer_depth),
+                "attention_heads": int(model.attention_heads),
+                "transformer_mlp_ratio": float(model.transformer_mlp_ratio),
+                "token_pool": model.token_pool,
+                "token_positional_encoding": model.token_positional_encoding,
+                "token_dropout": float(model.token_dropout_p),
+                "transformer_layernorm": model.transformer_layernorm,
+                "token_diversity_monitor": bool(token_metrics_enabled),
                 "contraction_is_empirical": True,
                 "plot_requested": bool(plot_requested),
                 "plot_mode": "real_time" if args.plot_real_time else ("once" if args.plot_once else "none"),

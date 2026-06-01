@@ -19,6 +19,13 @@ Both backends now use:
 - Stage 3: `Conv(round(64*scale)->128) -> BN -> ReLU -> Conv(128->128) -> BN -> ReLU -> SE(128) -> MaxPool`
 - Head: `Flatten -> FC(256) -> ReLU -> Dropout(0.5) -> FC(num_classes)`
 
+The PyTorch backend can optionally enable Phase 2 tokenized dynamics with `--tokenize`:
+- the CNN remains the primary representation extractor
+- the final CNN feature map is reduced to a lightweight token grid when needed, then reshaped into spatial tokens
+- a lightweight projection maps tokens to `--token-dim`
+- one shallow residual transformer dynamics block is used by default
+- the classifier uses mean-pooled tokens by default, with CLS pooling kept only for ablation
+
 Width scaling is controlled by `--model-width-scale`.
 
 - default `0.75` gives stage-2 width `48`
@@ -142,6 +149,32 @@ When `--omega-loss` is enabled, the trainer writes structured run artifacts unde
 - `qualitative_notes.txt`
 
 The metrics include total loss, CE loss, attractor loss, Layer-IDSI loss, accuracy, generalization gap, representation-variance diagnostics, global/layer IDSI distribution summaries, gradient norm, and hidden norm.
+
+### Phase 2 Tokenized Dynamics
+
+The torch backend supports the Phase 2 transition architecture through:
+
+- `--tokenize / --no-tokenize`
+- `--token-dim`
+- `--transformer-depth`
+- `--attention-heads`
+- `--transformer-mlp-ratio`
+- `--token-pool {mean,cls}`
+- `--token-positional-encoding {none,learned,sinusoidal}`
+- `--token-dropout`
+- `--transformer-layernorm {pre,post}`
+- `--token-omega-loss / --no-token-omega-loss`
+- `--token-idsi / --no-token-idsi`
+- `--token-diversity-monitor / --no-token-diversity-monitor`
+
+Policy details:
+- tokenization is off by default, so Phase 1/1.2 commands stay valid
+- the default token path uses `token_dim=128`, `transformer_depth=1`, `attention_heads=4`, and `transformer_mlp_ratio=2.0`
+- if the final CNN feature map would create more than 64 spatial tokens, adaptive average pooling reduces it before token projection
+- token Omega uses the already-computed token input and transformer output, with stop-gradient on the transformer target branch
+- token Layer-IDSI monitors `stage1`, `stage2`, `stage3`, `token_projection`, and `transformer_token_block`
+- token Layer-IDSI does not monitor attention heads, attention projections, FFN sublayers, or LayerNorm submodules separately
+- token diversity metrics track token variance, inter-token variance, token norm statistics, pairwise cosine similarity/distance, and collapse warnings
 
 ### EMA
 

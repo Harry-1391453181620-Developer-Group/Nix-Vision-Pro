@@ -35,6 +35,7 @@ from backends.torch.train_backend import (
     _make_worker_init_fn,
     _resolve_amp_dtype,
     _resolve_num_workers,
+    _validate_token_args,
     _validate_omega_args,
 )
 
@@ -413,6 +414,54 @@ def test_validate_omega_args():
         )
 
 
+def test_validate_token_args():
+    token_dim, depth, heads, mlp_ratio, dropout = _validate_token_args(
+        token_dim=128,
+        transformer_depth=1,
+        attention_heads=4,
+        transformer_mlp_ratio=2.0,
+        token_dropout=0.1,
+    )
+    assert token_dim == 128
+    assert depth == 1
+    assert heads == 4
+    assert mlp_ratio == pytest.approx(2.0)
+    assert dropout == pytest.approx(0.1)
+
+    with pytest.raises(ValueError):
+        _validate_token_args(
+            token_dim=130,
+            transformer_depth=1,
+            attention_heads=4,
+            transformer_mlp_ratio=2.0,
+            token_dropout=0.1,
+        )
+    with pytest.raises(ValueError):
+        _validate_token_args(
+            token_dim=128,
+            transformer_depth=0,
+            attention_heads=4,
+            transformer_mlp_ratio=2.0,
+            token_dropout=0.1,
+        )
+    with pytest.raises(ValueError):
+        _validate_token_args(
+            token_dim=128,
+            transformer_depth=1,
+            attention_heads=4,
+            transformer_mlp_ratio=0.0,
+            token_dropout=0.1,
+        )
+    with pytest.raises(ValueError):
+        _validate_token_args(
+            token_dim=128,
+            transformer_depth=1,
+            attention_heads=4,
+            transformer_mlp_ratio=2.0,
+            token_dropout=1.0,
+        )
+
+
 def test_omega_loss_backpropagates_to_projector_and_representation_path():
     model = TorchCNN(input_size=(32, 32), num_classes=4, seed=11, omega_enabled=True)
     x = torch.randn(4, 32, 32, 3)
@@ -450,6 +499,56 @@ def test_omega_loss_backpropagates_to_projector_and_representation_path():
     assert components.idsi_metrics.global_stats.mean > 0.0
     assert components.idsi_metrics.layer_names == model.idsi_layer_names
     assert len(components.idsi_metrics.layer_stats) == len(model.idsi_layer_names)
+
+
+def test_token_omega_loss_uses_stop_gradient_target_and_logs_diversity():
+    model = TorchCNN(
+        input_size=(32, 32),
+        num_classes=4,
+        seed=11,
+        tokenize=True,
+        token_dim=128,
+        transformer_depth=1,
+        attention_heads=4,
+    )
+    x = torch.randn(4, 32, 32, 3)
+    y = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    targets = _make_target_distribution(y, num_classes=4, label_smoothing=0.0, dtype=torch.float32)
+
+    components = _compute_total_loss_components(
+        model.forward_with_token_dynamics_and_layer_idsi(x),
+        targets,
+        omega_enabled=True,
+        omega_lambda=0.05,
+        idsi_lambda=0.005,
+        idsi_layer_names=model.idsi_layer_names,
+        use_focal_loss=False,
+        focal_gamma=1.5,
+        ce_class_weights=None,
+        focal_alpha_weights=None,
+    )
+    model.zero_grad(set_to_none=True)
+    components.attr_loss.backward()
+
+    transformer_grad_norm = sum(
+        float(parameter.grad.detach().abs().sum().item())
+        for parameter in model.token_transformer.parameters()
+        if parameter.grad is not None
+    )
+    projection_grad_norm = sum(
+        float(parameter.grad.detach().abs().sum().item())
+        for parameter in model.token_projection.parameters()
+        if parameter.grad is not None
+    )
+    assert transformer_grad_norm == pytest.approx(0.0)
+    assert projection_grad_norm > 0.0
+    assert components.total_loss.item() > components.ce_loss.item()
+    assert components.attr_loss.item() > 0.0
+    assert components.idsi_loss.item() > 0.0
+    assert components.token_stats.token_variance >= 0.0
+    assert components.token_stats.inter_token_variance >= 0.0
+    assert components.token_stats.pairwise_cosine_distance >= 0.0
+    assert components.idsi_metrics.layer_names == model.idsi_layer_names
 
 
 def test_torch_batch_mix_preserves_soft_label_simplex():

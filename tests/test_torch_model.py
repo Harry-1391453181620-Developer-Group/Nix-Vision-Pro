@@ -48,6 +48,39 @@ def test_torch_cnn_layer_idsi_forward_uses_matched_spaces():
         assert tuple(layer_input.shape) == tuple(layer_output.shape)
 
 
+def test_torch_cnn_tokenized_forward_uses_lightweight_token_dynamics():
+    model = TorchCNN(
+        input_size=(32, 32),
+        num_classes=10,
+        seed=123,
+        tokenize=True,
+        token_dim=128,
+        transformer_depth=1,
+        attention_heads=4,
+    )
+    x = torch.randn(4, 32, 32, 3)
+
+    logits, token_input, token_output, layer_inputs, layer_outputs, metric_tokens = (
+        model.forward_with_token_dynamics_and_layer_idsi(x)
+    )
+
+    assert model.idsi_layer_names == (
+        "stage1",
+        "stage2",
+        "stage3",
+        "token_projection",
+        "transformer_token_block",
+    )
+    assert tuple(logits.shape) == (4, 10)
+    assert tuple(token_input.shape) == (4, 16, 128)
+    assert tuple(token_output.shape) == (4, 16, 128)
+    assert tuple(metric_tokens.shape) == (4, 16, 128)
+    assert len(layer_inputs) == len(model.idsi_layer_names)
+    assert len(layer_outputs) == len(model.idsi_layer_names)
+    for layer_input, layer_output in zip(layer_inputs, layer_outputs):
+        assert tuple(layer_input.shape) == tuple(layer_output.shape)
+
+
 def test_torch_cnn_checkpoint_round_trip_preserves_metadata(tmp_path: Path):
     x = torch.randn(2, 32, 32, 3)
     model = TorchCNN(input_size=(32, 32), num_classes=10, seed=7)
@@ -141,6 +174,52 @@ def test_torch_checkpoint_runtime_config_round_trip_with_omega_metadata(tmp_path
     assert runtime_config.omega_projector_depth == 2
     assert runtime_config.omega_hidden_dim == 128
     assert metadata["omega_enabled"] is True
+
+
+def test_torch_checkpoint_runtime_config_round_trip_with_token_metadata(tmp_path: Path):
+    checkpoint = tmp_path / 'model_test_torch_runtime_config_token.pt'
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    model = TorchCNN(
+        input_size=(32, 32),
+        num_classes=13,
+        seed=29,
+        width_scale=1.5,
+        tokenize=True,
+        token_dim=128,
+        transformer_depth=1,
+        attention_heads=4,
+        transformer_mlp_ratio=2.0,
+        token_pool="mean",
+        token_positional_encoding="learned",
+        token_dropout=0.1,
+        transformer_layernorm="pre",
+    )
+    model.save_weights(checkpoint)
+
+    runtime_config = resolve_checkpoint_runtime_config(checkpoint, map_location='cpu')
+    restored = TorchCNN(
+        input_size=runtime_config.input_size,
+        num_classes=runtime_config.num_classes,
+        width_scale=runtime_config.width_scale,
+        tokenize=runtime_config.tokenize,
+        token_dim=runtime_config.token_dim or 128,
+        transformer_depth=runtime_config.transformer_depth or 1,
+        attention_heads=runtime_config.attention_heads or 4,
+        transformer_mlp_ratio=runtime_config.transformer_mlp_ratio or 2.0,
+        token_pool=runtime_config.token_pool or "mean",
+        token_positional_encoding=runtime_config.token_positional_encoding or "learned",
+        token_dropout=runtime_config.token_dropout if runtime_config.token_dropout is not None else 0.1,
+        transformer_layernorm=runtime_config.transformer_layernorm or "pre",
+    )
+    metadata = restored.load_weights(checkpoint, map_location='cpu')
+
+    assert runtime_config.tokenize is True
+    assert runtime_config.token_dim == 128
+    assert runtime_config.transformer_depth == 1
+    assert runtime_config.attention_heads == 4
+    assert runtime_config.transformer_mlp_ratio == pytest.approx(2.0)
+    assert runtime_config.token_pool == "mean"
+    assert metadata["tokenize"] is True
 
 
 def test_torch_checkpoint_runtime_config_infers_legacy_architecture(tmp_path: Path):

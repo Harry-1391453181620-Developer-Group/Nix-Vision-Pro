@@ -98,6 +98,15 @@ def main() -> None:
             "omega_enabled": checkpoint_config.omega_enabled,
             "omega_projector_depth": checkpoint_config.omega_projector_depth or 1,
             "omega_hidden_dim": checkpoint_config.omega_hidden_dim or DEFAULT_OMEGA_FEATURE_DIM,
+            "tokenize": checkpoint_config.tokenize,
+            "token_dim": checkpoint_config.token_dim or 128,
+            "transformer_depth": checkpoint_config.transformer_depth or 1,
+            "attention_heads": checkpoint_config.attention_heads or 4,
+            "transformer_mlp_ratio": checkpoint_config.transformer_mlp_ratio or 2.0,
+            "token_pool": checkpoint_config.token_pool or "mean",
+            "token_positional_encoding": checkpoint_config.token_positional_encoding or "learned",
+            "token_dropout": checkpoint_config.token_dropout if checkpoint_config.token_dropout is not None else 0.1,
+            "transformer_layernorm": checkpoint_config.transformer_layernorm or "pre",
         }
     model = TorchCNN(
         input_size=input_size,

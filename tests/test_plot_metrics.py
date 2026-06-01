@@ -15,6 +15,12 @@ def test_plot_metrics_use_train_h_var_names() -> None:
     assert "train_h_var_max" in PLOT_METRICS
     assert "train_h_var_mean" in PLOT_METRICS
     assert "train_h_var_min" in PLOT_METRICS
+    assert "train_token_variance" in PLOT_METRICS
+    assert "train_inter_token_variance" in PLOT_METRICS
+    assert "train_token_pairwise_cosine_distance" in PLOT_METRICS
+    assert "val_token_variance" in PLOT_METRICS
+    assert "val_inter_token_variance" in PLOT_METRICS
+    assert "val_token_pairwise_cosine_similarity" in PLOT_METRICS
     assert "h_var_max" not in PLOT_METRICS
     assert "h_var_mean" not in PLOT_METRICS
     assert "h_var_min" not in PLOT_METRICS

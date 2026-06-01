@@ -6,10 +6,12 @@ A Python 3.13.2 image classification project with two maintained backends:
 
 Project history is versioned under `Agent_History/`. Substantive contributions are expected to update the relevant history entries along with code and docs.
 
-The active architecture in both backends is width-scaled in stage 2:
+The default architecture in both backends is width-scaled in stage 2:
 `[Conv(32), Conv(32), SE, Pool] -> [Conv(round(64*scale)), Conv(round(64*scale)), SE, Pool] -> [Conv(128), Conv(128), SE, Pool] -> Flatten -> FC(256) -> Dropout(0.5) -> FC(num_classes)`.
 
 Default width scale is `0.75`, so the default stage-2 width is `48`. When you load a checkpoint, inference now reconstructs `num_classes`, `width_scale`, `stage2_channels`, and `input_size` from checkpoint metadata or legacy weight shapes, so `--model-width-scale` is usually unnecessary for saved checkpoints.
+
+The PyTorch backend also has an optional Phase 2 tokenized dynamics path behind `--tokenize`. It keeps the CNN backbone as the primary feature extractor, reshapes the final CNN feature map into a lightweight spatial token set, applies a shallow residual transformer dynamics block, and classifies from mean-pooled tokens by default. The NumPy backend remains the legacy CNN comparison path.
 
 ## Runtime Baseline
 
@@ -65,6 +67,9 @@ This repository no longer includes built-in synthetic or Wikimedia dataset build
 - `--compile-mode auto` benchmarks eager vs compiled train steps after warmup and keeps `torch.compile` only when it actually improves median step time.
 - Phase 1 Omega-loss is available in the torch trainer with `--omega-loss`; it adds a shallow projector on the existing 256-d penultimate representation and logs CE, attractor loss, and representation-variance diagnostics.
 - Phase 1.2 Layer-IDSI is enabled for Omega runs by default with `--idsi-lambda 0.005`. It adds a numerically small layer-wise stability loss on matched feature spaces for `stage1`, `stage2`, `stage3`, and `classifier_pre_head`.
+- Phase 2 tokenized dynamics is available in the torch trainer with `--tokenize`. New controls include `--token-dim`, `--transformer-depth`, `--attention-heads`, `--transformer-mlp-ratio`, `--token-pool {mean,cls}`, `--token-positional-encoding {none,learned,sinusoidal}`, `--token-dropout`, `--transformer-layernorm {pre,post}`, `--token-omega-loss`, `--token-idsi`, and `--token-diversity-monitor`.
+- In token mode, Layer-IDSI monitors `stage1`, `stage2`, `stage3`, `token_projection`, and `transformer_token_block`. It does not monitor attention heads or transformer sublayers separately.
+- Token metrics include token variance, inter-token variance, token norm statistics, mean pairwise cosine similarity/distance, and token collapse warnings.
 - Training run artifacts are written directly under `runs/<timestamp>-.../`.
 - Run metrics log `IDSI`, `IDSI mean`, `IDSI max`, and `IDSI std` from the per-sample relative fluctuation distribution, scaled by `100` for readability. Layer-wise arrays are logged under `layer_IDSI*` keys with stable `layer_IDSI_names`.
 - Run metrics also log `gradient_norm` from the existing backward pass before clipping and `hidden_norm` as the mean L2 norm over monitored feature tensors.
@@ -104,6 +109,7 @@ To open the plot window at training start, refresh it after each epoch, and save
 
 Plot-related options are `--json-dir`, `--plot-output-format {png,jpg,jpeg}`, and `--plot-output-dir`.
 The plotter keeps all metrics in one matplotlib window, includes global and layer-wise IDSI panels, and adapts dynamically to however many monitored layers are present in the JSONL rows.
+Phase 2 token metrics are optional scalar panels, so older Phase 1/1.2 JSONL files remain readable.
 `plot.py` is a helper module used by `train.py`; it is not a standalone command.
 
 ## Checkpoints
@@ -111,6 +117,7 @@ The plotter keeps all metrics in one matplotlib window, includes global and laye
 - New checkpoints save a structured payload with the model weights under `model` plus metadata under `meta`.
 - The metadata includes `checkpoint_version`, `backend`, `num_classes`, `width_scale`, `stage2_channels`, `input_size`, `class_names`, and whether the saved weights are EMA weights.
 - Torch checkpoints may also include Phase 1 Omega metadata: `omega_enabled`, `omega_projector_depth`, and `omega_hidden_dim`; inference reconstructs this branch when present but still predicts from logits only.
+- Torch checkpoints may also include Phase 2 token metadata such as `tokenize`, `token_dim`, transformer settings, token pooling, and positional encoding. Inference reconstructs the token path before loading weights when those metadata are present.
 - `load_weights()` still accepts older plain state-dict checkpoints, so older training runs remain usable.
 - Torch and NumPy inference now rebuild the model from checkpoint metadata first and fall back to legacy weight-shape inference when metadata is missing.
 - If you pass `--class-count` or `--model-width-scale` while also loading weights, conflicting overrides now fail clearly instead of silently building the wrong model shape.
