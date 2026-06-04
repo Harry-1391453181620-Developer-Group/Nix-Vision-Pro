@@ -83,7 +83,96 @@ This repository no longer includes built-in synthetic or Wikimedia dataset build
 Recommended PyTorch training command:
 
 ```powershell
-python.exe train.py --backend torch --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.0004 0.0002 --warmup-epochs 3 --batch-size 64 --streaming --num-workers 4 --optimizer adamw --seed 42 --weight-decay 2e-4 --dropout 0.3 --label-smoothing 0.05 --augment --no-class-weighting --lr-schedule cosine --min-lr-ratio 0.08 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 20 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 6 --after-unfreeze-lr-change 0.00004 --focal-loss --focal-gamma 1.8 --focal-alpha auto --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 1.5 --mixup --mixup-alpha 0.1 --mixup-prob 0.4 --cutmix-ratio 0.5 --ema --ema-decay 0.999 --amp-mode auto --compile-mode auto --device cuda --checkpoint checkpoints/best_torch_model.pt --init-from checkpoints/best_torch_model.pt
+$args = @(
+"--backend", "torch",
+
+"--data-dir", "Dataset",
+"--device", "cuda",
+"--num-workers", "4",
+"--streaming",
+"--seed", "42",
+"--class-count", "13",
+
+"--amp-mode", "auto",
+"--compile-mode", "auto",
+
+"--epochs", "100",
+"--phase-count", "1",
+"--batch-size", "128",
+
+"--optimizer", "adamw",
+"--lr", "0.00045",
+"--lr-schedule", "cosine",
+"--min-lr-ratio", "0.005",
+"--warmup-epochs", "5",
+"--weight-decay", "4e-4",
+"--grad-clip", "5.0",
+
+"--dropout", "0.30",
+"--label-smoothing", "0.04",
+"--no-focal-loss",
+
+"--augment",
+"--rotation", "20",
+"--brightness", "0.25",
+"--contrast", "0.25",
+"--saturation", "0.25",
+
+"--mixup",
+"--mixup-alpha", "0.3",
+"--mixup-prob", "0.25",
+"--cutmix-ratio", "0.2",
+
+"--model-width-scale", "2.0",
+
+"--freeze-bn-affine", "false",
+"--freeze-patience", "1000",
+"--freeze-epoch-num", "1",
+
+"--ema",
+"--ema-decay", "0.9993",
+
+"--early-stop",
+"--early-stop-metric", "val_acc",
+"--patience", "30",
+"--min-delta", "0.000001",
+
+"--checkpoint", "checkpoints/best_torch_model.pt",
+
+"--no-focal-loss",
+
+"--omega-loss",
+"--omega-lambda", "0.07",
+"--omega-projector-depth", "1",
+"--omega-hidden-dim", "256",
+
+"--idsi-lambda", "0.005",
+
+"--tokenize",
+"--token-dim", "128",
+"--transformer-depth", "1",
+"--attention-heads", "4",
+"--transformer-mlp-ratio", "2.0",
+"--token-pool", "mean",
+"--token-positional-encoding", "learned",
+"--token-dropout", "0.10",
+"--transformer-layernorm", "pre",
+"--token-omega-loss",
+"--token-idsi",
+"--token-diversity-monitor",
+
+"--json-dir", "runs",
+"--plot-real-time",
+"--plot-output-format", "png"
+
+"--enforce-readonly-dataset"
+
+"--num-partitions", "1",
+"--partition", "0"
+
+)
+
+python.exe train.py @args
 ```
 
 Legacy NumPy training remains available:
