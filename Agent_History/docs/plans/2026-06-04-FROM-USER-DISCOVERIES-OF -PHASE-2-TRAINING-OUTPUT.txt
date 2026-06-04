@@ -1,0 +1,43 @@
+This file notes some interesting discoveries from the user about the Phase 2 training.
+This file is NOT a mandantory technological instruction file, but more like a useful note.
+This file is based on the output in: D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\runs\20260601-180515-best_torch_model-seed_42-lambda_0p09-idsi_0p005
+
+Discoveries:
+1.  The current model is not in the status of both underfitting and overfitting, it is likely in the representation saturation zone.
+2.  Important milestones during the training:
+    1.  Epoch1,  val_acc = 21.1%, train_acc = 15.6%, IDSI = 59.5, Grad Norm = 0.93
+    2.  Epoch20, val_acc = 59.9%, train_acc = 57.9%, IDSI = 69.4, Grad Norm = 3.76
+    3.  Epoch40, val_acc = 74.6%, train_acc = 70.3%, IDSI = 73.5, Grad Norm = 3.92
+    4.  Epoch60, val_acc = 77.4%, train_acc = 77.9%, IDSI = 75.8, Grad Norm = 4.13
+    5.  Epoch79, val_acc = 78.65%, train_acc = 83.3%, IDSI =  77.1, Grad Norm =  4.06
+    6.  Epoch109,val_acc = 78.39%, train_acc = 85.8%, IDSI = 77.3, Grad Norm = 3.81
+3.  Notice from the data in 2: 
+    during: Epoch 40 to 60, acc increase significantly
+    during: Epoch 60 to 79, acc increase slowly
+    during: Epoch 79 to 109, acc stop increase
+    Meanwhile, IDSI increase continuously!
+    This leads to the conclusion that from the perspective of MAOIDL, the model is not learning how to sort during later epoches, but representation refinement instead.
+4.  IDSI AND VAL_ACC ARE EXTREMELY POSITIVELY CORRELATED!!
+    the corr(IDSI, Val_Acc) is about 0.93!
+    This means that at least in the current Phase2, IDSI is reflecting the representation quality.
+    But there is a saturation phenomenon that when IDSI increase from 75 to 77, the val_acc does not increase. This shows that the system is entering a status that is highly stable but learn less new characteristics. This is corresponding to my prediction that MAOIDL will lower val_acc.
+5.  Analyse Layer IDSI
+    At last: 
+    Stage1 = 95
+    Stage2 = 97
+    Stage3 = 145
+    Token Projection = 3
+    Transformer = 46
+    and it is noticable that Stage3 is MUCH MUCH higher than others, but the transformer block is unexpectedly lower. This means that the dynamics is concentrated in the last Conv layer. So the model currently is still Conv-dominated.
+6.  Very healthy Gradient Norm
+    the gradient norm from 0.9 to 4.1 to 3.8 is very healthy, and never touches clip=5.
+7.  Generalization Gap
+    the gap increase slightly after epoch 79, showing slight overfitting, but very acceptable.
+    I am very satiafied that IDSI and Omega loss significantly lowers the rate of overfitting.
+8.  Parameter changes accordingly:
+    1.  Epoch num from 120 to 100
+    2.  To prepare for Phase2.2, that adds CFT, the omega_lambda from 0.09 to 0.07 (give space)
+    3.  Others no change because the current balance is pretty good!
+
+IMPORTANT NOTES:
+1.  The gui_backend.py is debugged to be compatible with the current model structure. Rebundant model initialization is deleted.

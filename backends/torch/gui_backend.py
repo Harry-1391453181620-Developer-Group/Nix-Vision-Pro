@@ -89,7 +89,7 @@ class InferenceApp:
         self._last_frame: Optional[np.ndarray] = None
 
         self._build_ui()
-        self._init_model()
+        # self._init_model()
 
     def _build_ui(self) -> None:
         bar = tk.Frame(self.root)
@@ -123,9 +123,7 @@ class InferenceApp:
         self.pred_text.config(state=tk.DISABLED)
 
     def _init_model(self) -> None:
-        self.model = TorchCNN(input_size=self.input_size, num_classes=self.num_classes, seed=42, width_scale=self.width_scale)
-        self.model.to(self.device)
-        self.model.eval()
+        pass
 
     def on_choose_weights(self) -> None:
         path_str = filedialog.askopenfilename(
@@ -161,10 +159,22 @@ class InferenceApp:
                 num_classes=self.num_classes,
                 seed=42,
                 width_scale=self.width_scale,
+
                 omega_enabled=checkpoint_config.omega_enabled,
                 omega_projector_depth=checkpoint_config.omega_projector_depth or 1,
                 omega_hidden_dim=checkpoint_config.omega_hidden_dim or DEFAULT_OMEGA_FEATURE_DIM,
-            )
+
+                tokenize=checkpoint_config.tokenize,
+                token_dim=checkpoint_config.token_dim or 128,
+                transformer_depth=checkpoint_config.transformer_depth or 1,
+                attention_heads=checkpoint_config.attention_heads or 4,
+                transformer_mlp_ratio=checkpoint_config.transformer_mlp_ratio or 2.0,
+                token_pool=checkpoint_config.token_pool or "mean",
+                token_positional_encoding=checkpoint_config.token_positional_encoding or "learned",
+                token_dropout=checkpoint_config.token_dropout or 0.1,
+                transformer_layernorm=checkpoint_config.transformer_layernorm or "pre",
+                )
+            
             self.model.load_weights(checkpoint, map_location=self.device)
             self.model.to(self.device)
             self.model.eval()
@@ -239,7 +249,7 @@ class InferenceApp:
 
     def _predict_pil(self, pil_image: Image.Image) -> None:
         if self.model is None:
-            messagebox.showwarning("未就绪", "模型尚未初始化。")
+            # messagebox.showwarning("未就绪", "模型尚未初始化。") 不弹窗
             return
         x = np.asarray(pil_image, dtype=np.float32)
         x = preprocess_image(
