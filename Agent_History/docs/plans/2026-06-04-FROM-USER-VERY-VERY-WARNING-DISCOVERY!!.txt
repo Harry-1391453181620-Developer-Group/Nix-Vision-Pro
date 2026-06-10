@@ -1,0 +1,36 @@
+THIS FILE CORRECTS THE UNBELIEAVABLY MISTAKE MAKEN IN D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\Agent_History\docs\plans\2026-06-04-FROM-USER-DISCOVERIES-OF-PHASE-2-TRAINING-OUTPUT.txt
+
+First, as we see in the phase2 2026/6/1 training output IDSI is INCREASING, attr are INCREASING, completely inverse of what we expect about IDSI and Omega loss!!!!!
+
+So, the primary alter we should do is to INCREASE lambdas!
+
+
+Do two experiments:
+1. Omega_lambda=0.09, IDSI_lambda=0.01, output info dir:D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\runs\20260606-173814-best_torch_model-seed_42-lambda_0p09-idsi_0p01
+2. Omega_lambda=0.15, IDSI_lambda=0.005, output info dir:D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\runs\20260607-082927-best_torch_model-seed_42-lambda_0p15-idsi_0p005
+
+Investigate: which loss is dominating the dynamics.
+
+
+The investigation results shows that the lambdas changes DOES NOT AFFECT THE RESULTS!! OH NOOO!
+Another interesting finding is that the val_acc is LOWER in BOTH experiment cases. This is excactly what I expect, actually...
+Now, we fount that the stage3 IDSI is incrediblely high, so we do experiment 3:
+Mixup Prob = 0, output dir:\\?\d:\Programing_materials\Python\python_Projects\Image_Identify_CNN\runs\20260607-182610-best_torch_model-seed_42-lambda_0p15-idsi_0p005
+
+There is very good trend with mixup=0, the attrs, IDSIs both decreased.
+
+Now, we increase Omega_lambda to 0.2, IDSI_lambda to 0.02, still no mixup.
+output dir: D:\Programing_materials\Python\python_Projects\Image_Identify_CNN\runs\20260609-071833-best_torch_model-seed_42-lambda_0p2-idsi_0p02
+Well, we find that the influence of increasing lambdas are small.
+
+So, we found that the IDSI is majoritily contributed by stage 3. To investigate this, let's reduce model width scale to 1.5 instead of 2.0, while also do more aggresive lambdas, with IDSI one to 0.25, Omega one to 0.35
+output dir:\\?\d:\Programing_materials\Python\python_Projects\Image_Identify_CNN\runs\20260609-211127-best_torch_model-seed_42-lambda_0p35-idsi_0p25
+The output is magnificant, the bect epoch reached 0.891 and it occurs in epoch 104, which is much longer.
+Meanwhile, the Transformer IDSI further decrease but the Stage three IDSI increase. This shows that the dynamics is more improved in token space of the transformer rather than the CNN.
+This is actually a good trend because IDSI and Omega loss are originally designed to Transformer.
+This output tells us that in Phase2, the high dynamics stability restriction will NOT enforce CNN to be stable.
+Moreover, we found that the global IDSI is NOT equivalent to the global stability. The whole system is more similar to front layer explore, back layer converge; and characteristic space active, token space stable. 
+This is incredibliy important to Phase2.2, because the objective will NOT be lowering the global IDSI further, but maintain Transformer IDSI very low and give a more direct and concentrated direction for stage 3 to explore (in the word of CFT, focus on the front scene but NOT the background).
+Therefore, the global IDSI should no longer be the dominant indicator, but the Transformer IDSI is the major indicator, because global IDSI is misleading with CNN.
+
+Anyway, we've get teh best model in phase2, I hope we can get better model in phase2.2

@@ -18,6 +18,7 @@ Both backends now use:
 - Stage 2: `Conv(32->round(64*scale)) -> BN -> ReLU -> Conv(round(64*scale)->round(64*scale)) -> BN -> ReLU -> SE(round(64*scale)) -> MaxPool`
 - Stage 3: `Conv(round(64*scale)->128) -> BN -> ReLU -> Conv(128->128) -> BN -> ReLU -> SE(128) -> MaxPool`
 - Head: `Flatten -> FC(256) -> ReLU -> Dropout(0.5) -> FC(num_classes)`
+- Transformer: `Tokenizer -> Transformer`
 
 The PyTorch backend can optionally enable Phase 2 tokenized dynamics with `--tokenize`:
 - the CNN remains the primary representation extractor

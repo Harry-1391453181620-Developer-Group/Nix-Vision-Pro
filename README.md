@@ -96,8 +96,8 @@ $args = @(
 "--amp-mode", "auto",
 "--compile-mode", "auto",
 
-"--epochs", "100",
-"--phase-count", "1",
+"--epochs", "120",
+"--phase-count", "1", 
 "--batch-size", "128",
 
 "--optimizer", "adamw",
@@ -120,10 +120,10 @@ $args = @(
 
 "--mixup",
 "--mixup-alpha", "0.3",
-"--mixup-prob", "0.25",
+"--mixup-prob", "0",
 "--cutmix-ratio", "0.2",
 
-"--model-width-scale", "2.0",
+"--model-width-scale", "1.5",
 
 "--freeze-bn-affine", "false",
 "--freeze-patience", "1000",
@@ -134,19 +134,19 @@ $args = @(
 
 "--early-stop",
 "--early-stop-metric", "val_acc",
-"--patience", "30",
+"--patience", "50",
 "--min-delta", "0.000001",
 
 "--checkpoint", "checkpoints/best_torch_model.pt",
 
 "--no-focal-loss",
 
-"--omega-loss",
-"--omega-lambda", "0.07",
+"--omega-loss",   （
+"--omega-lambda", "0.35",
 "--omega-projector-depth", "1",
 "--omega-hidden-dim", "256",
 
-"--idsi-lambda", "0.005",
+"--idsi-lambda", "0.25",
 
 "--tokenize",
 "--token-dim", "128",
