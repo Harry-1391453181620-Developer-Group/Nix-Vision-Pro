@@ -24,7 +24,7 @@ from utils.training import (
 
 torch = pytest.importorskip("torch")
 
-from backends.torch.model import TorchCNN
+from backends.torch.model import TorchCNN, TorchLegacyCNN
 from backends.torch.train_backend import load_weights_forgiving as torch_load_weights_forgiving
 
 
@@ -147,23 +147,26 @@ def test_random_erasing_uses_image_mean_fill():
     np.testing.assert_allclose(erased[changed_mask], expected, atol=1e-6)
 
 
-def test_width_scale_changes_stage_two_channels_for_both_backends():
+def test_width_scale_changes_stage_two_channels_for_numpy_and_legacy_torch():
     numpy_model = CNN(input_size=(32, 32), num_classes=8, seed=3, width_scale=0.75)
-    torch_model = TorchCNN(input_size=(32, 32), num_classes=8, seed=3, width_scale=0.75)
+    legacy_torch_model = TorchLegacyCNN(input_size=(32, 32), num_classes=8, seed=3, width_scale=0.75)
+    vit_model = TorchCNN(input_size=(32, 32), num_classes=8, seed=3, width_scale=0.75)
 
     assert numpy_model.stage2_channels == 48
-    assert torch_model.stage2_channels == 48
+    assert legacy_torch_model.stage2_channels == 48
+    assert vit_model.stage2_channels == 0
     assert numpy_model.conv3.W.shape[-1] == 48
-    assert tuple(torch_model.conv3.weight.shape)[:2] == (48, 32)
+    assert tuple(legacy_torch_model.conv3.weight.shape)[:2] == (48, 32)
+    assert not hasattr(vit_model, "conv3")
 
 
 def test_forgiving_checkpoint_load_skips_resized_tensors_for_torch(tmp_path: Path):
     checkpoint = tmp_path / 'torch_width_scale_1_0.pt'
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    original = TorchCNN(input_size=(32, 32), num_classes=8, seed=5, width_scale=1.0)
+    original = TorchLegacyCNN(input_size=(32, 32), num_classes=8, seed=5, width_scale=1.0)
     original.save_weights(checkpoint)
 
-    resized = TorchCNN(input_size=(32, 32), num_classes=8, seed=5, width_scale=0.75)
+    resized = TorchLegacyCNN(input_size=(32, 32), num_classes=8, seed=5, width_scale=0.75)
     loaded, skipped = torch_load_weights_forgiving(resized, checkpoint)
 
     assert any(key.startswith('conv3.') for key in skipped)

@@ -26,7 +26,16 @@ from utils.safety import install_dataset_write_guard
 install_dataset_write_guard()
 
 import config
-from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, TorchCNN, resolve_checkpoint_runtime_config
+from backends.torch.model import (
+    ARCHITECTURE_LEGACY_CNN,
+    ARCHITECTURE_LEGACY_TOKEN,
+    DEFAULT_OMEGA_FEATURE_DIM,
+    DEFAULT_PATCH_SIZE,
+    DEFAULT_VIT_DEPTH,
+    TorchCNN,
+    TorchLegacyCNN,
+    resolve_checkpoint_runtime_config,
+)
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
 
@@ -44,6 +53,7 @@ def _resolve_device() -> torch.device:
 
 def _validate_checkpoint_overrides(
     *,
+    checkpoint_architecture: str,
     class_count_override: int | None,
     width_scale_override: float | None,
     checkpoint_num_classes: int,
@@ -53,10 +63,20 @@ def _validate_checkpoint_overrides(
         raise ValueError(
             f"--class-count={class_count_override} conflicts with checkpoint num_classes={checkpoint_num_classes}"
         )
-    if width_scale_override is not None and abs(float(width_scale_override) - float(checkpoint_width_scale)) > 1e-9:
+    if (
+        checkpoint_architecture in {ARCHITECTURE_LEGACY_CNN, ARCHITECTURE_LEGACY_TOKEN}
+        and width_scale_override is not None
+        and abs(float(width_scale_override) - float(checkpoint_width_scale)) > 1e-9
+    ):
         raise ValueError(
             f"--model-width-scale={width_scale_override} conflicts with checkpoint width_scale={checkpoint_width_scale:.6f}"
         )
+
+
+def _model_class_for_architecture(architecture: str):
+    if architecture in {ARCHITECTURE_LEGACY_CNN, ARCHITECTURE_LEGACY_TOKEN}:
+        return TorchLegacyCNN
+    return TorchCNN
 
 
 class InferenceApp:
@@ -78,18 +98,17 @@ class InferenceApp:
         self.num_classes = len(self.class_names)
         self.device = _resolve_device()
         self.width_scale_override = width_scale
-        self.width_scale = 0.75 if width_scale is None else float(width_scale)
+        self.width_scale = 0.0 if width_scale is None else float(width_scale)
         self.class_source_dir = class_source_dir
         self.class_count_override = class_count_override
 
-        self.model: Optional[TorchCNN] = None
+        self.model: Optional[torch.nn.Module] = None
         self.weights_path: Optional[Path] = None
         self._webcam_running = False
         self._webcam_thread: Optional[threading.Thread] = None
         self._last_frame: Optional[np.ndarray] = None
 
         self._build_ui()
-        # self._init_model()
 
     def _build_ui(self) -> None:
         bar = tk.Frame(self.root)
@@ -140,6 +159,7 @@ class InferenceApp:
                 default_input_size=self.input_size,
             )
             _validate_checkpoint_overrides(
+                checkpoint_architecture=checkpoint_config.architecture,
                 class_count_override=self.class_count_override,
                 width_scale_override=self.width_scale_override,
                 checkpoint_num_classes=checkpoint_config.num_classes,
@@ -154,26 +174,34 @@ class InferenceApp:
                 checkpoint_class_names=checkpoint_config.class_names,
                 require_images=False,
             )
-            self.model = TorchCNN(
+            model_class = _model_class_for_architecture(checkpoint_config.architecture)
+            is_legacy_checkpoint = model_class is TorchLegacyCNN
+            model_kwargs = {
+                "omega_enabled": checkpoint_config.omega_enabled,
+                "omega_projector_depth": checkpoint_config.omega_projector_depth or 1,
+                "omega_hidden_dim": checkpoint_config.omega_hidden_dim or DEFAULT_OMEGA_FEATURE_DIM,
+                "tokenize": checkpoint_config.tokenize,
+                "token_dim": checkpoint_config.token_dim or 128,
+                "transformer_depth": checkpoint_config.transformer_depth
+                or checkpoint_config.vit_depth
+                or (1 if is_legacy_checkpoint else DEFAULT_VIT_DEPTH),
+                "attention_heads": checkpoint_config.attention_heads or 4,
+                "transformer_mlp_ratio": checkpoint_config.transformer_mlp_ratio or 2.0,
+                "token_pool": checkpoint_config.token_pool or ("mean" if is_legacy_checkpoint else "cls"),
+                "token_positional_encoding": checkpoint_config.token_positional_encoding or "learned",
+                "token_dropout": checkpoint_config.token_dropout if checkpoint_config.token_dropout is not None else 0.1,
+                "transformer_layernorm": checkpoint_config.transformer_layernorm or "pre",
+            }
+            if not is_legacy_checkpoint:
+                model_kwargs["patch_size"] = checkpoint_config.patch_size or DEFAULT_PATCH_SIZE
+                model_kwargs["pool_type"] = checkpoint_config.pool_type or checkpoint_config.token_pool or "cls"
+            self.model = model_class(
                 input_size=self.input_size,
                 num_classes=self.num_classes,
                 seed=42,
                 width_scale=self.width_scale,
-
-                omega_enabled=checkpoint_config.omega_enabled,
-                omega_projector_depth=checkpoint_config.omega_projector_depth or 1,
-                omega_hidden_dim=checkpoint_config.omega_hidden_dim or DEFAULT_OMEGA_FEATURE_DIM,
-
-                tokenize=checkpoint_config.tokenize,
-                token_dim=checkpoint_config.token_dim or 128,
-                transformer_depth=checkpoint_config.transformer_depth or 1,
-                attention_heads=checkpoint_config.attention_heads or 4,
-                transformer_mlp_ratio=checkpoint_config.transformer_mlp_ratio or 2.0,
-                token_pool=checkpoint_config.token_pool or "mean",
-                token_positional_encoding=checkpoint_config.token_positional_encoding or "learned",
-                token_dropout=checkpoint_config.token_dropout or 0.1,
-                transformer_layernorm=checkpoint_config.transformer_layernorm or "pre",
-                )
+                **model_kwargs,
+            )
             
             self.model.load_weights(checkpoint, map_location=self.device)
             self.model.to(self.device)
@@ -292,7 +320,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the PyTorch inference GUI")
     parser.add_argument("--data-dir", type=str, default=None, help="Dataset root used to resolve class labels")
     parser.add_argument("--class-count", type=int, default=None, help="Optional class-count override for model output size")
-    parser.add_argument("--model-width-scale", type=float, default=None, help="Optional width multiplier override when no checkpoint is loaded")
+    parser.add_argument("--model-width-scale", type=float, default=None, help="Legacy CNN width override checked when loading legacy torch checkpoints")
     args = parser.parse_args()
 
     class_source_dir = Path(args.data_dir) if args.data_dir else None

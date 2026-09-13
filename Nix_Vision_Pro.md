@@ -1,6 +1,6 @@
 # Nix Vision Pro Training Guide
 
-The project uses `PyTorch` as the default backend and keeps the original `NumPy` structure intact. The active architecture in both backends is a three-stage CNN + SE classifier with a flattened dense head.
+The project uses `PyTorch` as the default backend and keeps the original `NumPy` structure intact. The active torch training architecture is Phase3.1 pure ViT; the NumPy backend remains the legacy CNN comparison path.
 
 ## Current Runtime
 
@@ -13,26 +13,21 @@ The project uses `PyTorch` as the default backend and keeps the original `NumPy`
 
 ## Active Architecture
 
-Both backends now use:
-- Stage 1: `Conv(3->32) -> BN -> ReLU -> Conv(32->32) -> BN -> ReLU -> SE(32) -> MaxPool`
-- Stage 2: `Conv(32->round(64*scale)) -> BN -> ReLU -> Conv(round(64*scale)->round(64*scale)) -> BN -> ReLU -> SE(round(64*scale)) -> MaxPool`
-- Stage 3: `Conv(round(64*scale)->128) -> BN -> ReLU -> Conv(128->128) -> BN -> ReLU -> SE(128) -> MaxPool`
-- Head: `Flatten -> FC(256) -> ReLU -> Dropout(0.5) -> FC(num_classes)`
-- Transformer: `Tokenizer -> Transformer`
+Torch training now uses:
+- Patch embedding: image patches of `8x8` pixels projected to token dimension `128`
+- Transformer encoder: `4` residual transformer blocks, `4` attention heads, MLP ratio `2.0`
+- Pooling: CLS token by default
+- Classifier: dropout `0.10` then a linear class head
 
-The PyTorch backend can optionally enable Phase 2 tokenized dynamics with `--tokenize`:
-- the CNN remains the primary representation extractor
-- the final CNN feature map is reduced to a lightweight token grid when needed, then reshaped into spatial tokens
-- a lightweight projection maps tokens to `--token-dim`
-- one shallow residual transformer dynamics block is used by default
-- the classifier uses mean-pooled tokens by default, with CLS pooling kept only for ablation
+The active torch path is:
 
-Width scaling is controlled by `--model-width-scale`.
+```text
+Image -> Patch Embedding -> CLS + Transformer Encoder -> Classifier
+```
 
-- default `0.75` gives stage-2 width `48`
-- inference now reconstructs width and class count from checkpoint metadata or legacy weight shapes, so explicit width overrides are mainly for training or weight-free model construction
+CNN stages are not part of Phase3.1 torch training. The old torch CNN+Transformer implementation is retained only as `TorchLegacyCNN` so Phase1/Phase2 checkpoints can still be inspected and loaded by inference and GUI tools.
 
-The old Mamba implementation has been removed because it was no longer part of the active model path.
+The NumPy backend still uses the previous three-stage CNN + SE architecture and keeps its existing width-scale and freeze controls.
 
 ## Environment Setup
 
@@ -121,7 +116,7 @@ Torch training now uses:
 
 `--compile-mode auto` warms up eager and compiled paths separately, measures synchronized median train-step time, and keeps compile only when it improves throughput.
 
-### Phase 1 Omega-Loss
+### Phase3.1 Omega-Loss and Layer-IDSI
 
 The torch backend supports the Phase 1 attractor experiment through:
 
@@ -133,12 +128,12 @@ The torch backend supports the Phase 1 attractor experiment through:
 - `--experiment-dir`
 
 Policy details:
-- `h` is the current 256-d representation after `FC(256) -> ReLU` and before dropout
+- `h` is the current ViT CLS representation, or the mean-pooled patch representation when `--token-pool mean` is selected
 - `T(h)` is a shallow trainable MLP projector with a final `LayerNorm`
-- Phase 1.2 adds a small Layer-IDSI term when `--omega-loss` is enabled:
+- Phase3.1 adds a small Layer-IDSI term when `--token-idsi` is enabled:
   `L_total = L_CE_mix + omega_lambda * L_fp + idsi_lambda * L_IDSI`
-- `L_IDSI` uses matched feature spaces only: `stage1`, `stage2`, `stage3`, and `classifier_pre_head`
-- Phase1.2 detaches only the Layer-IDSI denominator norm for numerical stability; no spectral normalization, memory bank, tokenization, or attention mechanism is introduced in Phase 1
+- `L_IDSI` uses matched token spaces only: `patch_embedding`, then `transformer_block_1` through `transformer_block_N`
+- transformer block IDSI is measured on each block output after the final residual connection
 - contraction behavior is an empirical hypothesis in this phase, not a guaranteed property
 - validation and checkpointing keep the existing EMA, AMP, compile, early-stop, augmentation, and MixUp/CutMix policies
 
@@ -151,9 +146,9 @@ When `--omega-loss` is enabled, the trainer writes structured run artifacts unde
 
 The metrics include total loss, CE loss, attractor loss, Layer-IDSI loss, accuracy, generalization gap, representation-variance diagnostics, global/layer IDSI distribution summaries, gradient norm, and hidden norm.
 
-### Phase 2 Tokenized Dynamics
+### Phase3.1 ViT Token Dynamics
 
-The torch backend supports the Phase 2 transition architecture through:
+The torch backend uses patch-token dynamics by default through:
 
 - `--tokenize / --no-tokenize`
 - `--token-dim`
@@ -169,13 +164,13 @@ The torch backend supports the Phase 2 transition architecture through:
 - `--token-diversity-monitor / --no-token-diversity-monitor`
 
 Policy details:
-- tokenization is off by default, so Phase 1/1.2 commands stay valid
-- the default token path uses `token_dim=128`, `transformer_depth=1`, `attention_heads=4`, and `transformer_mlp_ratio=2.0`
-- if the final CNN feature map would create more than 64 spatial tokens, adaptive average pooling reduces it before token projection
-- token Omega uses the already-computed token input and transformer output, with stop-gradient on the transformer target branch
-- token Layer-IDSI monitors `stage1`, `stage2`, `stage3`, `token_projection`, and `transformer_token_block`
+- tokenization is on by default and `--no-tokenize` is rejected for torch training because Phase3.1 is pure ViT
+- the default token path uses `token_dim=128`, `transformer_depth=4`, `attention_heads=4`, `transformer_mlp_ratio=2.0`, and `token_pool=cls`
+- patch size is fixed at `8` for the initial Phase3.1 baseline
+- token Omega uses the ViT representation and Omega projector
+- token Layer-IDSI monitors `patch_embedding` and one `transformer_block_N` row per configured transformer block
 - token Layer-IDSI does not monitor attention heads, attention projections, FFN sublayers, or LayerNorm submodules separately
-- token diversity metrics track token variance, inter-token variance, token norm statistics, pairwise cosine similarity/distance, and collapse warnings
+- token diversity metrics track patch-token variance, inter-token variance, token norm statistics, pairwise cosine similarity/distance, and collapse warnings; the CLS token is excluded from these diversity calculations
 
 ### EMA
 
@@ -191,29 +186,33 @@ Policy details:
 - EMA tracks both parameters and buffers, including BN running statistics
 - validation uses EMA weights when EMA is enabled
 - best checkpoint saves also use EMA weights when EMA is enabled
-- phase starts use a short EMA warmup so EMA can catch up after cosine restarts or freeze/unfreeze transitions
+- phase starts use a short EMA warmup so EMA can catch up after cosine restarts
 - mixed batches slightly lower the effective EMA decay so the shadow weights track noisier updates more quickly
 
 ### Structured Checkpoints
 
-New checkpoints now store:
+New torch ViT checkpoints now store:
 
 ```text
 {
   model: ...,
   meta: {
-    checkpoint_version: 2,
-    backend: ...,
+    checkpoint_version: 3,
+    backend: "torch",
+    architecture: "vit",
     num_classes: ...,
-    width_scale: ...,
-    stage2_channels: ...,
     input_size: ...,
     class_names: [...],
     is_ema: true/false,
     ema_decay: ...,
     omega_enabled: true/false,
     omega_projector_depth: 1 or 2,
-    omega_hidden_dim: ...
+    omega_hidden_dim: ...,
+    patch_size: 8,
+    vit_depth: ...,
+    token_dim: ...,
+    attention_heads: ...,
+    pool_type: "cls" or "mean"
   }
 }
 ```
@@ -221,8 +220,9 @@ New checkpoints now store:
 Notes:
 - both backends still load older plain checkpoints
 - both inference backends now reconstruct model architecture from checkpoint metadata before applying weights
-- when metadata is missing, both backends infer `num_classes` and stage-2 width from the saved parameter shapes
-- torch inference also reconstructs the optional Phase 1 Omega branch when a checkpoint contains it, but prediction uses only classifier logits
+- when metadata is missing, torch infers whether the checkpoint is ViT, legacy CNN, or legacy CNN+Transformer from saved parameter names
+- torch inference also reconstructs the optional Omega branch when a checkpoint contains it, but prediction uses only classifier logits
+- Phase1/Phase2 torch checkpoints use the preserved legacy model path and should load without crashing
 - `--init-from` loads the live model first and then syncs EMA from that loaded model so the two states start aligned
 
 ### Multiphase LR
@@ -244,29 +244,17 @@ Rules:
 - cosine scheduling intentionally restarts per phase
 - warmup ramps from `0.1 * base_lr` to `base_lr` at the start of each phase
 
-### Temporary Backbone Freeze
+### Torch Freeze Policy Removed
 
-If `val_acc` does not improve for `--freeze-patience` consecutive epochs inside the current phase:
-- the backbone freezes temporarily
-- the classifier head trains alone for exactly `--freeze-epoch-num` epochs
-- the backbone then unfreezes automatically inside the same phase
-- after unfreeze, the effective LR may gain an extra cumulative downward offset from `--after-unfreeze-lr-change`, while staying above the scheduler floor and the next phase start LR
-- entering the next phase always resets LR to the explicit value from `--lr`
+Torch Phase3.1 training does not expose the former temporary backbone-freeze policy. These torch arguments were removed:
 
-By default, BN affine parameters freeze with the backbone.
+- `--model-width-scale`
+- `--freeze-bn-affine`
+- `--freeze-patience`
+- `--freeze-epoch-num`
+- `--after-unfreeze-lr-change`
 
-Default timed-freeze settings:
-- `--freeze-patience 8`
-- `--freeze-epoch-num 10`
-- `--after-unfreeze-lr-change 0.0001`
-
-Optional advanced mode:
-
-```text
---freeze-bn-affine false
-```
-
-That keeps BN affine parameters trainable while BN running statistics remain frozen.
+The NumPy backend remains legacy CNN code and may still expose its previous width-scale and freeze controls.
 
 ## Recommended Training Command
 
@@ -274,6 +262,7 @@ See `best_train_commands.txt`.
 
 ## Key Training Arguments
 
+- `--help-md`
 - `--data-dir`
 - `--epochs`
 - `--batch-size`
@@ -307,21 +296,34 @@ See `best_train_commands.txt`.
 - `--brightness`
 - `--contrast`
 - `--saturation`
-- `--model-width-scale`
 - `--omega-loss / --no-omega-loss`
 - `--omega-lambda`
 - `--idsi-lambda`
 - `--omega-projector-depth`
 - `--omega-hidden-dim`
+- `--tokenize / --no-tokenize` (`--no-tokenize` is rejected by torch Phase3.1)
+- `--token-dim`
+- `--transformer-depth`
+- `--attention-heads`
+- `--transformer-mlp-ratio`
+- `--token-pool {mean,cls}`
+- `--token-positional-encoding {none,learned,sinusoidal}`
+- `--token-dropout`
+- `--transformer-layernorm {pre,post}`
+- `--token-omega-loss / --no-token-omega-loss`
+- `--token-idsi / --no-token-idsi`
+- `--token-diversity-monitor / --no-token-diversity-monitor`
+- `--allow-unlabeled-root / --no-allow-unlabeled-root`
 - `--experiment-dir`
+- `--json-dir`
+- `--plot-once`
+- `--plot-real-time`
+- `--plot-output-format {png,jpg,jpeg}`
+- `--plot-output-dir`
 - `--early-stop / --no-early-stop`
 - `--early-stop-metric {val_loss,val_acc}`
 - `--patience`
 - `--min-delta`
-- `--freeze-bn-affine false`
-- `--freeze-patience`
-- `--freeze-epoch-num`
-- `--after-unfreeze-lr-change`
 - `--checkpoint`
 - `--streaming / --no-streaming`
 - `--amp-mode {auto,on,off}`
