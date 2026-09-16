@@ -1,4 +1,4 @@
-"""Focused tests for RandAugment, EMA, schedules, and legacy freeze policy."""
+"""Focused tests for RandAugment, EMA, schedules, and backbone freeze policy."""
 
 from argparse import Namespace
 import pickle
@@ -23,7 +23,7 @@ from utils.training import (
 torch = pytest.importorskip("torch")
 from torch import nn
 
-from backends.torch.model import TorchCNN, TorchLegacyCNN
+from backends.torch.model import TorchCNN
 from backends.torch.train_backend import (
     _apply_backbone_freeze_state,
     _apply_batch_mix_torch,
@@ -232,9 +232,9 @@ def test_numpy_freeze_keeps_bn_running_stats_fixed():
     np.testing.assert_allclose(model.bn1.running_mean, running_mean_before, atol=1e-12)
 
 
-def test_torch_legacy_model_ema_tracks_parameters_and_bn_buffers():
-    model = TorchLegacyCNN(input_size=(32, 32), num_classes=8, seed=11)
-    ema_model = TorchLegacyCNN(input_size=(32, 32), num_classes=8, seed=13)
+def test_torch_model_ema_tracks_parameters_and_bn_buffers():
+    model = TorchCNN(input_size=(32, 32), num_classes=8, seed=11)
+    ema_model = TorchCNN(input_size=(32, 32), num_classes=8, seed=13)
     ema = ModelEMA(ema_model, decay=0.5, phase_warmup_steps=0)
     ema.sync_from(model)
 
@@ -261,8 +261,8 @@ def test_torch_legacy_model_ema_tracks_parameters_and_bn_buffers():
     assert ema.num_updates == 1
 
 
-def test_torch_legacy_freeze_transition_updates_expected_params_and_bn_modes():
-    model = TorchLegacyCNN(input_size=(32, 32), num_classes=8, seed=11)
+def test_torch_freeze_transition_updates_expected_params_and_bn_modes():
+    model = TorchCNN(input_size=(32, 32), num_classes=8, seed=11)
     args = Namespace(optimizer="adamw", momentum=0.9, weight_decay=1e-5)
     criterion = nn.CrossEntropyLoss()
     x = torch.randn(4, 32, 32, 3)
@@ -489,8 +489,8 @@ def test_omega_loss_backpropagates_to_projector_and_representation_path():
         if parameter.grad is not None
     )
     assert projector_grad_norm > 0.0
-    assert model.patch_projection.weight.grad is not None
-    assert float(model.patch_projection.weight.grad.detach().abs().sum().item()) > 0.0
+    assert model.fc1.weight.grad is not None
+    assert float(model.fc1.weight.grad.detach().abs().sum().item()) > 0.0
     assert components.total_loss.item() > components.ce_loss.item()
     assert components.attr_loss.item() > 0.0
     assert components.idsi_loss.item() > 0.0
@@ -501,12 +501,11 @@ def test_omega_loss_backpropagates_to_projector_and_representation_path():
     assert len(components.idsi_metrics.layer_stats) == len(model.idsi_layer_names)
 
 
-def test_token_omega_loss_uses_cls_projector_target_and_logs_patch_diversity():
+def test_token_omega_loss_uses_stop_gradient_target_and_logs_diversity():
     model = TorchCNN(
         input_size=(32, 32),
         num_classes=4,
         seed=11,
-        omega_enabled=True,
         tokenize=True,
         token_dim=128,
         transformer_depth=1,
@@ -536,19 +535,13 @@ def test_token_omega_loss_uses_cls_projector_target_and_logs_patch_diversity():
         for parameter in model.token_transformer.parameters()
         if parameter.grad is not None
     )
-    patch_projection_grad_norm = sum(
+    projection_grad_norm = sum(
         float(parameter.grad.detach().abs().sum().item())
-        for parameter in model.patch_projection.parameters()
+        for parameter in model.token_projection.parameters()
         if parameter.grad is not None
     )
-    projector_grad_norm = sum(
-        float(parameter.grad.detach().abs().sum().item())
-        for parameter in model.omega_projector.parameters()
-        if parameter.grad is not None
-    )
-    assert transformer_grad_norm > 0.0
-    assert patch_projection_grad_norm > 0.0
-    assert projector_grad_norm > 0.0
+    assert transformer_grad_norm == pytest.approx(0.0)
+    assert projection_grad_norm > 0.0
     assert components.total_loss.item() > components.ce_loss.item()
     assert components.attr_loss.item() > 0.0
     assert components.idsi_loss.item() > 0.0

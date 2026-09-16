@@ -1,8 +1,9 @@
-"""PyTorch image-classification models.
+"""PyTorch CNN + SE backend model.
 
-Phase 3 training uses the public ``TorchCNN`` name for a pure ViT classifier so
-older entry points keep working. The previous CNN + token transformer model is
-kept as ``TorchLegacyCNN`` for checkpoint inspection and inference compatibility.
+The stage-2 width is now parameterized with a width scale so the project can use
+smaller intermediate feature maps without hard-coding a single architecture.
+Every entry point that constructs this model must therefore pass the same width
+scale that was used during training if it wants checkpoint shapes to match.
 """
 
 from __future__ import annotations
@@ -20,14 +21,6 @@ from torch import nn
 DEFAULT_INPUT_SIZE: Tuple[int, int] = (32, 32)
 DEFAULT_OMEGA_FEATURE_DIM = 256
 DEFAULT_MAX_TOKENS = 64
-DEFAULT_PATCH_SIZE = 8
-DEFAULT_VIT_DEPTH = 4
-DEFAULT_TOKEN_DIM = 128
-DEFAULT_ATTENTION_HEADS = 4
-DEFAULT_POOL_TYPE = "cls"
-ARCHITECTURE_VIT = "vit"
-ARCHITECTURE_LEGACY_CNN = "legacy_cnn"
-ARCHITECTURE_LEGACY_TOKEN = "legacy_cnn_transformer"
 
 
 def _normalize_omega_metadata_flag(value: Any) -> bool:
@@ -70,26 +63,8 @@ def _normalize_choice(value: Any, choices: set[str]) -> str | None:
     return text if text in choices else None
 
 
-def _normalize_architecture(value: Any) -> str | None:
-    text = _normalize_choice(
-        value,
-        {ARCHITECTURE_VIT, ARCHITECTURE_LEGACY_CNN, ARCHITECTURE_LEGACY_TOKEN},
-    )
-    if text is not None:
-        return text
-    if value is None:
-        return None
-    legacy_text = str(value).strip().lower()
-    if legacy_text in {"cnn", "torch_cnn"}:
-        return ARCHITECTURE_LEGACY_CNN
-    if legacy_text in {"token", "tokenized", "cnn_transformer", "phase2"}:
-        return ARCHITECTURE_LEGACY_TOKEN
-    return None
-
-
 @dataclass(frozen=True)
 class CheckpointRuntimeConfig:
-    architecture: str
     input_size: Tuple[int, int]
     num_classes: int
     width_scale: float
@@ -107,9 +82,6 @@ class CheckpointRuntimeConfig:
     token_positional_encoding: str | None
     token_dropout: float | None
     transformer_layernorm: str | None
-    patch_size: int | None
-    vit_depth: int | None
-    pool_type: str | None
     metadata: dict[str, Any]
 
 
@@ -216,38 +188,21 @@ def resolve_runtime_config_from_state(
     default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
 ) -> CheckpointRuntimeConfig:
     metadata_dict = {} if metadata is None else dict(metadata)
-    architecture = _normalize_architecture(metadata_dict.get("architecture"))
-    if architecture is None:
-        if "patch_projection.weight" in state:
-            architecture = ARCHITECTURE_VIT
-        elif "token_projection.weight" in state:
-            architecture = ARCHITECTURE_LEGACY_TOKEN
-        else:
-            architecture = ARCHITECTURE_LEGACY_CNN
 
-    classifier_weight = state.get("classifier.weight")
-    if classifier_weight is None:
-        classifier_weight = state.get("token_classifier.weight")
-    if classifier_weight is None:
-        classifier_weight = state.get("fc2.weight")
-    if classifier_weight is None or classifier_weight.ndim != 2:
-        raise ValueError("Checkpoint is missing a classifier weight, so num_classes cannot be resolved")
+    fc2_weight = state.get("fc2.weight")
+    if fc2_weight is None or fc2_weight.ndim != 2:
+        raise ValueError("Checkpoint is missing `fc2.weight`, so num_classes cannot be resolved")
+    conv3_weight = state.get("conv3.weight")
+    if conv3_weight is None or conv3_weight.ndim != 4:
+        raise ValueError("Checkpoint is missing `conv3.weight`, so width_scale cannot be resolved")
 
-    num_classes = int(metadata_dict.get("num_classes", classifier_weight.shape[0]))
-    if architecture == ARCHITECTURE_VIT:
-        stage2_channels = int(metadata_dict.get("stage2_channels", 0) or 0)
-        width_scale = float(metadata_dict.get("width_scale", 0.0) or 0.0)
-        input_size = _normalize_input_size(metadata_dict.get("input_size")) or tuple(default_input_size)
-    else:
-        conv3_weight = state.get("conv3.weight")
-        if conv3_weight is None or conv3_weight.ndim != 4:
-            raise ValueError("Legacy checkpoint is missing `conv3.weight`, so width_scale cannot be resolved")
-        stage2_channels = int(metadata_dict.get("stage2_channels", conv3_weight.shape[0]))
-        width_scale = float(metadata_dict.get("width_scale", stage2_channels / 64.0))
-        input_size = (
-            _normalize_input_size(metadata_dict.get("input_size"))
-            or _infer_input_size_from_state(state, default_input_size=default_input_size)
-        )
+    num_classes = int(metadata_dict.get("num_classes", fc2_weight.shape[0]))
+    stage2_channels = int(metadata_dict.get("stage2_channels", conv3_weight.shape[0]))
+    width_scale = float(metadata_dict.get("width_scale", stage2_channels / 64.0))
+    input_size = (
+        _normalize_input_size(metadata_dict.get("input_size"))
+        or _infer_input_size_from_state(state, default_input_size=default_input_size)
+    )
     class_names = _normalize_checkpoint_class_names(
         metadata_dict.get("class_names"),
         expected_count=num_classes,
@@ -257,25 +212,15 @@ def resolve_runtime_config_from_state(
     omega_hidden_dim = _normalize_optional_positive_int(metadata_dict.get("omega_hidden_dim"))
     token_projection_weight = state.get("token_projection.weight")
     tokenize = _normalize_omega_metadata_flag(
-        metadata_dict.get(
-            "tokenize",
-            architecture in {ARCHITECTURE_VIT, ARCHITECTURE_LEGACY_TOKEN}
-            or token_projection_weight is not None,
-        )
+        metadata_dict.get("tokenize", token_projection_weight is not None)
     )
     token_dim = _normalize_optional_positive_int(metadata_dict.get("token_dim"))
     if token_dim is None and token_projection_weight is not None and token_projection_weight.ndim == 2:
         token_dim = int(token_projection_weight.shape[0])
-    if token_dim is None and "patch_projection.weight" in state and state["patch_projection.weight"].ndim == 2:
-        token_dim = int(state["patch_projection.weight"].shape[0])
     transformer_depth = _normalize_optional_positive_int(metadata_dict.get("transformer_depth"))
-    vit_depth = _normalize_optional_positive_int(metadata_dict.get("vit_depth"))
-    if transformer_depth is None and vit_depth is not None:
-        transformer_depth = vit_depth
     attention_heads = _normalize_optional_positive_int(metadata_dict.get("attention_heads"))
     transformer_mlp_ratio = _normalize_optional_positive_float(metadata_dict.get("transformer_mlp_ratio"))
-    pool_type = _normalize_choice(metadata_dict.get("pool_type"), {"mean", "cls"})
-    token_pool = _normalize_choice(metadata_dict.get("token_pool"), {"mean", "cls"}) or pool_type
+    token_pool = _normalize_choice(metadata_dict.get("token_pool"), {"mean", "cls"})
     token_positional_encoding = _normalize_choice(
         metadata_dict.get("token_positional_encoding"),
         {"none", "learned", "sinusoidal"},
@@ -285,10 +230,8 @@ def resolve_runtime_config_from_state(
     except (TypeError, ValueError):
         token_dropout = None
     transformer_layernorm = _normalize_choice(metadata_dict.get("transformer_layernorm"), {"pre", "post"})
-    patch_size = _normalize_optional_positive_int(metadata_dict.get("patch_size"))
 
     return CheckpointRuntimeConfig(
-        architecture=architecture,
         input_size=input_size,
         num_classes=num_classes,
         width_scale=width_scale,
@@ -306,9 +249,6 @@ def resolve_runtime_config_from_state(
         token_positional_encoding=token_positional_encoding,
         token_dropout=token_dropout,
         transformer_layernorm=transformer_layernorm,
-        patch_size=patch_size,
-        vit_depth=vit_depth or transformer_depth,
-        pool_type=pool_type or token_pool,
         metadata=metadata_dict,
     )
 
@@ -397,7 +337,7 @@ def _build_sinusoidal_positions(num_tokens: int, token_dim: int) -> torch.Tensor
 
 
 class TokenTransformerBlock(nn.Module):
-    """Small residual transformer block used for token dynamics."""
+    """Small residual transformer block used as a Phase 2 dynamics refinement."""
 
     def __init__(
         self,
@@ -407,7 +347,6 @@ class TokenTransformerBlock(nn.Module):
         mlp_ratio: float,
         dropout: float,
         layernorm: str,
-        residual_scale: float = 0.1,
     ) -> None:
         super().__init__()
         if token_dim <= 0:
@@ -423,7 +362,7 @@ class TokenTransformerBlock(nn.Module):
 
         hidden_dim = max(token_dim, int(round(token_dim * float(mlp_ratio))))
         self.layernorm = str(layernorm)
-        self.residual_scale = float(residual_scale)
+        self.residual_scale = 0.1
         self.norm1 = nn.LayerNorm(token_dim)
         self.norm2 = nn.LayerNorm(token_dim)
         self.attn = nn.MultiheadAttention(
@@ -468,8 +407,8 @@ class TokenTransformerBlock(nn.Module):
         return self.norm2(tokens + (self.residual_scale * self.mlp(tokens)))
 
 
-class TorchLegacyCNN(nn.Module):
-    """Phase 1/2 CNN + SE classifier retained for historical checkpoint loading."""
+class TorchCNN(nn.Module):
+    """Three-stage CNN + SE classifier matching the active project architecture."""
 
     CNN_IDSI_LAYER_NAMES: tuple[str, ...] = (
         "stage1",
@@ -1017,7 +956,6 @@ class TorchLegacyCNN(nn.Module):
         payload_metadata = {
             "checkpoint_version": 2,
             "backend": "torch",
-            "architecture": ARCHITECTURE_LEGACY_TOKEN if self.tokenize else ARCHITECTURE_LEGACY_CNN,
             "num_classes": int(self.num_classes),
             "width_scale": float(self.width_scale),
             "stage2_channels": int(self.stage2_channels),
@@ -1053,417 +991,12 @@ class TorchLegacyCNN(nn.Module):
         return metadata
 
 
-class TorchCNN(nn.Module):
-    """Pure ViT classifier used by the Phase 3 torch backend."""
-
-    def __init__(
-        self,
-        input_size: Tuple[int, int],
-        num_classes: int,
-        seed: int | None = None,
-        dropout_p: float = 0.1,
-        width_scale: float = 0.0,
-        omega_enabled: bool = False,
-        omega_projector_depth: int = 1,
-        omega_hidden_dim: int = DEFAULT_OMEGA_FEATURE_DIM,
-        tokenize: bool = True,
-        token_dim: int = DEFAULT_TOKEN_DIM,
-        transformer_depth: int = DEFAULT_VIT_DEPTH,
-        attention_heads: int = DEFAULT_ATTENTION_HEADS,
-        transformer_mlp_ratio: float = 2.0,
-        token_pool: str = DEFAULT_POOL_TYPE,
-        token_positional_encoding: str = "learned",
-        token_dropout: float = 0.1,
-        transformer_layernorm: str = "pre",
-        patch_size: int = DEFAULT_PATCH_SIZE,
-        pool_type: str | None = None,
-    ):
-        super().__init__()
-        if seed is not None:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-
-        height, width = input_size
-        patch_size = int(patch_size)
-        token_dim = int(token_dim)
-        transformer_depth = int(transformer_depth)
-        attention_heads = int(attention_heads)
-        transformer_mlp_ratio = float(transformer_mlp_ratio)
-        token_dropout = float(token_dropout)
-        pool_type = str(pool_type or token_pool)
-
-        if patch_size <= 0:
-            raise ValueError("patch_size must be > 0")
-        if height < patch_size or width < patch_size:
-            raise ValueError("input_size must be at least one patch")
-        if height % patch_size != 0 or width % patch_size != 0:
-            raise ValueError("input_size must be divisible by patch_size")
-        if token_dim <= 0:
-            raise ValueError("token_dim must be > 0")
-        if transformer_depth <= 0:
-            raise ValueError("transformer_depth must be > 0")
-        if attention_heads <= 0 or token_dim % attention_heads != 0:
-            raise ValueError("attention_heads must divide token_dim")
-        if transformer_mlp_ratio <= 0.0:
-            raise ValueError("transformer_mlp_ratio must be > 0")
-        if pool_type not in {"mean", "cls"}:
-            raise ValueError("token_pool/pool_type must be 'mean' or 'cls'")
-        if token_positional_encoding not in {"none", "learned", "sinusoidal"}:
-            raise ValueError("token_positional_encoding must be 'none', 'learned', or 'sinusoidal'")
-        if not (0.0 <= token_dropout < 1.0):
-            raise ValueError("token_dropout must satisfy 0 <= value < 1")
-
-        patch_dim = 3 * patch_size * patch_size
-        grid_h = height // patch_size
-        grid_w = width // patch_size
-        num_patches = grid_h * grid_w
-        num_transformer_tokens = num_patches + 1
-
-        self.patch_unfold = nn.Unfold(kernel_size=patch_size, stride=patch_size)
-        self.patch_projection = nn.Linear(patch_dim, token_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, token_dim))
-        nn.init.normal_(self.cls_token, mean=0.0, std=0.01)
-        self.token_dropout = nn.Dropout(p=token_dropout)
-        self.token_transformer = nn.ModuleList(
-            [
-                TokenTransformerBlock(
-                    token_dim=token_dim,
-                    attention_heads=attention_heads,
-                    mlp_ratio=transformer_mlp_ratio,
-                    dropout=token_dropout,
-                    layernorm=transformer_layernorm,
-                    residual_scale=1.0,
-                )
-                for _ in range(transformer_depth)
-            ]
-        )
-        self.classifier = nn.Linear(token_dim, num_classes)
-        self.dropout = nn.Dropout(p=dropout_p)
-        self.omega_projector = (
-            OmegaProjector(
-                input_dim=token_dim,
-                hidden_dim=int(omega_hidden_dim),
-                depth=int(omega_projector_depth),
-            )
-            if omega_enabled
-            else None
-        )
-
-        if token_positional_encoding == "learned":
-            self.token_positional_embedding = nn.Parameter(torch.zeros(1, num_transformer_tokens, token_dim))
-            nn.init.normal_(self.token_positional_embedding, mean=0.0, std=0.01)
-            self.register_buffer("token_sinusoidal_embedding", torch.zeros(1, 0, token_dim), persistent=False)
-        elif token_positional_encoding == "sinusoidal":
-            self.register_parameter("token_positional_embedding", None)
-            self.register_buffer(
-                "token_sinusoidal_embedding",
-                _build_sinusoidal_positions(num_transformer_tokens, token_dim),
-                persistent=False,
-            )
-        else:
-            self.register_parameter("token_positional_embedding", None)
-            self.register_buffer("token_sinusoidal_embedding", torch.zeros(1, 0, token_dim), persistent=False)
-
-        self._input_size = tuple(input_size)
-        self._num_classes = int(num_classes)
-        self._width_scale = float(width_scale)
-        self._stage2_channels = 0
-        self._omega_enabled = bool(self.omega_projector is not None)
-        self._omega_projector_depth = int(omega_projector_depth) if self.omega_projector is not None else None
-        self._omega_hidden_dim = int(omega_hidden_dim) if self.omega_projector is not None else None
-        self._tokenize = True
-        self._token_dim = int(token_dim)
-        self._transformer_depth = int(transformer_depth)
-        self._attention_heads = int(attention_heads)
-        self._transformer_mlp_ratio = float(transformer_mlp_ratio)
-        self._token_pool = pool_type
-        self._token_positional_encoding = str(token_positional_encoding)
-        self._token_dropout = float(token_dropout)
-        self._transformer_layernorm = str(transformer_layernorm)
-        self._token_grid_size = (int(grid_h), int(grid_w))
-        self._patch_size = int(patch_size)
-        self._architecture = ARCHITECTURE_VIT
-
-    @property
-    def architecture(self) -> str:
-        return self._architecture
-
-    @property
-    def width_scale(self) -> float:
-        return self._width_scale
-
-    @property
-    def stage2_channels(self) -> int:
-        return self._stage2_channels
-
-    @property
-    def input_size(self) -> Tuple[int, int]:
-        return self._input_size
-
-    @property
-    def num_classes(self) -> int:
-        return self._num_classes
-
-    @property
-    def omega_enabled(self) -> bool:
-        return self._omega_enabled
-
-    @property
-    def omega_projector_depth(self) -> int | None:
-        return self._omega_projector_depth
-
-    @property
-    def omega_hidden_dim(self) -> int | None:
-        return self._omega_hidden_dim
-
-    @property
-    def tokenize(self) -> bool:
-        return self._tokenize
-
-    @property
-    def token_dim(self) -> int:
-        return self._token_dim
-
-    @property
-    def transformer_depth(self) -> int:
-        return self._transformer_depth
-
-    @property
-    def vit_depth(self) -> int:
-        return self._transformer_depth
-
-    @property
-    def attention_heads(self) -> int:
-        return self._attention_heads
-
-    @property
-    def transformer_mlp_ratio(self) -> float:
-        return self._transformer_mlp_ratio
-
-    @property
-    def token_pool(self) -> str:
-        return self._token_pool
-
-    @property
-    def pool_type(self) -> str:
-        return self._token_pool
-
-    @property
-    def token_positional_encoding(self) -> str:
-        return self._token_positional_encoding
-
-    @property
-    def token_dropout_p(self) -> float:
-        return self._token_dropout
-
-    @property
-    def transformer_layernorm(self) -> str:
-        return self._transformer_layernorm
-
-    @property
-    def token_grid_size(self) -> tuple[int, int]:
-        return self._token_grid_size
-
-    @property
-    def patch_size(self) -> int:
-        return self._patch_size
-
-    @property
-    def idsi_layer_names(self) -> tuple[str, ...]:
-        return ("patch_embedding",) + tuple(
-            f"transformer_block_{index + 1}" for index in range(self.transformer_depth)
-        )
-
-    def _normalize_runtime_input(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
-        if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x)
-        if not isinstance(x, torch.Tensor):
-            raise TypeError(f"Unsupported input type: {type(x)!r}")
-        device = next(self.parameters()).device
-        x = x.to(device=device, dtype=torch.float32)
-        if x.ndim != 4:
-            raise ValueError(f"Expected 4D input, got {tuple(x.shape)}")
-        if x.shape[1] == 3:
-            return x
-        if x.shape[-1] == 3:
-            return x.permute(0, 3, 1, 2)
-        raise ValueError("Input must be NHWC or NCHW with 3 channels")
-
-    def _positional_slice(self, *, start: int, end: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor | None:
-        if self.token_positional_encoding == "none":
-            return None
-        if self.token_positional_encoding == "learned":
-            if self.token_positional_embedding is None:
-                return None
-            return self.token_positional_embedding[:, start:end].to(dtype=dtype, device=device)
-        if self.token_sinusoidal_embedding.numel() == 0:
-            return None
-        return 0.05 * self.token_sinusoidal_embedding[:, start:end].to(dtype=dtype, device=device)
-
-    def _patch_tokens(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        patches = self.patch_unfold(x).transpose(1, 2).contiguous()
-        patch_tokens = self.patch_projection(patches)
-        patch_pos = self._positional_slice(
-            start=1,
-            end=1 + patch_tokens.shape[1],
-            dtype=patch_tokens.dtype,
-            device=patch_tokens.device,
-        )
-        positioned_patch_tokens = patch_tokens if patch_pos is None else patch_tokens + patch_pos
-        return patch_tokens, positioned_patch_tokens
-
-    def _forward_vit_tokens(
-        self,
-        x: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        tuple[torch.Tensor, ...],
-        tuple[torch.Tensor, ...],
-    ]:
-        patch_tokens, positioned_patch_tokens = self._patch_tokens(x)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        cls_pos = self._positional_slice(
-            start=0,
-            end=1,
-            dtype=patch_tokens.dtype,
-            device=patch_tokens.device,
-        )
-        if cls_pos is not None:
-            cls_tokens = cls_tokens + cls_pos
-        tokens = torch.cat((cls_tokens, positioned_patch_tokens), dim=1)
-        tokens = self.token_dropout(tokens)
-
-        layer_inputs: list[torch.Tensor] = [patch_tokens]
-        layer_outputs: list[torch.Tensor] = [patch_tokens]
-        for block in self.token_transformer:
-            block_input = tokens
-            tokens = block(tokens)
-            layer_inputs.append(block_input)
-            layer_outputs.append(tokens)
-        cls_output = tokens[:, 0]
-        spatial_tokens = tokens[:, 1:]
-        return tokens, cls_output, spatial_tokens, tuple(layer_inputs), tuple(layer_outputs)
-
-    def _forward_logits_from_cls(self, cls_output: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.dropout(cls_output))
-
-    def forward_with_representation(self, x: torch.Tensor | np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-        x_tensor = self._normalize_runtime_input(x)
-        _, cls_output, spatial_tokens, _, _ = self._forward_vit_tokens(x_tensor)
-        if self.token_pool == "mean":
-            cls_output = spatial_tokens.mean(dim=1)
-        return self._forward_logits_from_cls(cls_output), cls_output
-
-    def forward_with_token_dynamics(
-        self,
-        x: torch.Tensor | np.ndarray,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_tensor = self._normalize_runtime_input(x)
-        _, cls_output, spatial_tokens, _, _ = self._forward_vit_tokens(x_tensor)
-        if self.token_pool == "mean":
-            cls_output = spatial_tokens.mean(dim=1)
-        omega_target = self.omega_projector(cls_output) if self.omega_projector is not None else cls_output
-        return self._forward_logits_from_cls(cls_output), cls_output, omega_target
-
-    def forward_with_token_dynamics_and_layer_idsi(
-        self,
-        x: torch.Tensor | np.ndarray,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        tuple[torch.Tensor, ...],
-        tuple[torch.Tensor, ...],
-        torch.Tensor,
-    ]:
-        x_tensor = self._normalize_runtime_input(x)
-        _, cls_output, spatial_tokens, layer_inputs, layer_outputs = self._forward_vit_tokens(x_tensor)
-        if self.token_pool == "mean":
-            cls_output = spatial_tokens.mean(dim=1)
-        omega_target = self.omega_projector(cls_output) if self.omega_projector is not None else cls_output
-        return (
-            self._forward_logits_from_cls(cls_output),
-            cls_output,
-            omega_target,
-            layer_inputs,
-            layer_outputs,
-            spatial_tokens,
-        )
-
-    def forward_with_omega(self, x: torch.Tensor | np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.omega_projector is None:
-            raise RuntimeError("Omega projector is disabled for this model instance")
-        return self.forward_with_token_dynamics(x)
-
-    def forward_with_omega_and_layer_idsi(self, x: torch.Tensor | np.ndarray) -> tuple[torch.Tensor, ...]:
-        if self.omega_projector is None:
-            raise RuntimeError("Omega projector is disabled for this model instance")
-        return self.forward_with_token_dynamics_and_layer_idsi(x)
-
-    def forward(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
-        logits, _ = self.forward_with_representation(x)
-        return logits
-
-    def save_weights(self, path: str | Path, metadata: Mapping[str, Any] | None = None) -> None:
-        checkpoint = Path(path)
-        if checkpoint.suffix not in {".pt", ".pth"}:
-            raise ValueError("Checkpoint path must use .pt or .pth extension")
-        checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        payload_metadata = {
-            "checkpoint_version": 3,
-            "backend": "torch",
-            "architecture": ARCHITECTURE_VIT,
-            "num_classes": int(self.num_classes),
-            "width_scale": 0.0,
-            "stage2_channels": 0,
-            "input_size": list(self.input_size),
-            "omega_enabled": bool(self.omega_enabled),
-            "omega_projector_depth": self.omega_projector_depth,
-            "omega_hidden_dim": self.omega_hidden_dim,
-            "tokenize": True,
-            "patch_size": int(self.patch_size),
-            "vit_depth": int(self.vit_depth),
-            "token_dim": int(self.token_dim),
-            "attention_heads": int(self.attention_heads),
-            "transformer_depth": int(self.transformer_depth),
-            "transformer_mlp_ratio": float(self.transformer_mlp_ratio),
-            "pool_type": self.pool_type,
-            "token_pool": self.token_pool,
-            "token_positional_encoding": self.token_positional_encoding,
-            "token_dropout": float(self.token_dropout_p),
-            "transformer_layernorm": self.transformer_layernorm,
-            "token_grid_size": list(self.token_grid_size),
-            **({} if metadata is None else dict(metadata)),
-        }
-        torch.save({"model": self.state_dict(), "meta": payload_metadata}, checkpoint)
-
-    def load_weights(
-        self,
-        path: str | Path,
-        map_location: str | torch.device | None = None,
-    ) -> dict[str, Any]:
-        state, metadata = load_checkpoint_state(path, map_location=map_location)
-        self.load_state_dict(state)
-        return metadata
-
-
 CNN = TorchCNN
 
 __all__ = [
-    "ARCHITECTURE_LEGACY_CNN",
-    "ARCHITECTURE_LEGACY_TOKEN",
-    "ARCHITECTURE_VIT",
     "CheckpointRuntimeConfig",
-    "DEFAULT_ATTENTION_HEADS",
     "DEFAULT_OMEGA_FEATURE_DIM",
-    "DEFAULT_PATCH_SIZE",
-    "DEFAULT_POOL_TYPE",
-    "DEFAULT_TOKEN_DIM",
-    "DEFAULT_VIT_DEPTH",
     "TorchCNN",
-    "TorchLegacyCNN",
     "CNN",
     "load_checkpoint_state",
     "resolve_checkpoint_runtime_config",

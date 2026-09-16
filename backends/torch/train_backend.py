@@ -22,22 +22,26 @@ from typing import Any, Callable, Protocol, Sequence, cast
 import numpy as np
 
 import config
-from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, DEFAULT_PATCH_SIZE, TorchCNN, load_checkpoint_state
+from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, TorchCNN, load_checkpoint_state
 from data.loaders import load_image
 from data.preprocessing import preprocess_image
 from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
     ModelEMA,
+    adjust_phase_lr_offset_after_unfreeze,
     augment_batch,
     build_epoch_phase_map,
     compute_effective_learning_rate,
     compute_phase_learning_rate,
+    parse_bool_flag,
     validate_augmentation_args,
     validate_cutmix_ratio,
     validate_ema_decay,
     validate_focal_gamma,
+    validate_freeze_cycle_args,
     validate_mixup_alpha,
     validate_mixup_probability,
+    validate_model_width_scale,
     validate_phase_learning_rates,
 )
 
@@ -1610,14 +1614,7 @@ def load_weights_forgiving(model: TorchCNN, checkpoint_path: str | Path, skip_pr
 
 
 def _apply_backbone_freeze_state(model: TorchCNN, backbone_frozen: bool, freeze_bn_affine: bool) -> None:
-    """Compatibility helper for legacy CNN freeze tests; unused by Phase 3.1 training."""
-    if not all(
-        hasattr(model, name)
-        for name in ("iter_head_parameters", "iter_backbone_parameters", "backbone_batchnorm_layers")
-    ):
-        for parameter in model.parameters():
-            parameter.requires_grad = True
-        return
+    """Apply the temporary freeze policy after each `model.train()` call."""
     for parameter in model.iter_head_parameters():
         parameter.requires_grad = True
 
@@ -1644,7 +1641,7 @@ def _build_optimizer(
     model: TorchCNN,
     lr_value: float,
 ) -> torch.optim.Optimizer:
-    """Build the optimizer over currently trainable parameters."""
+    """Recreate the optimizer intentionally when freeze state changes."""
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if args.optimizer == "adamw":
         return torch.optim.AdamW(parameters, lr=lr_value, weight_decay=args.weight_decay)
@@ -1663,13 +1660,16 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE, help="Batch size")
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker count (defaults to 4 for streaming, 0 for preloaded)")
-    parser.add_argument("--lr", type=float, nargs="+", default=[3e-4], help="One learning rate per phase")
+    parser.add_argument("--lr", type=float, nargs="+", default=[1e-3], help="One learning rate per phase")
     parser.add_argument("--phase-count", type=int, default=1, help="Number of contiguous training phases")
     parser.add_argument("--warmup-epochs", type=int, default=0, help="Warmup epochs at the start of each phase")
+    parser.add_argument("--freeze-patience", type=int, default=8, help="Epochs without val_acc improvement before freezing the backbone")
+    parser.add_argument("--freeze-epoch-num", type=int, default=10, help="How many epochs each temporary freeze window lasts")
+    parser.add_argument("--after-unfreeze-lr-change", type=float, default=1e-4, help="Additive LR decrement applied after unfreeze when allowed")
     parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw", help="Optimizer type")
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum (for SGD)")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability in classifier head")
+    parser.add_argument("--dropout", type=float, default=0.5, help="Dropout probability in classifier head")
     parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing factor")
     parser.add_argument("--val-split", type=float, default=0.2, help="Validation split ratio")
     parser.add_argument("--min-lr-ratio", type=float, default=0.2, help="Minimum LR ratio for cosine schedule")
@@ -1704,22 +1704,23 @@ def main() -> None:
     parser.add_argument("--brightness", type=float, default=0.2, help="Brightness jitter strength in [0, 1]")
     parser.add_argument("--contrast", type=float, default=0.2, help="Contrast jitter strength in [0, 1]")
     parser.add_argument("--saturation", type=float, default=0.2, help="Saturation jitter strength in [0, 1]")
-    parser.add_argument("--omega-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable the Omega-loss auxiliary branch on the ViT representation")
-    parser.add_argument("--omega-lambda", type=float, default=0.0, help="Weight applied to the Omega attractor loss")
-    parser.add_argument("--idsi-lambda", type=float, default=0.005, help="Weight applied to the Layer-IDSI loss when --token-idsi is enabled")
+    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
+    parser.add_argument("--omega-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable the Phase 1 Omega-loss auxiliary branch")
+    parser.add_argument("--omega-lambda", type=float, default=0.0, help="Weight applied to the Phase 1 Omega attractor loss")
+    parser.add_argument("--idsi-lambda", type=float, default=0.005, help="Weight applied to the Phase 1.2 Layer-IDSI loss when --omega-loss is enabled")
     parser.add_argument("--omega-projector-depth", type=int, default=1, help="Omega projector depth: 1 or 2 linear layers")
     parser.add_argument("--omega-hidden-dim", type=int, default=DEFAULT_OMEGA_FEATURE_DIM, help="Hidden width for the 2-layer Omega projector")
-    parser.add_argument("--tokenize", action=argparse.BooleanOptionalAction, default=True, help="Enable Phase3 ViT patch-token representation")
-    parser.add_argument("--token-dim", type=int, default=128, help="Token embedding dimension for Phase3 ViT")
-    parser.add_argument("--transformer-depth", type=int, default=4, help="Number of ViT transformer blocks")
+    parser.add_argument("--tokenize", action=argparse.BooleanOptionalAction, default=False, help="Enable Phase2 tokenized feature representation")
+    parser.add_argument("--token-dim", type=int, default=128, help="Token embedding dimension for Phase2")
+    parser.add_argument("--transformer-depth", type=int, default=1, help="Number of lightweight transformer blocks")
     parser.add_argument("--attention-heads", type=int, default=4, help="Attention head count for token transformer")
     parser.add_argument("--transformer-mlp-ratio", type=float, default=2.0, help="Expansion ratio for transformer FFN")
-    parser.add_argument("--token-pool", choices=["cls"], default="cls", help="Pooling strategy for token classification")
+    parser.add_argument("--token-pool", choices=["mean", "cls"], default="mean", help="Pooling strategy for token classification")
     parser.add_argument("--token-positional-encoding", choices=["none", "learned", "sinusoidal"], default="learned", help="Positional encoding type for tokens")
     parser.add_argument("--token-dropout", type=float, default=0.1, help="Dropout inside transformer token block")
     parser.add_argument("--transformer-layernorm", choices=["pre", "post"], default="pre", help="Transformer LayerNorm placement")
-    parser.add_argument("--token-omega-loss", action=argparse.BooleanOptionalAction, default=True, help="Apply Omega loss to the ViT representation")
-    parser.add_argument("--token-idsi", action=argparse.BooleanOptionalAction, default=True, help="Enable Layer-IDSI monitoring for patch embedding and transformer blocks")
+    parser.add_argument("--token-omega-loss", action=argparse.BooleanOptionalAction, default=True, help="Apply Omega loss in token space")
+    parser.add_argument("--token-idsi", action=argparse.BooleanOptionalAction, default=True, help="Enable Layer-IDSI monitoring for token transformer")
     parser.add_argument("--token-diversity-monitor", action=argparse.BooleanOptionalAction, default=True, help="Track token diversity metrics")
     parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True, help="If true, stream batches from disk; if false, preload all images into memory.")
@@ -1734,6 +1735,14 @@ def main() -> None:
     parser.add_argument("--enforce-readonly-dataset", action=argparse.BooleanOptionalAction, default=True, help="Verify Dataset unchanged before/after run")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Training device")
+    parser.add_argument(
+        "--freeze-bn-affine",
+        type=parse_bool_flag,
+        nargs="?",
+        const=True,
+        default=True,
+        help="When false, keep BN affine parameters trainable during backbone freeze",
+    )
     args = parser.parse_args()
 
     if args.help_md:
@@ -1746,12 +1755,15 @@ def main() -> None:
 
     if args.phase_count > args.epochs:
         raise SystemExit("--phase-count cannot be greater than --epochs")
-    if not args.tokenize:
-        raise SystemExit("--no-tokenize is not supported in Phase 3.1 torch training; the torch backend is pure ViT.")
     if not (0.0 <= float(args.label_smoothing) < 1.0):
         raise SystemExit("--label-smoothing must satisfy 0 <= value < 1")
     try:
         lr_values = validate_phase_learning_rates(args.lr, args.phase_count)
+        freeze_patience, freeze_epoch_num, after_unfreeze_lr_change = validate_freeze_cycle_args(
+            args.freeze_patience,
+            args.freeze_epoch_num,
+            args.after_unfreeze_lr_change,
+        )
         augment_config = validate_augmentation_args(
             args.rotation,
             args.brightness,
@@ -1763,6 +1775,7 @@ def main() -> None:
         cutmix_ratio = validate_cutmix_ratio(args.cutmix_ratio)
         ema_decay = validate_ema_decay(args.ema_decay)
         focal_gamma = validate_focal_gamma(args.focal_gamma)
+        width_scale = validate_model_width_scale(args.model_width_scale)
         omega_lambda, idsi_lambda, omega_projector_depth, omega_hidden_dim = _validate_omega_args(
             omega_loss=bool(args.omega_loss),
             omega_lambda=args.omega_lambda,
@@ -1786,9 +1799,15 @@ def main() -> None:
     device = _resolve_device(args.device)
     amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
     use_channels_last = _configure_runtime_kernels(device, fixed_input_shape=True)
-    omega_enabled = bool(args.omega_loss and args.token_omega_loss)
-    token_metrics_enabled = bool(args.token_diversity_monitor)
-    idsi_enabled = bool(idsi_lambda > 0.0 and args.token_idsi)
+    omega_enabled = bool(args.omega_loss and (not args.tokenize or args.token_omega_loss))
+    token_metrics_enabled = bool(args.tokenize and args.token_diversity_monitor)
+    idsi_enabled = bool(
+        idsi_lambda > 0.0
+        and (
+            (bool(args.omega_loss) and not args.tokenize)
+            or (bool(args.tokenize) and bool(args.token_idsi))
+        )
+    )
 
     data_dir = Path(args.data_dir) if args.data_dir else Path(config.DATA_DIR)
     data_dir = data_dir.resolve()
@@ -1912,10 +1931,11 @@ def main() -> None:
         num_classes=num_classes,
         seed=args.seed,
         dropout_p=args.dropout,
-        omega_enabled=omega_enabled,
+        width_scale=width_scale,
+        omega_enabled=bool(args.omega_loss and not args.tokenize),
         omega_projector_depth=omega_projector_depth,
         omega_hidden_dim=omega_hidden_dim,
-        tokenize=True,
+        tokenize=bool(args.tokenize),
         token_dim=token_dim,
         transformer_depth=transformer_depth,
         attention_heads=attention_heads,
@@ -1924,29 +1944,24 @@ def main() -> None:
         token_positional_encoding=args.token_positional_encoding,
         token_dropout=token_dropout,
         transformer_layernorm=args.transformer_layernorm,
-        patch_size=DEFAULT_PATCH_SIZE,
     )
     if use_channels_last:
         model.to(device=device, memory_format=torch.channels_last)
     else:
         model.to(device=device)
-    print(
-        f"Using Phase3.1 ViT: patch_size={model.patch_size} "
-        f"grid={model.token_grid_size[0]}x{model.token_grid_size[1]} "
-        f"dim={model.token_dim} depth={model.vit_depth} heads={model.attention_heads} "
-        f"pool={model.pool_type}"
-    )
+    print(f"Using stage2_channels={model.stage2_channels} (width_scale={model.width_scale:.3f})")
+    if model.tokenize:
+        print(
+            f"Using Phase2 tokens: grid={model.token_grid_size[0]}x{model.token_grid_size[1]} "
+            f"dim={model.token_dim} depth={model.transformer_depth} heads={model.attention_heads}"
+        )
     if args.init_from:
         try:
             model.load_weights(args.init_from, map_location=device)
             print(f"Initialized weights from: {args.init_from}")
         except Exception as exc:
             print(f"[warn] Strict load failed: {exc}")
-            loaded, skipped = load_weights_forgiving(
-                model,
-                args.init_from,
-                skip_prefixes=("classifier.", "fc2.", "token_classifier."),
-            )
+            loaded, skipped = load_weights_forgiving(model, args.init_from, skip_prefixes=("fc2.",))
             print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (for example, classifier or resized feature tensors)")
             if use_channels_last:
                 model.to(device=device, memory_format=torch.channels_last)
@@ -1958,6 +1973,10 @@ def main() -> None:
     current_phase_index = -1
     current_phase_base_lr = lr_values[0]
     phase_lr_offset = 0.0
+    phase_best_val_acc = -float("inf")
+    phase_plateau_epochs = 0
+    freeze_epochs_remaining = 0
+    backbone_frozen = False
 
     best_val_loss = float("inf")
     best_val_acc = 0.0
@@ -1968,6 +1987,7 @@ def main() -> None:
     collapse_low_variance_epochs = 0
     final_epoch_metrics: dict[str, Any] | None = None
 
+    _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
     optimizer: torch.optim.Optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
     scaler = _make_grad_scaler(device, amp_dtype)
 
@@ -2005,10 +2025,11 @@ def main() -> None:
             num_classes=num_classes,
             seed=args.seed,
             dropout_p=args.dropout,
-            omega_enabled=omega_enabled,
+            width_scale=width_scale,
+            omega_enabled=bool(args.omega_loss and not args.tokenize),
             omega_projector_depth=omega_projector_depth,
             omega_hidden_dim=omega_hidden_dim,
-            tokenize=True,
+            tokenize=bool(args.tokenize),
             token_dim=token_dim,
             transformer_depth=transformer_depth,
             attention_heads=attention_heads,
@@ -2017,7 +2038,6 @@ def main() -> None:
             token_positional_encoding=args.token_positional_encoding,
             token_dropout=token_dropout,
             transformer_layernorm=args.transformer_layernorm,
-            patch_size=DEFAULT_PATCH_SIZE,
         )
         if use_channels_last:
             ema_model.to(device=device, memory_format=torch.channels_last)
@@ -2060,8 +2080,8 @@ def main() -> None:
                 "resolved_device": str(device),
                 "resolved_num_classes": int(num_classes),
                 "resolved_class_names": list(resolved_class_names),
-                "architecture": model.architecture,
-                "patch_size": int(model.patch_size),
+                "resolved_width_scale": float(width_scale),
+                "resolved_stage2_channels": int(model.stage2_channels),
                 "omega_enabled": bool(omega_enabled),
                 "omega_lambda": float(omega_lambda),
                 "idsi_enabled": bool(idsi_enabled),
@@ -2071,11 +2091,9 @@ def main() -> None:
                 "omega_hidden_dim": int(omega_hidden_dim),
                 "tokenize": bool(model.tokenize),
                 "token_dim": int(model.token_dim),
-                "vit_depth": int(model.vit_depth),
                 "transformer_depth": int(model.transformer_depth),
                 "attention_heads": int(model.attention_heads),
                 "transformer_mlp_ratio": float(model.transformer_mlp_ratio),
-                "pool_type": model.pool_type,
                 "token_pool": model.token_pool,
                 "token_positional_encoding": model.token_positional_encoding,
                 "token_dropout": float(model.token_dropout_p),
@@ -2101,7 +2119,12 @@ def main() -> None:
             current_phase_index = phase_config.phase_index
             current_phase_base_lr = lr_values[current_phase_index]
             phase_lr_offset = 0.0
+            phase_best_val_acc = -float("inf")
+            phase_plateau_epochs = 0
+            freeze_epochs_remaining = 0
+            backbone_frozen = False
             model.train()
+            _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
             optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
             scaler = _make_grad_scaler(device, amp_dtype)
             print(
@@ -2112,7 +2135,8 @@ def main() -> None:
             )
 
         model.train()
-        mode_text = "full"
+        epoch_backbone_frozen = backbone_frozen
+        _apply_backbone_freeze_state(model, backbone_frozen=epoch_backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
         epoch_loss = 0.0
         epoch_ce_loss = 0.0
         epoch_attr_loss = 0.0
@@ -2306,8 +2330,52 @@ def main() -> None:
             if args.early_stop_metric != "val_acc":
                 best_val_acc = max(best_val_acc, val_acc)
 
+            if epoch_backbone_frozen:
+                if val_acc > (phase_best_val_acc + args.min_delta):
+                    phase_best_val_acc = val_acc
+                freeze_epochs_remaining -= 1
+                if freeze_epochs_remaining <= 0:
+                    next_phase_start_lr = lr_values[current_phase_index + 1] if current_phase_index + 1 < len(lr_values) else None
+                    phase_lr_offset, deduction_applied = adjust_phase_lr_offset_after_unfreeze(
+                        current_effective_lr=current_lr,
+                        phase_lr_offset=phase_lr_offset,
+                        after_unfreeze_lr_change=after_unfreeze_lr_change,
+                        phase_base_lr=current_phase_base_lr,
+                        min_lr_ratio=args.min_lr_ratio,
+                        next_phase_start_lr=next_phase_start_lr,
+                    )
+                    backbone_frozen = False
+                    phase_plateau_epochs = 0
+                    model.train()
+                    _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
+                    optimizer = _build_optimizer(args, model, lr_value=current_lr)
+                    scaler = _make_grad_scaler(device, amp_dtype)
+                    lr_message = "reduced" if deduction_applied else "kept"
+                    print(
+                        f"Backbone unfrozen at epoch {epoch + 1}: cumulative lr offset {lr_message} at {phase_lr_offset:.6f}."
+                    )
+            else:
+                if val_acc > (phase_best_val_acc + args.min_delta):
+                    phase_best_val_acc = val_acc
+                    phase_plateau_epochs = 0
+                else:
+                    phase_plateau_epochs += 1
+                    if phase_plateau_epochs >= freeze_patience:
+                        backbone_frozen = True
+                        freeze_epochs_remaining = freeze_epoch_num
+                        phase_plateau_epochs = 0
+                        model.train()
+                        _apply_backbone_freeze_state(model, backbone_frozen=True, freeze_bn_affine=args.freeze_bn_affine)
+                        optimizer = _build_optimizer(args, model, lr_value=current_lr)
+                        scaler = _make_grad_scaler(device, amp_dtype)
+                        print(
+                            f"Backbone frozen at epoch {epoch + 1}: val_acc plateaued for {freeze_patience} epochs; "
+                            f"training the head for {freeze_epoch_num} epochs."
+                        )
+
             gap = train_acc - val_acc
             marker = " *" if improved else ""
+            mode_text = "head-only" if epoch_backbone_frozen else "full"
             print(
                 f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
                 f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  "
@@ -2377,6 +2445,25 @@ def main() -> None:
                 print(f"Early stopping at epoch {epoch + 1}: metric {args.early_stop_metric} did not improve by {args.min_delta} for {args.patience} epochs.")
                 break
         else:
+            if epoch_backbone_frozen:
+                freeze_epochs_remaining -= 1
+                if freeze_epochs_remaining <= 0:
+                    next_phase_start_lr = lr_values[current_phase_index + 1] if current_phase_index + 1 < len(lr_values) else None
+                    phase_lr_offset, _ = adjust_phase_lr_offset_after_unfreeze(
+                        current_effective_lr=current_lr,
+                        phase_lr_offset=phase_lr_offset,
+                        after_unfreeze_lr_change=after_unfreeze_lr_change,
+                        phase_base_lr=current_phase_base_lr,
+                        min_lr_ratio=args.min_lr_ratio,
+                        next_phase_start_lr=next_phase_start_lr,
+                    )
+                    backbone_frozen = False
+                    phase_plateau_epochs = 0
+                    model.train()
+                    _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
+                    optimizer = _build_optimizer(args, model, lr_value=current_lr)
+                    scaler = _make_grad_scaler(device, amp_dtype)
+            mode_text = "head-only" if epoch_backbone_frozen else "full"
             print(
                 f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
                 f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}"
@@ -2464,11 +2551,6 @@ def main() -> None:
                 "representation_collapse_warning": representation_collapse_warning,
                 "collapse_variance_threshold": float(OMEGA_COLLAPSE_VARIANCE_THRESHOLD),
                 "collapse_consecutive_epochs": int(OMEGA_COLLAPSE_EPOCHS),
-                "architecture": model.architecture,
-                "patch_size": int(model.patch_size),
-                "vit_depth": int(model.vit_depth),
-                "pool_type": model.pool_type,
-                "omega_enabled": bool(omega_enabled),
                 "omega_lambda": float(omega_lambda),
                 "idsi_lambda": float(idsi_lambda),
                 "idsi_enabled": bool(idsi_enabled),
