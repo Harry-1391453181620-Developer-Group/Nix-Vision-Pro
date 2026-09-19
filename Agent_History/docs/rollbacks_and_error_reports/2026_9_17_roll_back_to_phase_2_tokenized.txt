@@ -1,0 +1,36 @@
+After unacceptable difficulties and comprehensive considerations, I decided to rollback this project from Phase 3 back to the final sub-process of Phase 2.
+
+Reasons:
+    1. Falling and failing training: the ViT is more suitable for large amount of photos, but we only have 6000 photos approximately, so the 
+       best model we reached in the pure ViT phase 3 only get 54% approximately, which is a significant drop from the Phase 2 mixed structure (78%).
+       During the training, we also se underfitting problems, but most improtantly, we found that our IDSI is only suitable for the first transformer block,
+       for the deeper transformer blocks, the IDSI is higher when val_acc increase, which is opposite with our expectation, but understandable because 
+       the model needs to be more active to have more generalization ability.
+    2. Unstability of code reaches the highest level: Because this project is fully coded by Codex, we examined the code by human and found unacceptable 
+       unstability in the code. We fixed those errors as much as we can but the ViT version is still very unstable. The risk of further development is very high.
+    3. Harware demand out of bound: The project is own by Harry-1391453181620 Developer Group but currently there is only one person is the group, who is poor.
+       So we don't really have the GPUs and accelerators to train large ViTs, the only thing we are using now is a RTX 5070 laptop. However, there is a good news that
+       we are considering purchase a DGX Spark or a 5090 eGPU in order to gain more memory and computational ability.
+
+Implementations:
+NOTE: All implementations are same on both the local repo and the remote github repo, we always let the github repo be updated.
+    1. Rollback to the CNN+ViT stable version.
+    2. Change the model scale from 6CNN+1Transformer to 10CNN + 2Transformer.
+    3. Preserve the IDSI and Omega experimental losses.
+    4. Change the image processors to float 32 instead of float 64 to decrease memory occupation.
+    5. Tried training but failed because of harware.
+    6. The best model is still phase_2_preserved_best_model_torch.pt
+    7. The pure ViT version is now stored and TEMPORARILY untouched in a new brach "reserved-pure-vit-version" which can be accessed on both local and remote repo.
+
+Future Plans:
+    1. Expand the current Phase 2 structure as I already done.
+    2. Purchase more powerful harwares.
+    3. Expand the dataset largely, consider import more data from Huggingface
+    4. The pure ViT version is reserved but not deleted because I consider to build a parrellel structure with mixed CNN+Transformer and Pure ViT and produce the output combinely.
+    5. In the future, this model will not only be image classification, but also image segmentation, this is why I consider parrellel, ViT is more powerful in image segmentation and CNN is more compatible and convinient in image classification.
+    6. The original Phase 3 plans are ALL DEPRECIATED AND WILL NEVER BE USED AGAIN, we will directly shift to Phase 4, parrellelism after the training and optimizing of the current version.
+    7. The thought of plug this model into a MoE is still considered, which means the Project_Final_Goal is still valid.
+    8. The IDSI and Omega loss will NOT be imposed on all blocks later, detailed implementation will be decided by further experiments.
+    9. Another way might be imposing the advanced losses on all blocks but for each block a different weight of the loss (lambda) is used.
+    10. The project will gradually be taken over by human during the future one year.
+    11. If one day we proved that IDSI and Omega loss is rubbish for the current structure, there may be a huge reconstruction of the whole project including the definition of the losses.

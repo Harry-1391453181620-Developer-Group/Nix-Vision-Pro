@@ -52,7 +52,7 @@ def normalize(
     """
     lo, hi = input_range
     out_lo, out_hi = scale
-    out = np.asarray(image, dtype=np.float64)
+    out = np.asarray(image, dtype=np.float32)
     out = (out - lo) / (hi - lo)
     out = out * (out_hi - out_lo) + out_lo
     return out

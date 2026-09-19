@@ -1,4 +1,4 @@
-"""PyTorch CNN + SE backend model.
+"""PyTorch 5-stage CNN + SE backend model.
 
 The stage-2 width is now parameterized with a width scale so the project can use
 smaller intermediate feature maps without hard-coding a single architecture.
@@ -114,16 +114,14 @@ def load_checkpoint_state(
     return payload, {}
 
 
-def _resolve_stage2_channels(width_scale: float) -> int:
-    """Convert a width multiplier into a safe integer channel count.
-
-    The base architecture uses 64 channels in stage 2. A scale of 0.75 therefore
-    maps to 48 channels, which is the requested default reduction.
+def _resolve_stage_channels(width_scale: float) -> tuple[int, int, int, int, int]:
+    """Resolve 5-stage channel counts from a global width multiplier.
     """
     width_scale = float(width_scale)
     if width_scale <= 0.0:
         raise ValueError("width_scale must be > 0")
-    return max(8, int(round(64 * width_scale)))
+    base = (32, 64, 128, 256, 256)
+    return tuple(max(8, int(round(c * width_scale))) for c in base)
 
 
 def _normalize_input_size(value: Any) -> Tuple[int, int] | None:
@@ -139,21 +137,23 @@ def _normalize_input_size(value: Any) -> Tuple[int, int] | None:
     return (height, width)
 
 
-def _infer_input_size_from_state(
-    state: Mapping[str, torch.Tensor],
-    default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
-) -> Tuple[int, int]:
+def _infer_input_size_from_state(state, default_input_size=DEFAULT_INPUT_SIZE, stage_channels=None):
     fc1_weight = state.get("fc1.weight")
     if fc1_weight is None or fc1_weight.ndim != 2:
         return tuple(default_input_size)
     flatten_dim = int(fc1_weight.shape[1])
-    if flatten_dim <= 0 or flatten_dim % 128 != 0:
+    if flatten_dim <= 0:
         return tuple(default_input_size)
-    spatial_area = flatten_dim // 128
+    if stage_channels is None:
+        stage_channels = (32, 64, 128, 256, 256)
+    c_last = int(stage_channels[-1])
+    if c_last <= 0 or flatten_dim % c_last != 0:
+        return tuple(default_input_size)
+    spatial_area = flatten_dim // c_last
     spatial_edge = int(round(math.sqrt(spatial_area)))
     if spatial_edge * spatial_edge != spatial_area:
         return tuple(default_input_size)
-    return (spatial_edge * 8, spatial_edge * 8)
+    return (spatial_edge * 32, spatial_edge * 32)   # ← 注意 /32 不是 /8
 
 
 def _normalize_checkpoint_class_names(
@@ -187,29 +187,96 @@ def resolve_runtime_config_from_state(
     *,
     default_input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
 ) -> CheckpointRuntimeConfig:
+    """Resolve runtime configuration from a checkpoint state_dict.
+
+    Supports both:
+      - Legacy 3-stage checkpoints (channels inferred from `conv3.weight`)
+      - New N-stage checkpoints (channels read from `stage_channels` metadata)
+
+    Resolution priority for channel layout:
+      1. `metadata["stage_channels"]` if present and well-formed
+      2. `metadata["stage2_channels"]` + `metadata["width_scale"]`
+      3. Infer from `conv3.weight` shape (legacy fallback)
+    """
     metadata_dict = {} if metadata is None else dict(metadata)
 
+    # ------------------------------------------------------------------
+    # num_classes
+    # ------------------------------------------------------------------
     fc2_weight = state.get("fc2.weight")
     if fc2_weight is None or fc2_weight.ndim != 2:
         raise ValueError("Checkpoint is missing `fc2.weight`, so num_classes cannot be resolved")
-    conv3_weight = state.get("conv3.weight")
-    if conv3_weight is None or conv3_weight.ndim != 4:
-        raise ValueError("Checkpoint is missing `conv3.weight`, so width_scale cannot be resolved")
-
     num_classes = int(metadata_dict.get("num_classes", fc2_weight.shape[0]))
-    stage2_channels = int(metadata_dict.get("stage2_channels", conv3_weight.shape[0]))
-    width_scale = float(metadata_dict.get("width_scale", stage2_channels / 64.0))
+
+    # ------------------------------------------------------------------
+    # stage_channels resolution
+    # ------------------------------------------------------------------
+    stage_channels_meta = metadata_dict.get("stage_channels")
+    stage_channels: tuple[int, ...] | None = None
+    if isinstance(stage_channels_meta, (list, tuple)) and stage_channels_meta:
+        try:
+            parsed = tuple(int(c) for c in stage_channels_meta)
+            if all(c > 0 for c in parsed):
+                stage_channels = parsed
+        except (TypeError, ValueError):
+            stage_channels = None
+
+    conv3_weight = state.get("conv3.weight")
+    conv3_shape_ok = conv3_weight is not None and conv3_weight.ndim == 4
+
+    if stage_channels is not None:
+        # New N-stage checkpoint: width_scale is authoritative if present.
+        if "width_scale" in metadata_dict:
+            try:
+                width_scale = float(metadata_dict["width_scale"])
+            except (TypeError, ValueError):
+                width_scale = 1.0
+        else:
+            # Derive width_scale from 5-stage reference channels.
+            reference = (32, 64, 128, 256, 256)
+            if len(stage_channels) == len(reference):
+                ratios = [c / r for c, r in zip(stage_channels, reference)]
+                width_scale = float(sum(ratios) / len(ratios))
+            else:
+                width_scale = 1.0
+        # `stage2_channels` historically means the second stage's output width.
+        stage2_channels = int(stage_channels[1]) if len(stage_channels) > 1 else int(stage_channels[0])
+    else:
+        # Legacy 3-stage checkpoint path.
+        if not conv3_shape_ok:
+            raise ValueError(
+                "Checkpoint is missing `conv3.weight` and has no `stage_channels` metadata; "
+                "cannot resolve width_scale."
+            )
+        stage2_channels = int(metadata_dict.get("stage2_channels", conv3_weight.shape[0]))
+        width_scale = float(metadata_dict.get("width_scale", stage2_channels / 64.0))
+
+    # ------------------------------------------------------------------
+    # input_size
+    # ------------------------------------------------------------------
     input_size = (
         _normalize_input_size(metadata_dict.get("input_size"))
-        or _infer_input_size_from_state(state, default_input_size=default_input_size)
+        or _infer_input_size_from_state(state, default_input_size=default_input_size, stage_channels=stage_channels)
     )
+
+    # ------------------------------------------------------------------
+    # class names
+    # ------------------------------------------------------------------
     class_names = _normalize_checkpoint_class_names(
         metadata_dict.get("class_names"),
         expected_count=num_classes,
     )
+
+    # ------------------------------------------------------------------
+    # Omega branch
+    # ------------------------------------------------------------------
     omega_enabled = _normalize_omega_metadata_flag(metadata_dict.get("omega_enabled", False))
     omega_projector_depth = _normalize_optional_positive_int(metadata_dict.get("omega_projector_depth"))
     omega_hidden_dim = _normalize_optional_positive_int(metadata_dict.get("omega_hidden_dim"))
+
+    # ------------------------------------------------------------------
+    # Token / Transformer branch
+    # ------------------------------------------------------------------
     token_projection_weight = state.get("token_projection.weight")
     tokenize = _normalize_omega_metadata_flag(
         metadata_dict.get("tokenize", token_projection_weight is not None)
@@ -230,6 +297,14 @@ def resolve_runtime_config_from_state(
     except (TypeError, ValueError):
         token_dropout = None
     transformer_layernorm = _normalize_choice(metadata_dict.get("transformer_layernorm"), {"pre", "post"})
+
+    # ------------------------------------------------------------------
+    # Propagate resolved channels downstream for any consumer that wants them
+    # ------------------------------------------------------------------
+    if stage_channels is not None:
+        metadata_dict["stage_channels"] = list(stage_channels)
+    metadata_dict["stage2_channels"] = int(stage2_channels)
+    metadata_dict["width_scale"] = float(width_scale)
 
     return CheckpointRuntimeConfig(
         input_size=input_size,
@@ -408,20 +483,13 @@ class TokenTransformerBlock(nn.Module):
 
 
 class TorchCNN(nn.Module):
-    """Three-stage CNN + SE classifier matching the active project architecture."""
+    """Five-stage CNN + SE classifier matching the active project architecture."""
 
     CNN_IDSI_LAYER_NAMES: tuple[str, ...] = (
-        "stage1",
-        "stage2",
-        "stage3",
-        "classifier_pre_head",
+        "stage1", "stage2", "stage3", "stage4", "stage5", "classifier_pre_head"
     )
     TOKEN_IDSI_LAYER_NAMES: tuple[str, ...] = (
-        "stage1",
-        "stage2",
-        "stage3",
-        "token_projection",
-        "transformer_token_block",
+        "stage1", "stage2", "stage3", "stage4", "stage5", "token_projection", "transformer_token_block"
     )
 
     def __init__(
@@ -473,33 +541,52 @@ class TorchCNN(nn.Module):
         if not (0.0 <= token_dropout < 1.0):
             raise ValueError("token_dropout must satisfy 0 <= value < 1")
 
-        stage2_channels = _resolve_stage2_channels(width_scale)
+        c1, c2, c3, c4, c5 = _resolve_stage_channels(width_scale)
+        self._stage_channels = (c1, c2, c3, c4, c5)
 
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.se1 = SqueezeExcitation(32, reduction=4)
+        # Stage 1
+        self.conv1 = nn.Conv2d(3, c1, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(c1)
+        self.conv2 = nn.Conv2d(c1, c1, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(c1)
+        self.se1 = SqueezeExcitation(c1, reduction=4)
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # Stage 2 is the width-scaled stage. This is the main architecture knob.
-        self.conv3 = nn.Conv2d(32, stage2_channels, kernel_size=3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(stage2_channels)
-        self.conv4 = nn.Conv2d(stage2_channels, stage2_channels, kernel_size=3, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm2d(stage2_channels)
-        self.se2 = SqueezeExcitation(stage2_channels, reduction=4)
+        # Stage 2
+        self.conv3 = nn.Conv2d(c1, c2, kernel_size=3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(c2)
+        self.conv4 = nn.Conv2d(c2, c2, kernel_size=3, stride=1, padding=1)
+        self.bn4 = nn.BatchNorm2d(c2)
+        self.se2 = SqueezeExcitation(c2, reduction=4)
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # Stage 3 keeps its output width so the classifier head dimension stays stable.
-        self.conv5 = nn.Conv2d(stage2_channels, 128, kernel_size=3, stride=1, padding=1)
-        self.bn5 = nn.BatchNorm2d(128)
-        self.conv6 = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1)
-        self.bn6 = nn.BatchNorm2d(128)
-        self.se3 = SqueezeExcitation(128, reduction=4)
+        # Stage 3
+        self.conv5 = nn.Conv2d(c2, c3, kernel_size=3, stride=1, padding=1)
+        self.bn5 = nn.BatchNorm2d(c3)
+        self.conv6 = nn.Conv2d(c3, c3, kernel_size=3, stride=1, padding=1)
+        self.bn6 = nn.BatchNorm2d(c3)
+        self.se3 = SqueezeExcitation(c3, reduction=4)
         self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        feat_h, feat_w = height // 8, width // 8
-        self.fc1 = nn.Linear(feat_h * feat_w * 128, DEFAULT_OMEGA_FEATURE_DIM)
+        # Stage 4
+        self.conv7 = nn.Conv2d(c3, c4, kernel_size=3, stride=1, padding=1)
+        self.bn7 = nn.BatchNorm2d(c4)
+        self.conv8 = nn.Conv2d(c4, c4, kernel_size=3, stride=1, padding=1)
+        self.bn8 = nn.BatchNorm2d(c4)
+        self.se4 = SqueezeExcitation(c4, reduction=4)
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Stage 5
+        self.conv9 = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+        self.bn9 = nn.BatchNorm2d(c5)
+        self.conv10 = nn.Conv2d(c5, c5, kernel_size=3, stride=1, padding=1)
+        self.bn10 = nn.BatchNorm2d(c5)
+        self.se5 = SqueezeExcitation(c5, reduction=4)
+        self.pool5 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Total stride /32
+        feat_h, feat_w = height // 32, width // 32
+        self.fc1 = nn.Linear(feat_h * feat_w * c5, DEFAULT_OMEGA_FEATURE_DIM)
         self.dropout = nn.Dropout(p=dropout_p)
         self.fc2 = nn.Linear(DEFAULT_OMEGA_FEATURE_DIM, num_classes)
         token_grid_h, token_grid_w = _resolve_token_grid(feat_h, feat_w, DEFAULT_MAX_TOKENS)
@@ -509,7 +596,7 @@ class TorchCNN(nn.Module):
                 if (token_grid_h, token_grid_w) == (feat_h, feat_w)
                 else nn.AdaptiveAvgPool2d((token_grid_h, token_grid_w))
             )
-            self.token_projection = nn.Linear(128, token_dim)
+            self.token_projection = nn.Linear(c5, token_dim)
             self.token_dropout = nn.Dropout(p=token_dropout)
             self.token_transformer = nn.Sequential(
                 *[
@@ -563,7 +650,8 @@ class TorchCNN(nn.Module):
         self._input_size = tuple(input_size)
         self._num_classes = int(num_classes)
         self._width_scale = float(width_scale)
-        self._stage2_channels = int(stage2_channels)
+        self._stage_channels = tuple(int(c) for c in (c1, c2, c3, c4, c5))
+        self._stage2_channels = int(c2)
         self._omega_enabled = bool(self.omega_projector is not None)
         self._omega_projector_depth = int(omega_projector_depth) if self.omega_projector is not None else None
         self._omega_hidden_dim = int(omega_hidden_dim) if self.omega_projector is not None else None
@@ -579,14 +667,19 @@ class TorchCNN(nn.Module):
         self._token_grid_size = (int(token_grid_h), int(token_grid_w))
 
     @property
+    def stage2_channels(self) -> int:
+        """Backward-compatible alias for the second stage's output width."""
+        return self._stage2_channels
+    
+    @property
+    def stage_channels(self) -> tuple[int, ...]:
+        """Full N-stage channel layout, e.g. (32, 64, 128, 256, 256)."""
+        return self._stage_channels
+
+    @property
     def width_scale(self) -> float:
         """Expose the configured width scale for tests and debugging."""
         return self._width_scale
-
-    @property
-    def stage2_channels(self) -> int:
-        """Expose the resolved stage-2 channel count for tests and diagnostics."""
-        return self._stage2_channels
 
     @property
     def input_size(self) -> Tuple[int, int]:
@@ -659,29 +752,17 @@ class TorchCNN(nn.Module):
         """Stable monitored-layer names used by Layer-IDSI logging."""
         return self.TOKEN_IDSI_LAYER_NAMES if self.tokenize else self.CNN_IDSI_LAYER_NAMES
 
-    def backbone_modules(self) -> tuple[nn.Module, ...]:
-        """Return the feature extractor modules affected by temporary freezing."""
+    def backbone_modules(self):
         return (
-            self.conv1,
-            self.bn1,
-            self.conv2,
-            self.bn2,
-            self.se1,
-            self.conv3,
-            self.bn3,
-            self.conv4,
-            self.bn4,
-            self.se2,
-            self.conv5,
-            self.bn5,
-            self.conv6,
-            self.bn6,
-            self.se3,
+            self.conv1, self.bn1, self.conv2, self.bn2, self.se1,
+            self.conv3, self.bn3, self.conv4, self.bn4, self.se2,
+            self.conv5, self.bn5, self.conv6, self.bn6, self.se3,
+            self.conv7, self.bn7, self.conv8, self.bn8, self.se4,
+            self.conv9, self.bn9, self.conv10, self.bn10, self.se5,
         )
-
-    def backbone_batchnorm_layers(self) -> tuple[nn.BatchNorm2d, ...]:
-        """Return backbone BN layers so the trainer can control stats during freeze."""
-        return (self.bn1, self.bn2, self.bn3, self.bn4, self.bn5, self.bn6)
+    def backbone_batchnorm_layers(self):
+        return (self.bn1, self.bn2, self.bn3, self.bn4, self.bn5,
+                self.bn6, self.bn7, self.bn8, self.bn9, self.bn10)
 
     def head_modules(self) -> tuple[nn.Module, ...]:
         """Return the classifier head modules that stay trainable during freeze."""
@@ -725,46 +806,51 @@ class TorchCNN(nn.Module):
     def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.relu(self.bn1(self.conv1(x)))
         x = torch.relu(self.bn2(self.conv2(x)))
-        x = self.se1(x)
-        x = self.pool1(x)
+        x = self.se1(x); x = self.pool1(x)
 
         x = torch.relu(self.bn3(self.conv3(x)))
         x = torch.relu(self.bn4(self.conv4(x)))
-        x = self.se2(x)
-        x = self.pool2(x)
+        x = self.se2(x); x = self.pool2(x)
 
         x = torch.relu(self.bn5(self.conv5(x)))
         x = torch.relu(self.bn6(self.conv6(x)))
-        x = self.se3(x)
-        x = self.pool3(x)
+        x = self.se3(x); x = self.pool3(x)
+
+        x = torch.relu(self.bn7(self.conv7(x)))
+        x = torch.relu(self.bn8(self.conv8(x)))
+        x = self.se4(x); x = self.pool4(x)
+
+        x = torch.relu(self.bn9(self.conv9(x)))
+        x = torch.relu(self.bn10(self.conv10(x)))
+        x = self.se5(x); x = self.pool5(x)
         return x
 
-    def _forward_features_with_layer_idsi(
-        self,
-        x: torch.Tensor,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Return features plus matched-space stage transitions for Layer-IDSI.
-
-        Whole CNN stages change channel count or spatial resolution. Phase 1.2
-        therefore monitors the residual-aligned same-shape transition inside
-        each stage, after the stage projection convolution and before pooling.
-        """
+    def _forward_features_with_layer_idsi(self, x):
         stage1_in = torch.relu(self.bn1(self.conv1(x)))
-        stage1_out = torch.relu(self.bn2(self.conv2(stage1_in)))
-        stage1_out = self.se1(stage1_out)
+        stage1_out = self.se1(torch.relu(self.bn2(self.conv2(stage1_in))))
         x = self.pool1(stage1_out)
 
         stage2_in = torch.relu(self.bn3(self.conv3(x)))
-        stage2_out = torch.relu(self.bn4(self.conv4(stage2_in)))
-        stage2_out = self.se2(stage2_out)
+        stage2_out = self.se2(torch.relu(self.bn4(self.conv4(stage2_in))))
         x = self.pool2(stage2_out)
 
         stage3_in = torch.relu(self.bn5(self.conv5(x)))
-        stage3_out = torch.relu(self.bn6(self.conv6(stage3_in)))
-        stage3_out = self.se3(stage3_out)
+        stage3_out = self.se3(torch.relu(self.bn6(self.conv6(stage3_in))))
         x = self.pool3(stage3_out)
 
-        return x, (stage1_in, stage2_in, stage3_in), (stage1_out, stage2_out, stage3_out)
+        stage4_in = torch.relu(self.bn7(self.conv7(x)))
+        stage4_out = self.se4(torch.relu(self.bn8(self.conv8(stage4_in))))
+        x = self.pool4(stage4_out)
+
+        stage5_in = torch.relu(self.bn9(self.conv9(x)))
+        stage5_out = self.se5(torch.relu(self.bn10(self.conv10(stage5_in))))
+        x = self.pool5(stage5_out)
+
+        return (
+            x,
+            (stage1_in, stage2_in, stage3_in, stage4_in, stage5_in),
+            (stage1_out, stage2_out, stage3_out, stage4_out, stage5_out),
+        )
 
     def _add_token_positional_encoding(self, tokens: torch.Tensor) -> torch.Tensor:
         if self.token_positional_encoding == "none":
@@ -959,6 +1045,7 @@ class TorchCNN(nn.Module):
             "num_classes": int(self.num_classes),
             "width_scale": float(self.width_scale),
             "stage2_channels": int(self.stage2_channels),
+            "stage_channels": list(self._stage_channels),
             "input_size": list(self.input_size),
             "omega_enabled": bool(self.omega_enabled),
             "omega_projector_depth": self.omega_projector_depth,

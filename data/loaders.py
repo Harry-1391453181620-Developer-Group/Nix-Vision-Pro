@@ -9,8 +9,9 @@ from typing import List, Tuple, Union
 import os
 import math
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile;
 
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 # Defaults can be overridden via env vars to tune memory behavior
 _MAX_SIDE = int(os.environ.get("CNN_MAX_SIDE", "640"))            # hard cap on longer side
 _MAX_IMAGE_MB = float(os.environ.get("CNN_MAX_IMAGE_MB", "8.0"))  # max bytes for float64 array in MiB
@@ -78,7 +79,7 @@ def load_image(path: Union[str, Path]) -> np.ndarray:
         img = _to_rgb_safe(opened)
         img = _downscale_if_needed(img, _MAX_SIDE)
         img = _downscale_for_memory(img, _MAX_IMAGE_MB, _MIN_SIDE)
-        return np.array(img, dtype=np.float64)
+        return np.array(img, dtype=np.float32)
 
 
 def load_images_from_dir(

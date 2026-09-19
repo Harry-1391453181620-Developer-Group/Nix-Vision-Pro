@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Sequence, Tuple
 
 # Input image size (H, W) after preprocessing.
-INPUT_SIZE: Tuple[int, int] = (32, 32)
+INPUT_SIZE: Tuple[int, int] = (224, 224)
 
 # Default class names used when no dataset folders can be detected yet.
 DEFAULT_CLASS_NAMES: List[str] = [
