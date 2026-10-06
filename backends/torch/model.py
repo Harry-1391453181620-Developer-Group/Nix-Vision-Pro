@@ -488,8 +488,8 @@ class TorchCNN(nn.Module):
     CNN_IDSI_LAYER_NAMES: tuple[str, ...] = (
         "stage1", "stage2", "stage3", "stage4", "stage5", "classifier_pre_head"
     )
-    TOKEN_IDSI_LAYER_NAMES: tuple[str, ...] = (
-        "stage1", "stage2", "stage3", "stage4", "stage5", "token_projection", "transformer_token_block"
+    TOKEN_IDSI_BASE_LAYER_NAMES: tuple[str, ...] = (
+        "stage1", "stage2", "stage3", "stage4", "stage5", "token_projection"
     )
 
     def __init__(
@@ -750,7 +750,12 @@ class TorchCNN(nn.Module):
     @property
     def idsi_layer_names(self) -> tuple[str, ...]:
         """Stable monitored-layer names used by Layer-IDSI logging."""
-        return self.TOKEN_IDSI_LAYER_NAMES if self.tokenize else self.CNN_IDSI_LAYER_NAMES
+        if not self.tokenize:
+            return self.CNN_IDSI_LAYER_NAMES
+        names = list(self.TOKEN_IDSI_BASE_LAYER_NAMES)
+        for index in range(self._transformer_depth):
+            names.append(f"transformer_token_block_{index + 1}")
+        return tuple(names)
 
     def backbone_modules(self):
         return (
@@ -874,10 +879,20 @@ class TorchCNN(nn.Module):
         positioned_tokens = self._add_token_positional_encoding(projected_tokens)
         return projected_tokens, positioned_tokens
 
-    def _forward_token_dynamics_from_features(
+    def _forward_token_dynamics_with_blocks(
         self,
         features: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,                 # logits
+        torch.Tensor,                 # projected_tokens
+        torch.Tensor,                 # positioned_tokens
+        torch.Tensor,                 # transformer_input
+        torch.Tensor,                 # refined_tokens
+        torch.Tensor,                 # spatial_refined_tokens
+        tuple[torch.Tensor, ...],     # block_inputs
+        tuple[torch.Tensor, ...],     # block_outputs
+    ]:
+        """Run token dynamics while exposing every transformer block's I/O."""
         if not self.tokenize:
             raise RuntimeError("Tokenization is disabled for this model instance")
         assert isinstance(self.token_dropout, nn.Dropout)
@@ -892,7 +907,16 @@ class TorchCNN(nn.Module):
             cls_tokens = self.cls_token.expand(transformer_input.shape[0], -1, -1)
             transformer_input = torch.cat((cls_tokens, transformer_input), dim=1)
         transformer_input = self.token_dropout(transformer_input)
-        refined_tokens = self.token_transformer(transformer_input)
+
+        block_inputs: list[torch.Tensor] = []
+        block_outputs: list[torch.Tensor] = []
+        current = transformer_input
+        for block in self.token_transformer:
+            block_inputs.append(current)
+            current = block(current)
+            block_outputs.append(current)
+        refined_tokens = current
+
         if self.token_pool == "cls":
             pooled = refined_tokens[:, 0]
             spatial_refined_tokens = refined_tokens[:, 1:]
@@ -900,7 +924,43 @@ class TorchCNN(nn.Module):
             spatial_refined_tokens = refined_tokens
             pooled = spatial_refined_tokens.mean(dim=1)
         logits = self.token_classifier(self.dropout(pooled))
-        return logits, projected_tokens, positioned_tokens, transformer_input, refined_tokens, spatial_refined_tokens
+
+        return (
+            logits,
+            projected_tokens,
+            positioned_tokens,
+            transformer_input,
+            refined_tokens,
+            spatial_refined_tokens,
+            tuple(block_inputs),
+            tuple(block_outputs),
+        )
+
+
+    def _forward_token_dynamics_from_features(
+        self,
+        features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.tokenize:
+            raise RuntimeError("Tokenization is disabled for this model instance")
+        (
+            logits,
+            projected_tokens,
+            positioned_tokens,
+            transformer_input,
+            refined_tokens,
+            spatial_refined_tokens,
+            _,
+            _,
+        ) = self._forward_token_dynamics_with_blocks(features)
+        return (
+            logits,
+            projected_tokens,
+            positioned_tokens,
+            transformer_input,
+            refined_tokens,
+            spatial_refined_tokens,
+        )
 
     def _normalize_runtime_input(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
         if isinstance(x, np.ndarray):
@@ -992,13 +1052,15 @@ class TorchCNN(nn.Module):
             transformer_input,
             refined_tokens,
             spatial_refined_tokens,
-        ) = self._forward_token_dynamics_from_features(features)
+            block_inputs,
+            block_outputs,
+        ) = self._forward_token_dynamics_with_blocks(features)
         return (
             logits,
             transformer_input,
             refined_tokens,
-            cnn_inputs + (projected_tokens, transformer_input),
-            cnn_outputs + (positioned_tokens, refined_tokens),
+            cnn_inputs + (projected_tokens,) + block_inputs,
+            cnn_outputs + (positioned_tokens,) + block_outputs,
             spatial_refined_tokens,
         )
 

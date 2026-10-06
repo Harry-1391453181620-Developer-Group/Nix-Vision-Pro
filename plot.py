@@ -108,7 +108,7 @@ class EpochMetricsPlotter:
         self.title = title
         self._plt = plt
         self._interactive = "agg" not in plt.get_backend().lower()
-        self._figure = plt.figure(num="Experiment Metrics", figsize=(22, 18))
+        self._figure = plt.figure(num="Experiment Metrics")
         self._axes: dict[str, Any] = {}
         self._lines: dict[tuple[str, str], Any] = {}
         self._layer_colors: dict[str, Any] = {}
@@ -167,7 +167,14 @@ class EpochMetricsPlotter:
             axis.autoscale_view(scalex=False, scaley=True)
 
         self._figure.suptitle(f"{self.title}: {self.metrics_path}", fontsize=10)
-        self._figure.tight_layout(rect=(0, 0, 1, 0.97))
+        self._figure.subplots_adjust(
+            left=0.04,
+            right=0.98,
+            bottom=0.04,
+            top=0.94,
+            wspace=0.35,
+            hspace=0.65,
+        )
 
     def _build_panel_specs(self) -> list[tuple[str, str, list[str]]]:
         specs = [(f"scalar:{metric_name}", metric_name, [metric_name]) for metric_name in SCALAR_PLOT_METRICS]
@@ -176,8 +183,17 @@ class EpochMetricsPlotter:
         return specs
 
     def _create_axes(self) -> None:
-        cols = 4
+        cols = 5
         row_count = math.ceil(len(self._panel_specs) / cols)
+
+        # Give every subplot enough vertical space. The number of metrics can
+        # grow over time, so the figure height is derived from row_count.
+        self._figure.set_size_inches(
+            cols * 4.2,
+            row_count * 3.2,
+            forward=True,
+        )
+
         axes = self._figure.subplots(row_count, cols, squeeze=False).ravel()
         for index, (panel_id, title, _) in enumerate(self._panel_specs):
             axis = axes[index]
@@ -302,5 +318,48 @@ def _as_layer_float(value: Any, index: int) -> float:
     return _as_float(value[index])
 
 
+def _choose_metrics_file() -> Path | None:
+    """Open a file picker and let the user choose a JSONL metrics file."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.update()
+    try:
+        selected = filedialog.askopenfilename(
+            title="Select epoch metrics JSONL file",
+            filetypes=[("JSONL files", "*.jsonl"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+
+    return Path(selected) if selected else None
+
+
+def _plot_selected_file() -> int:
+    """Pick a JSONL file and write epoch_metrics_plot.png beside it."""
+    metrics_path = _choose_metrics_file()
+    if metrics_path is None:
+        return 0
+
+    rows = read_metric_rows(metrics_path)
+    if not rows:
+        raise SystemExit(f"No valid JSON object rows found in: {metrics_path}")
+
+    output_path = metrics_path.parent / "epoch_metrics_plot.png"
+    plotter = EpochMetricsPlotter(
+        metrics_path=metrics_path,
+        output_path=output_path,
+    )
+    try:
+        plotter.save(rows)
+    finally:
+        plotter.close()
+
+    print(f"Plot saved to: {output_path}")
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit("plot.py is a helper module. Use train.py --plot-once or train.py --plot-real-time.")
+    raise SystemExit(_plot_selected_file())
