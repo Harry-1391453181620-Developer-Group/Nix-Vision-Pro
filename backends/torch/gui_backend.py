@@ -95,17 +95,17 @@ class InferenceApp:
         bar = tk.Frame(self.root)
         bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
 
-        self.weights_label = tk.Label(bar, text="未加载权重 (.pt/.pth)")
+        self.weights_label = tk.Label(bar, text="Weights Not Loaded (.pt/.pth)")
         self.weights_label.pack(side=tk.LEFT)
 
-        tk.Button(bar, text="选择权重(.pt/.pth)", command=self.on_choose_weights).pack(side=tk.LEFT, padx=6)
-        tk.Button(bar, text="上传图片识别", command=self.on_choose_image).pack(side=tk.LEFT, padx=6)
+        tk.Button(bar, text="Choose Weights(.pt/.pth)", command=self.on_choose_weights).pack(side=tk.LEFT, padx=6)
+        tk.Button(bar, text="Upload Image to Identify", command=self.on_choose_image).pack(side=tk.LEFT, padx=6)
 
-        self.webcam_btn = tk.Button(bar, text="打开摄像头识别", command=self.on_toggle_webcam)
+        self.webcam_btn = tk.Button(bar, text="Open Camera to Identify", command=self.on_toggle_webcam)
         self.webcam_btn.pack(side=tk.LEFT, padx=6)
         if not _HAS_CV2:
             self.webcam_btn.config(state=tk.DISABLED)
-            tk.Label(bar, text="未检测到OpenCV，无法使用摄像头。", fg="#a00").pack(side=tk.LEFT, padx=6)
+            tk.Label(bar, text="OpenCV Not Found, Cannot use Camera", fg="#a00").pack(side=tk.LEFT, padx=6)
 
         content = tk.Frame(self.root)
         content.pack(fill=tk.BOTH, expand=True)
@@ -116,10 +116,10 @@ class InferenceApp:
         side = tk.Frame(content)
         side.pack(side=tk.RIGHT, fill=tk.Y)
 
-        tk.Label(side, text="预测结果", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, padx=8, pady=(8, 4))
+        tk.Label(side, text="Identification Result", font=("Segoe UI", 12, "bold")).pack(anchor=tk.W, padx=8, pady=(8, 4))
         self.pred_text = tk.Text(side, width=36, height=24)
         self.pred_text.pack(padx=8, pady=4)
-        self.pred_text.insert(tk.END, "加载权重后，上传图片或打开摄像头进行识别。\n")
+        self.pred_text.insert(tk.END, "Upload Image or Open Camera to Identify after Loading Weights\n")
         self.pred_text.config(state=tk.DISABLED)
 
     def _init_model(self) -> None:
@@ -127,8 +127,8 @@ class InferenceApp:
 
     def on_choose_weights(self) -> None:
         path_str = filedialog.askopenfilename(
-            title="选择 .pt/.pth 权重文件",
-            filetypes=[("PyTorch Weights", ".pt .pth"), ("所有文件", "*.*")],
+            title="Choose .pt/.pth Weight File",
+            filetypes=[("PyTorch Weights", ".pt .pth"), ("All Files", "*.*")],
         )
         if not path_str:
             return
@@ -175,36 +175,52 @@ class InferenceApp:
                 transformer_layernorm=checkpoint_config.transformer_layernorm or "pre",
                 )
             
-            self.model.load_weights(checkpoint, map_location=self.device)
+            try:
+                self.model.load_weights(checkpoint, map_location=self.device)
+            except RuntimeError as exc:
+                # Legacy checkpoints predate the Layer-IDSI alignment layers
+                # (stage_idsi_proj1..5, token_idsi_proj). Those layers are only
+                # touched by the monitor-only *_with_layer_idsi forward paths, so
+                # leaving them at their fresh initialization has zero effect on
+                # inference. Retry with strict=False instead of failing outright.
+                print(
+                    f"[warn] Strict checkpoint load failed ({exc}); "
+                    "retrying with strict=False (IDSI alignment layers use fresh init)."
+                )
+                self.model.load_weights(
+                    checkpoint,
+                    map_location=self.device,
+                    strict=False,
+                )
             self.model.to(self.device)
             self.model.eval()
             self.weights_path = checkpoint
-            self._set_status(f"已加载权重: {checkpoint}")
+            self._set_status(f"Weights Loaded: {checkpoint}")
         except Exception as exc:
-            messagebox.showerror("加载失败", f"无法加载权重: {exc}")
+            messagebox.showerror("Failed to Load", f"Cannot Load Weights: {exc}")
 
     def on_choose_image(self) -> None:
         path_str = filedialog.askopenfilename(
-            title="选择图片",
-            filetypes=[("图像文件", ".jpg .jpeg .png .bmp"), ("所有文件", "*.*")],
+            title="Choose Image",
+            filetypes=[("Image File", ".jpg .jpeg .png .bmp"), ("All Files", "*.*")],
         )
         if not path_str:
             return
         try:
             self._predict_image(Path(path_str))
         except Exception as exc:
-            messagebox.showerror("识别失败", str(exc))
+            messagebox.showerror("Identification Failed", str(exc))
 
     def on_toggle_webcam(self) -> None:
         if not _HAS_CV2:
-            messagebox.showwarning("不可用", "未安装OpenCV，无法使用摄像头。请先安装 opencv-python。")
+            messagebox.showwarning("Not Usable", "OpenCV Not Found, Cannot Use Camera, Please install opencv-python.")
             return
         if self._webcam_running:
             self._webcam_running = False
-            self.webcam_btn.config(text="打开摄像头识别")
+            self.webcam_btn.config(text="Open Camera")
         else:
             self._webcam_running = True
-            self.webcam_btn.config(text="关闭摄像头识别")
+            self.webcam_btn.config(text="Close Camera")
             self._start_webcam_thread()
 
     def _start_webcam_thread(self) -> None:
@@ -219,7 +235,7 @@ class InferenceApp:
         assert _HAS_CV2 and cv2 is not None
         capture = cv2.VideoCapture(0)
         if not capture.isOpened():
-            self._set_status("无法打开摄像头 0")
+            self._set_status("Cannot Open Camera")
             self._webcam_running = False
             return
         try:
@@ -249,7 +265,6 @@ class InferenceApp:
 
     def _predict_pil(self, pil_image: Image.Image) -> None:
         if self.model is None:
-            # messagebox.showwarning("未就绪", "模型尚未初始化。") 不弹窗
             return
         x = np.asarray(pil_image, dtype=np.float32)
         x = preprocess_image(
@@ -275,7 +290,7 @@ class InferenceApp:
         self.canvas.image = tk_image
 
     def _write_pred(self, pred_idx: int, probs: np.ndarray) -> None:
-        lines = [f"预测: {self.class_names[pred_idx]}  (#{pred_idx})  置信度: {probs[pred_idx]:.4f}", "", "Top-5:"]
+        lines = [f"Prediction: {self.class_names[pred_idx]}  (#{pred_idx})  Possibility: {probs[pred_idx]:.4f}", "", "Top-5:"]
         top5 = np.argsort(probs)[::-1][:5]
         for index in top5:
             lines.append(f"  {self.class_names[index]}: {probs[index]:.4f}")

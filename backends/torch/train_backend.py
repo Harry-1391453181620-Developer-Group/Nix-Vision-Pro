@@ -635,6 +635,7 @@ def _compute_idsi_metrics_from_pairs(
     layer_inputs: Sequence[torch.Tensor],
     layer_outputs: Sequence[torch.Tensor],
     *,
+    loss_layer_names: Sequence[str] | None = None,
     epsilon: float = IDSI_EPSILON,
 ) -> IDSIMetrics:
     if len(layer_inputs) != len(layer_outputs):
@@ -644,8 +645,12 @@ def _compute_idsi_metrics_from_pairs(
     if not layer_inputs:
         raise ValueError("Layer-IDSI requires at least one monitored tensor pair")
 
+    loss_name_set: frozenset[str] | None = (
+        None if loss_layer_names is None else frozenset(loss_layer_names)
+    )
+
     layer_stats: list[IDSIDistributionStats] = []
-    layer_losses: list[torch.Tensor] = []
+    loss_eligible_losses: list[torch.Tensor] = []
     global_count = 0
     global_total = 0.0
     global_sum_sq = 0.0
@@ -667,8 +672,9 @@ def _compute_idsi_metrics_from_pairs(
         layer_loss = torch.mean(torch.square(torch.linalg.vector_norm(residual, dim=1) / denominator))
         stats = _distribution_stats_from_delta(relative_delta * IDSI_LOG_SCALE)
 
-        layer_losses.append(layer_loss)
         layer_stats.append(stats)
+        if loss_name_set is None or layer_name in loss_name_set:
+            loss_eligible_losses.append(layer_loss)
         global_count += stats.count
         global_total += stats.total
         global_sum_sq += stats.sum_sq
@@ -683,11 +689,16 @@ def _compute_idsi_metrics_from_pairs(
         sum_sq=global_sum_sq,
         max=global_max if global_count > 0 else float("nan"),
     )
+    if loss_eligible_losses:
+        idsi_loss = torch.stack(loss_eligible_losses).mean()
+    else:
+        idsi_loss = torch.zeros((), device=layer_inputs[0].device, dtype=layer_inputs[0].dtype)
+
     return IDSIMetrics(
         layer_names=tuple(str(name) for name in layer_names),
         global_stats=global_stats,
         layer_stats=tuple(layer_stats),
-        loss=torch.stack(layer_losses).mean(),
+        loss=idsi_loss,
         hidden_norm_total=hidden_norm_total,
         hidden_norm_count=hidden_norm_count,
     )
@@ -740,6 +751,30 @@ def _resolve_forward_output(
         )
     raise ValueError("Omega-enabled forward path must return (logits, h, T(h)) or Layer-IDSI outputs")
 
+def _resolve_idsi_loss_layer_names(
+    model: TorchCNN,
+    *,
+    omega_enabled: bool,
+    idsi_enabled: bool,
+) -> tuple[str, ...] | None:
+    """Decide which layers contribute to the L_IDSI term.
+
+    Per MAOIDL, the IDSI loss is a regularizer on *attractor dynamics*
+    (hidden-state transitions), not on generic feature extraction. So:
+      - CNN path: only the Omega projector (``classifier_pre_head``).
+      - Token path: only the transformer blocks.
+    CNN backbone stages and the token projection stay monitor-only.
+    """
+    if not idsi_enabled:
+        return None
+    if model.tokenize:
+        return tuple(
+            f"transformer_token_block_{index + 1}"
+            for index in range(model.transformer_depth)
+        )
+    if omega_enabled:
+        return ("classifier_pre_head",)
+    return None
 
 def _select_forward_callable(
     model: TorchCNN,
@@ -1020,6 +1055,7 @@ def _compute_total_loss_components(
     omega_lambda: float,
     idsi_lambda: float,
     idsi_layer_names: Sequence[str] | None = None,
+    idsi_loss_layer_names: Sequence[str] | None = None,
     use_focal_loss: bool,
     focal_gamma: float,
     ce_class_weights: torch.Tensor | None,
@@ -1056,6 +1092,7 @@ def _compute_total_loss_components(
             layer_names,
             components.layer_inputs,
             components.layer_outputs,
+            loss_layer_names=idsi_loss_layer_names,
         )
     elif h is not None and t_h is not None:
         if float(idsi_lambda) > 0.0:
@@ -1264,6 +1301,7 @@ def _benchmark_train_steps(
     idsi_enabled: bool,
     idsi_lambda: float,
     idsi_layer_names: Sequence[str] | None,
+    idsi_loss_layer_names: Sequence[str] | None,
     grad_clip: float,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -1292,6 +1330,7 @@ def _benchmark_train_steps(
                 omega_lambda=omega_lambda,
                 idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
                 idsi_layer_names=idsi_layer_names,
+                idsi_loss_layer_names=idsi_loss_layer_names,
                 use_focal_loss=use_focal_loss,
                 focal_gamma=focal_gamma,
                 ce_class_weights=ce_class_weights,
@@ -1351,6 +1390,7 @@ def _maybe_enable_compiled_forward_model(
     omega_lambda: float,
     idsi_enabled: bool,
     idsi_lambda: float,
+    idsi_loss_layer_names: Sequence[str] | None,
     token_metrics_enabled: bool,
     grad_clip: float,
     device: torch.device,
@@ -1418,6 +1458,7 @@ def _maybe_enable_compiled_forward_model(
             idsi_enabled=idsi_enabled,
             idsi_lambda=idsi_lambda,
             idsi_layer_names=eager_model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
+            idsi_loss_layer_names=idsi_loss_layer_names,
             grad_clip=grad_clip,
             device=device,
             amp_dtype=amp_dtype,
@@ -1454,6 +1495,7 @@ def _maybe_enable_compiled_forward_model(
             idsi_enabled=idsi_enabled,
             idsi_lambda=idsi_lambda,
             idsi_layer_names=compiled_model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
+            idsi_loss_layer_names=idsi_loss_layer_names,
             grad_clip=grad_clip,
             device=device,
             amp_dtype=amp_dtype,
@@ -1503,6 +1545,7 @@ def evaluate_loader(
     omega_lambda: float,
     idsi_lambda: float,
     idsi_layer_names: Sequence[str] | None = None,
+    idsi_loss_layer_names: Sequence[str] | None = None,
 ) -> dict[str, float]:
     if len(loader.dataset) == 0:
         return {
@@ -1556,6 +1599,7 @@ def evaluate_loader(
                     omega_lambda=omega_lambda,
                     idsi_lambda=idsi_lambda,
                     idsi_layer_names=idsi_layer_names,
+                    idsi_loss_layer_names=idsi_loss_layer_names,
                     use_focal_loss=use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
@@ -1968,6 +2012,12 @@ def main() -> None:
             else:
                 model.to(device=device)
 
+    idsi_loss_layer_names = _resolve_idsi_loss_layer_names(
+        model,
+        omega_enabled=omega_enabled,
+        idsi_enabled=idsi_enabled,
+    )
+
     num_batches = max(1, len(train_loader))
     phase_map = build_epoch_phase_map(args.epochs, args.phase_count)
     current_phase_index = -1
@@ -2011,6 +2061,7 @@ def main() -> None:
         omega_lambda=omega_lambda,
         idsi_enabled=idsi_enabled,
         idsi_lambda=idsi_lambda,
+        idsi_loss_layer_names=idsi_loss_layer_names,
         token_metrics_enabled=token_metrics_enabled,
         grad_clip=float(args.grad_clip),
         device=device,
@@ -2087,6 +2138,7 @@ def main() -> None:
                 "idsi_enabled": bool(idsi_enabled),
                 "idsi_lambda": float(idsi_lambda),
                 "idsi_layer_names": list(model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else ()),
+                "idsi_loss_layer_names": list(idsi_loss_layer_names or ()),
                 "omega_projector_depth": int(omega_projector_depth),
                 "omega_hidden_dim": int(omega_hidden_dim),
                 "tokenize": bool(model.tokenize),
@@ -2225,6 +2277,7 @@ def main() -> None:
                     omega_lambda=omega_lambda,
                     idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
                     idsi_layer_names=model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
+                    idsi_loss_layer_names=idsi_loss_layer_names,
                     use_focal_loss=batch_use_focal_loss,
                     focal_gamma=focal_gamma,
                     ce_class_weights=ce_class_weights,
@@ -2306,6 +2359,7 @@ def main() -> None:
                 omega_lambda=omega_lambda,
                 idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
                 idsi_layer_names=model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
+                idsi_loss_layer_names=idsi_loss_layer_names,
             )
             val_loss = val_metrics["loss_total"]
             val_acc = val_metrics["acc"]
@@ -2555,6 +2609,7 @@ def main() -> None:
                 "idsi_lambda": float(idsi_lambda),
                 "idsi_enabled": bool(idsi_enabled),
                 "idsi_layer_names": list(model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else ()),
+                "idsi_loss_layer_names": list(idsi_loss_layer_names or ()),
                 "omega_projector_depth": int(omega_projector_depth),
                 "omega_hidden_dim": int(omega_hidden_dim),
                 "tokenize": bool(model.tokenize),

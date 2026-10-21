@@ -117,7 +117,14 @@ def main() -> None:
     )
     model.to(device)
     if args.weights:
-        model.load_weights(weights_path, map_location=device)
+        try:
+            model.load_weights(weights_path, map_location=device)
+        except RuntimeError as exc:
+            print(
+                f"[warn] Strict checkpoint load failed ({exc}); "
+                "retrying with strict=False (stage IDSI projections will use fresh init)."
+            )
+            model.load_weights(weights_path, map_location=device, strict=False)
     model.eval()
 
     image = load_image(image_path)

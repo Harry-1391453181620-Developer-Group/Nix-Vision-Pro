@@ -584,6 +584,13 @@ class TorchCNN(nn.Module):
         self.se5 = SqueezeExcitation(c5, reduction=4)
         self.pool5 = nn.MaxPool2d(kernel_size=2, stride=2)
 
+        # Layer-IDSI 1x1 channel-alignment projections
+        self.stage_idsi_proj1 = nn.Conv2d(3, c1, kernel_size=1, bias=False)
+        self.stage_idsi_proj2 = nn.Conv2d(c1, c2, kernel_size=1, bias=False)
+        self.stage_idsi_proj3 = nn.Conv2d(c2, c3, kernel_size=1, bias=False)
+        self.stage_idsi_proj4 = nn.Conv2d(c3, c4, kernel_size=1, bias=False)
+        self.stage_idsi_proj5 = nn.Conv2d(c4, c5, kernel_size=1, bias=False)
+
         # Total stride /32
         feat_h, feat_w = height // 32, width // 32
         self.fc1 = nn.Linear(feat_h * feat_w * c5, DEFAULT_OMEGA_FEATURE_DIM)
@@ -597,6 +604,7 @@ class TorchCNN(nn.Module):
                 else nn.AdaptiveAvgPool2d((token_grid_h, token_grid_w))
             )
             self.token_projection = nn.Linear(c5, token_dim)
+            self.token_idsi_proj = nn.Linear(c5, token_dim, bias=False)
             self.token_dropout = nn.Dropout(p=token_dropout)
             self.token_transformer = nn.Sequential(
                 *[
@@ -614,6 +622,7 @@ class TorchCNN(nn.Module):
         else:
             self.token_feature_pool = None
             self.token_projection = None
+            self.token_idsi_proj = None
             self.token_dropout = None
             self.token_transformer = None
             self.token_classifier = None
@@ -758,13 +767,20 @@ class TorchCNN(nn.Module):
         return tuple(names)
 
     def backbone_modules(self):
-        return (
+        modules = (
             self.conv1, self.bn1, self.conv2, self.bn2, self.se1,
             self.conv3, self.bn3, self.conv4, self.bn4, self.se2,
             self.conv5, self.bn5, self.conv6, self.bn6, self.se3,
             self.conv7, self.bn7, self.conv8, self.bn8, self.se4,
             self.conv9, self.bn9, self.conv10, self.bn10, self.se5,
+            self.stage_idsi_proj1, self.stage_idsi_proj2,
+            self.stage_idsi_proj3, self.stage_idsi_proj4,
+            self.stage_idsi_proj5,
         )
+        if self.token_idsi_proj is not None:
+            modules = modules + (self.token_idsi_proj,)
+        return modules
+    
     def backbone_batchnorm_layers(self):
         return (self.bn1, self.bn2, self.bn3, self.bn4, self.bn5,
                 self.bn6, self.bn7, self.bn8, self.bn9, self.bn10)
@@ -831,29 +847,46 @@ class TorchCNN(nn.Module):
         return x
 
     def _forward_features_with_layer_idsi(self, x):
-        stage1_in = torch.relu(self.bn1(self.conv1(x)))
-        stage1_out = self.se1(torch.relu(self.bn2(self.conv2(stage1_in))))
+        # Stage 1: input is the raw image (B, 3, H, W).
+        stage1_in = x
+        stage1_proj = self.stage_idsi_proj1(stage1_in)
+        stage1_out = self.se1(torch.relu(self.bn2(self.conv2(
+            torch.relu(self.bn1(self.conv1(stage1_in)))
+        ))))
         x = self.pool1(stage1_out)
 
-        stage2_in = torch.relu(self.bn3(self.conv3(x)))
-        stage2_out = self.se2(torch.relu(self.bn4(self.conv4(stage2_in))))
+        # Stage 2: input is the pooled output of stage 1 (B, c1, H/2, W/2).
+        stage2_in = x
+        stage2_proj = self.stage_idsi_proj2(stage2_in)
+        stage2_out = self.se2(torch.relu(self.bn4(self.conv4(
+            torch.relu(self.bn3(self.conv3(stage2_in)))
+        ))))
         x = self.pool2(stage2_out)
 
-        stage3_in = torch.relu(self.bn5(self.conv5(x)))
-        stage3_out = self.se3(torch.relu(self.bn6(self.conv6(stage3_in))))
+        stage3_in = x
+        stage3_proj = self.stage_idsi_proj3(stage3_in)
+        stage3_out = self.se3(torch.relu(self.bn6(self.conv6(
+            torch.relu(self.bn5(self.conv5(stage3_in)))
+        ))))
         x = self.pool3(stage3_out)
 
-        stage4_in = torch.relu(self.bn7(self.conv7(x)))
-        stage4_out = self.se4(torch.relu(self.bn8(self.conv8(stage4_in))))
+        stage4_in = x
+        stage4_proj = self.stage_idsi_proj4(stage4_in)
+        stage4_out = self.se4(torch.relu(self.bn8(self.conv8(
+            torch.relu(self.bn7(self.conv7(stage4_in)))
+        ))))
         x = self.pool4(stage4_out)
 
-        stage5_in = torch.relu(self.bn9(self.conv9(x)))
-        stage5_out = self.se5(torch.relu(self.bn10(self.conv10(stage5_in))))
+        stage5_in = x
+        stage5_proj = self.stage_idsi_proj5(stage5_in)
+        stage5_out = self.se5(torch.relu(self.bn10(self.conv10(
+            torch.relu(self.bn9(self.conv9(stage5_in)))
+        ))))
         x = self.pool5(stage5_out)
 
         return (
             x,
-            (stage1_in, stage2_in, stage3_in, stage4_in, stage5_in),
+            (stage1_proj, stage2_proj, stage3_proj, stage4_proj, stage5_proj),
             (stage1_out, stage2_out, stage3_out, stage4_out, stage5_out),
         )
 
@@ -868,7 +901,7 @@ class TorchCNN(nn.Module):
             return tokens
         return tokens + (0.05 * self.token_sinusoidal_embedding.to(dtype=tokens.dtype, device=tokens.device))
 
-    def _tokens_from_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _tokens_from_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.tokenize:
             raise RuntimeError("Tokenization is disabled for this model instance")
         assert isinstance(self.token_feature_pool, nn.Module)
@@ -877,7 +910,7 @@ class TorchCNN(nn.Module):
         raw_tokens = pooled_features.flatten(2).transpose(1, 2).contiguous()
         projected_tokens = self.token_projection(raw_tokens)
         positioned_tokens = self._add_token_positional_encoding(projected_tokens)
-        return projected_tokens, positioned_tokens
+        return raw_tokens, projected_tokens, positioned_tokens
 
     def _forward_token_dynamics_with_blocks(
         self,
@@ -889,6 +922,7 @@ class TorchCNN(nn.Module):
         torch.Tensor,                 # transformer_input
         torch.Tensor,                 # refined_tokens
         torch.Tensor,                 # spatial_refined_tokens
+        torch.Tensor,                 # raw_tokens          ← 新增
         tuple[torch.Tensor, ...],     # block_inputs
         tuple[torch.Tensor, ...],     # block_outputs
     ]:
@@ -899,7 +933,8 @@ class TorchCNN(nn.Module):
         assert isinstance(self.token_transformer, nn.Sequential)
         assert isinstance(self.token_classifier, nn.Linear)
 
-        projected_tokens, positioned_tokens = self._tokens_from_features(features)
+        raw_tokens, projected_tokens, positioned_tokens = self._tokens_from_features(features)
+        projected_from_raw = self.token_idsi_proj(raw_tokens)
         transformer_input = positioned_tokens
         if self.token_pool == "cls":
             if self.cls_token is None:
@@ -932,6 +967,7 @@ class TorchCNN(nn.Module):
             transformer_input,
             refined_tokens,
             spatial_refined_tokens,
+            projected_from_raw,
             tuple(block_inputs),
             tuple(block_outputs),
         )
@@ -950,6 +986,7 @@ class TorchCNN(nn.Module):
             transformer_input,
             refined_tokens,
             spatial_refined_tokens,
+            _projected_from_raw,
             _,
             _,
         ) = self._forward_token_dynamics_with_blocks(features)
@@ -1052,6 +1089,7 @@ class TorchCNN(nn.Module):
             transformer_input,
             refined_tokens,
             spatial_refined_tokens,
+            projected_from_raw,
             block_inputs,
             block_outputs,
         ) = self._forward_token_dynamics_with_blocks(features)
@@ -1059,8 +1097,8 @@ class TorchCNN(nn.Module):
             logits,
             transformer_input,
             refined_tokens,
-            cnn_inputs + (projected_tokens,) + block_inputs,
-            cnn_outputs + (positioned_tokens,) + block_outputs,
+            cnn_inputs + (projected_from_raw,) + block_inputs,
+            cnn_outputs + (projected_tokens,) + block_outputs,
             spatial_refined_tokens,
         )
 
@@ -1134,9 +1172,10 @@ class TorchCNN(nn.Module):
         self,
         path: str | Path,
         map_location: str | torch.device | None = None,
+        strict: bool = True,
     ) -> dict[str, Any]:
         state, metadata = load_checkpoint_state(path, map_location=map_location)
-        self.load_state_dict(state)
+        self.load_state_dict(state, strict=strict)
         return metadata
 
 
