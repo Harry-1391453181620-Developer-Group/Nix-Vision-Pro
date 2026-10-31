@@ -1,932 +1,129 @@
-"""PyTorch training backend.
+"""PyTorch training backend for MAOL (CNN-only).
 
-This backend keeps the project data pipeline and CLI style close to the legacy
-NumPy trainer, but runs the model, gradients, optimizer, and checkpointing in
-PyTorch. The original NumPy trainer remains available under `--backend numpy`.
+Workflow:
+1. Warm-up on the prototype head with epoch-wise class means and CE only.
+2. Save a warm-up checkpoint containing backbone, wells, statistics and margins.
+3. Optional scale probe from that checkpoint (100 steps, six loss terms + grads).
+4. Full MAOL training from the warm-up checkpoint with tuned lambdas.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Sized
-import copy
-from dataclasses import dataclass
 from functools import partial
 import hashlib
 import json
 import random
 import time
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence, cast
+from typing import Any, Mapping, Sequence, cast
 
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 import config
-from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, TorchCNN, load_checkpoint_state
+from backends.torch.model import TorchCNN, load_checkpoint_state, resolve_checkpoint_runtime_config
 from data.loaders import load_image
+from data.nested import DatasetIndex, discover_nested_dataset, split_dataset, stratified_split
 from data.preprocessing import preprocess_image
+from maol.losses import compute_maol_losses
+from maol.stats import (
+    WarmupStats,
+    apply_warmup_stats,
+    compute_class_means,
+    compute_warmup_statistics,
+)
 from utils.safety import install_dataset_write_guard, tree_signature
 from utils.training import (
     ModelEMA,
-    adjust_phase_lr_offset_after_unfreeze,
     augment_batch,
     build_epoch_phase_map,
     compute_effective_learning_rate,
     compute_phase_learning_rate,
     parse_bool_flag,
     validate_augmentation_args,
-    validate_cutmix_ratio,
     validate_ema_decay,
-    validate_focal_gamma,
     validate_freeze_cycle_args,
-    validate_mixup_alpha,
-    validate_mixup_probability,
     validate_model_width_scale,
     validate_phase_learning_rates,
 )
 
 install_dataset_write_guard()
 
-try:
-    import torch
-    from torch import nn
-    import torch.nn.functional as F
-    from torch.utils.data import DataLoader, Dataset
-except Exception as exc:
-    raise SystemExit(f"PyTorch backend is unavailable in this interpreter: {exc}") from exc
+DEFAULT_LAMBDAS = {
+    "intra": 1.0,
+    "sep": 1.0,
+    "nest": 1.0,
+    "cov": 1.0,
+    "center": 1.0,
+}
+MAOL_WARMUP_TAU_STEPS = 100
 
 
 class TorchImageDataset(Dataset[tuple[torch.Tensor, int]]):
-    """Stateless dataset for worker-safe Windows DataLoader multiprocessing."""
+    """Image dataset used by the MAOL trainer."""
 
     def __init__(
         self,
-        *,
+        paths: Sequence[Path],
         labels: np.ndarray,
         input_size: tuple[int, int],
-        paths: Sequence[Path] | None = None,
-        preloaded_images: np.ndarray | None = None,
         augment_config=None,
     ) -> None:
-        if paths is None and preloaded_images is None:
-            raise ValueError("Either paths or preloaded_images must be provided")
-        if paths is not None and preloaded_images is not None and len(paths) != int(preloaded_images.shape[0]):
-            raise ValueError("paths and preloaded_images must have matching lengths")
+        if len(paths) != int(labels.shape[0]):
+            raise ValueError("paths and labels must have matching lengths")
+        self.paths = tuple(Path(path) for path in paths)
         self.labels = np.asarray(labels, dtype=np.int64)
         self.input_size = (int(input_size[0]), int(input_size[1]))
-        self.paths = tuple(Path(path) for path in paths) if paths is not None else None
-        self.preloaded_images = (
-            np.asarray(preloaded_images, dtype=np.float32)
-            if preloaded_images is not None
-            else None
-        )
         self.augment_config = augment_config
 
     def __len__(self) -> int:
         return int(self.labels.shape[0])
 
-    def _load_image(self, index: int) -> np.ndarray:
-        if self.preloaded_images is not None:
-            return np.asarray(self.preloaded_images[index], dtype=np.float32)
-        assert self.paths is not None
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
         image = load_image(self.paths[index])
-        return preprocess_image(
+        image = preprocess_image(
             image,
             target_size=self.input_size,
             normalize_to=config.NORMALIZE_TO,
             input_value_range=config.INPUT_VALUE_RANGE,
         ).astype(np.float32)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        image = self._load_image(index)
         if self.augment_config is not None:
             seed = int(np.random.randint(0, 2**31 - 1))
-            rng = np.random.default_rng(seed)
-            image = augment_batch(image[np.newaxis, ...], rng, self.augment_config)[0]
+            image = augment_batch(image[None, ...], np.random.default_rng(seed), self.augment_config)[0]
         image_nchw = np.transpose(image, (2, 0, 1))
-        image_tensor = torch.from_numpy(np.ascontiguousarray(image_nchw, dtype=np.float32))
-        return image_tensor, int(self.labels[index])
+        return torch.from_numpy(np.ascontiguousarray(image_nchw, dtype=np.float32)), int(self.labels[index])
 
 
-OMEGA_COLLAPSE_VARIANCE_THRESHOLD = 1e-4
-OMEGA_COLLAPSE_EPOCHS = 3
-IDSI_EPSILON = 1e-6
-IDSI_LOG_SCALE = 100.0
-
-
-class MetricPlotter(Protocol):
-    def update(self, rows: list[dict[str, Any]]) -> None:
-        ...
-
-    def save(self, rows: list[dict[str, Any]]) -> Path:
-        ...
-
-    def show(self, *, block: bool) -> None:
-        ...
-
-
-@dataclass(frozen=True)
-class RepresentationVarianceStats:
-    mean: float
-    min: float
-    max: float
-
-
-@dataclass(frozen=True)
-class TokenDiversityStats:
-    token_variance: float
-    inter_token_variance: float
-    token_norm_mean: float
-    token_norm_min: float
-    token_norm_max: float
-    pairwise_cosine_similarity: float
-    pairwise_cosine_distance: float
-    collapse_score: float
-
-
-@dataclass(frozen=True)
-class IDSIDistributionStats:
-    count: int
-    total: float
-    sum_sq: float
-    max: float
-
-    @property
-    def mean(self) -> float:
-        return self.total / self.count if self.count > 0 else float("nan")
-
-    @property
-    def std(self) -> float:
-        if self.count <= 0:
-            return float("nan")
-        variance = max(0.0, (self.sum_sq / self.count) - (self.mean * self.mean))
-        return float(variance ** 0.5)
-
-
-@dataclass(frozen=True)
-class IDSIMetrics:
-    layer_names: tuple[str, ...]
-    global_stats: IDSIDistributionStats
-    layer_stats: tuple[IDSIDistributionStats, ...]
-    loss: torch.Tensor
-    hidden_norm_total: float
-    hidden_norm_count: int
-
-    @property
-    def hidden_norm_mean(self) -> float:
-        return (
-            self.hidden_norm_total / self.hidden_norm_count
-            if self.hidden_norm_count > 0
-            else float("nan")
-        )
-
-
-@dataclass(frozen=True)
-class ForwardComponents:
-    logits: torch.Tensor
-    h: torch.Tensor | None
-    t_h: torch.Tensor | None
-    layer_inputs: tuple[torch.Tensor, ...]
-    layer_outputs: tuple[torch.Tensor, ...]
-    token_metric_tokens: torch.Tensor | None
-
-
-@dataclass(frozen=True)
-class BatchLossComponents:
-    total_loss: torch.Tensor
-    ce_loss: torch.Tensor
-    attr_loss: torch.Tensor
-    idsi_loss: torch.Tensor
-    logits: torch.Tensor
-    h_stats: RepresentationVarianceStats
-    idsi_metrics: IDSIMetrics
-    token_stats: TokenDiversityStats
-
-
-class EpochIDSIAggregator:
-    def __init__(self) -> None:
-        self.layer_names: tuple[str, ...] = ()
-        self.global_count = 0
-        self.global_total = 0.0
-        self.global_sum_sq = 0.0
-        self.global_max = -float("inf")
-        self.layer_count: list[int] = []
-        self.layer_total: list[float] = []
-        self.layer_sum_sq: list[float] = []
-        self.layer_max: list[float] = []
-        self.hidden_norm_total = 0.0
-        self.hidden_norm_count = 0
-
-    def update(self, metrics: IDSIMetrics) -> None:
-        if metrics.global_stats.count > 0:
-            self.global_count += int(metrics.global_stats.count)
-            self.global_total += float(metrics.global_stats.total)
-            self.global_sum_sq += float(metrics.global_stats.sum_sq)
-            self.global_max = max(self.global_max, float(metrics.global_stats.max))
-        if metrics.hidden_norm_count > 0:
-            self.hidden_norm_total += float(metrics.hidden_norm_total)
-            self.hidden_norm_count += int(metrics.hidden_norm_count)
-        if not metrics.layer_names:
-            return
-        if not self.layer_names:
-            self.layer_names = tuple(metrics.layer_names)
-            layer_count = len(self.layer_names)
-            self.layer_count = [0] * layer_count
-            self.layer_total = [0.0] * layer_count
-            self.layer_sum_sq = [0.0] * layer_count
-            self.layer_max = [-float("inf")] * layer_count
-        if tuple(metrics.layer_names) != self.layer_names:
-            raise ValueError("Layer-IDSI layer names changed within an epoch")
-        for index, stats in enumerate(metrics.layer_stats):
-            if stats.count <= 0:
-                continue
-            self.layer_count[index] += int(stats.count)
-            self.layer_total[index] += float(stats.total)
-            self.layer_sum_sq[index] += float(stats.sum_sq)
-            self.layer_max[index] = max(self.layer_max[index], float(stats.max))
-
-    def summary(self) -> dict[str, Any]:
-        global_stats = self._stats_from_running(
-            self.global_count,
-            self.global_total,
-            self.global_sum_sq,
-            self.global_max,
-        )
-        layer_stats = [
-            self._stats_from_running(count, total, sum_sq, max_value)
-            for count, total, sum_sq, max_value in zip(
-                self.layer_count,
-                self.layer_total,
-                self.layer_sum_sq,
-                self.layer_max,
-            )
-        ]
-        layer_means = [stats.mean for stats in layer_stats]
-        layer_maxes = [stats.max for stats in layer_stats]
-        layer_stds = [stats.std for stats in layer_stats]
-        return {
-            "IDSI": float(global_stats.mean),
-            "IDSI mean": float(global_stats.mean),
-            "IDSI max": float(global_stats.max),
-            "IDSI std": float(global_stats.std),
-            "layer_IDSI_names": list(self.layer_names),
-            "layer_IDSI": [float(value) for value in layer_means],
-            "layer_IDSI_mean": [float(value) for value in layer_means],
-            "layer_IDSI_max": [float(value) for value in layer_maxes],
-            "layer_IDSI_std": [float(value) for value in layer_stds],
-            "hidden_norm": (
-                float(self.hidden_norm_total / self.hidden_norm_count)
-                if self.hidden_norm_count > 0
-                else float("nan")
-            ),
-        }
-
-    @staticmethod
-    def _stats_from_running(count: int, total: float, sum_sq: float, max_value: float) -> IDSIDistributionStats:
-        return IDSIDistributionStats(
-            count=int(count),
-            total=float(total),
-            sum_sq=float(sum_sq),
-            max=float(max_value) if count > 0 else float("nan"),
-        )
-
-
-class EpochTokenStatsAggregator:
-    def __init__(self) -> None:
-        self.count = 0
-        self.token_variance = 0.0
-        self.inter_token_variance = 0.0
-        self.token_norm_mean = 0.0
-        self.token_norm_min = float("inf")
-        self.token_norm_max = -float("inf")
-        self.pairwise_cosine_similarity = 0.0
-        self.pairwise_cosine_distance = 0.0
-        self.collapse_score = 0.0
-
-    def update(self, stats: TokenDiversityStats) -> None:
-        if np.isnan(stats.token_variance):
-            return
-        self.count += 1
-        self.token_variance += float(stats.token_variance)
-        self.inter_token_variance += float(stats.inter_token_variance)
-        self.token_norm_mean += float(stats.token_norm_mean)
-        if not np.isnan(stats.token_norm_min):
-            self.token_norm_min = min(self.token_norm_min, float(stats.token_norm_min))
-        if not np.isnan(stats.token_norm_max):
-            self.token_norm_max = max(self.token_norm_max, float(stats.token_norm_max))
-        if not np.isnan(stats.pairwise_cosine_similarity):
-            self.pairwise_cosine_similarity += float(stats.pairwise_cosine_similarity)
-        if not np.isnan(stats.pairwise_cosine_distance):
-            self.pairwise_cosine_distance += float(stats.pairwise_cosine_distance)
-        if not np.isnan(stats.collapse_score):
-            self.collapse_score += float(stats.collapse_score)
-
-    def summary(self, prefix: str) -> dict[str, float]:
-        if self.count <= 0:
-            return {
-                f"{prefix}_token_variance": float("nan"),
-                f"{prefix}_inter_token_variance": float("nan"),
-                f"{prefix}_token_norm_mean": float("nan"),
-                f"{prefix}_token_norm_min": float("nan"),
-                f"{prefix}_token_norm_max": float("nan"),
-                f"{prefix}_token_pairwise_cosine_similarity": float("nan"),
-                f"{prefix}_token_pairwise_cosine_distance": float("nan"),
-                f"{prefix}_token_collapse_score": float("nan"),
-            }
-        return {
-            f"{prefix}_token_variance": float(self.token_variance / self.count),
-            f"{prefix}_inter_token_variance": float(self.inter_token_variance / self.count),
-            f"{prefix}_token_norm_mean": float(self.token_norm_mean / self.count),
-            f"{prefix}_token_norm_min": float(self.token_norm_min),
-            f"{prefix}_token_norm_max": float(self.token_norm_max),
-            f"{prefix}_token_pairwise_cosine_similarity": float(
-                self.pairwise_cosine_similarity / self.count
-            ),
-            f"{prefix}_token_pairwise_cosine_distance": float(
-                self.pairwise_cosine_distance / self.count
-            ),
-            f"{prefix}_token_collapse_score": float(self.collapse_score / self.count),
-        }
-
-
-def _validate_omega_args(
-    *,
-    omega_loss: bool,
-    omega_lambda: float,
-    idsi_lambda: float,
-    omega_projector_depth: int,
-    omega_hidden_dim: int,
-) -> tuple[float, float, int, int]:
-    omega_lambda = float(omega_lambda)
-    idsi_lambda = float(idsi_lambda)
-    omega_projector_depth = int(omega_projector_depth)
-    omega_hidden_dim = int(omega_hidden_dim)
-    if omega_lambda < 0.0:
-        raise ValueError("omega_lambda must be >= 0")
-    if idsi_lambda < 0.0:
-        raise ValueError("idsi_lambda must be >= 0")
-    if omega_projector_depth not in {1, 2}:
-        raise ValueError("omega_projector_depth must be 1 or 2")
-    if omega_hidden_dim <= 0:
-        raise ValueError("omega_hidden_dim must be > 0")
-    if omega_lambda > 0.0 and not omega_loss:
-        raise ValueError("omega_lambda > 0 requires --omega-loss")
-    return omega_lambda, idsi_lambda, omega_projector_depth, omega_hidden_dim
-
-
-def _validate_token_args(
-    *,
-    token_dim: int,
-    transformer_depth: int,
-    attention_heads: int,
-    transformer_mlp_ratio: float,
-    token_dropout: float,
-) -> tuple[int, int, int, float, float]:
-    token_dim = int(token_dim)
-    transformer_depth = int(transformer_depth)
-    attention_heads = int(attention_heads)
-    transformer_mlp_ratio = float(transformer_mlp_ratio)
-    token_dropout = float(token_dropout)
-    if token_dim <= 0:
-        raise ValueError("token_dim must be > 0")
-    if transformer_depth <= 0:
-        raise ValueError("transformer_depth must be > 0")
-    if attention_heads <= 0:
-        raise ValueError("attention_heads must be > 0")
-    if token_dim % attention_heads != 0:
-        raise ValueError("attention_heads must divide token_dim")
-    if transformer_mlp_ratio <= 0.0:
-        raise ValueError("transformer_mlp_ratio must be > 0")
-    if not (0.0 <= token_dropout < 1.0):
-        raise ValueError("token_dropout must satisfy 0 <= value < 1")
-    return token_dim, transformer_depth, attention_heads, transformer_mlp_ratio, token_dropout
-
-
-def _format_run_value(value: float) -> str:
-    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
-    return text.replace("-", "m").replace(".", "p")
-
-
-def _make_json_serializable(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _make_json_serializable(inner) for key, inner in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_make_json_serializable(item) for item in value]
-    return value
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_make_json_serializable(payload), indent=2, sort_keys=True), encoding="utf-8")
-
-
-def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(_make_json_serializable(payload), sort_keys=True) + "\n")
-
-
-def _plot_output_dir_arg(value: str | None) -> Path | None:
-    return Path(value) if value else None
-
-
-def _build_epoch_metrics_plotter(
-    *,
-    metrics_path: Path,
-    output_dir: Path | None,
-    output_format: str,
-) -> MetricPlotter:
-    try:
-        from plot import EpochMetricsPlotter, resolve_plot_output_path
-    except Exception as exc:
-        raise SystemExit(f"Failed to initialize metric plotting: {exc}") from exc
-
-    return EpochMetricsPlotter(
-        metrics_path=metrics_path,
-        output_path=resolve_plot_output_path(
-            metrics_path,
-            output_dir=output_dir,
-            output_format=output_format,
-        ),
-    )
-
-
-def _record_epoch_metrics(
-    *,
-    metrics_path: Path | None,
-    metric_rows: list[dict[str, Any]],
-    metric_plotter: MetricPlotter | None,
-    payload: dict[str, Any],
-) -> None:
-    if metrics_path is None:
-        raise RuntimeError("epoch metrics path is required when tracking is enabled")
-    _append_jsonl(metrics_path, payload)
-    metric_rows.append(dict(payload))
-    if metric_plotter is not None:
-        metric_plotter.update(metric_rows)
-
-
-def _finalize_metric_plot(
-    *,
-    metric_plotter: MetricPlotter | None,
-    metric_rows: list[dict[str, Any]],
-    metrics_path: Path,
-    output_dir: Path | None,
-    output_format: str,
-) -> Path:
-    if metric_plotter is None:
-        metric_plotter = _build_epoch_metrics_plotter(
-            metrics_path=metrics_path,
-            output_dir=output_dir,
-            output_format=output_format,
-        )
-    if not metric_rows:
-        try:
-            from plot import read_metric_rows
-        except Exception as exc:
-            raise SystemExit(f"Failed to read metric rows for plotting: {exc}") from exc
-        metric_rows.extend(read_metric_rows(metrics_path))
-    saved_plot_path = metric_plotter.save(metric_rows)
-    metric_plotter.show(block=True)
-    return saved_plot_path
-
-
-def _loader_dataset_len(loader: DataLoader[Any]) -> int:
-    return len(cast(Sized, loader.dataset))
-
-
-def _move_module_to_device(
-    module: nn.Module,
-    *,
-    device: torch.device,
-    use_channels_last: bool,
-) -> nn.Module:
-    module.to(device=device)
-    if use_channels_last:
-        module.to(memory_format=torch.channels_last)
-    return module
-
-
-def _prepare_experiment_artifacts(
-    *,
-    experiment_root: Path,
-    checkpoint_path: Path,
-    seed: int,
-    omega_lambda: float,
-    idsi_lambda: float,
-) -> tuple[Path, Path, Path, Path]:
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = experiment_root / (
-        f"{timestamp}-{checkpoint_path.stem}-seed_{int(seed)}"
-        f"-lambda_{_format_run_value(omega_lambda)}"
-        f"-idsi_{_format_run_value(idsi_lambda)}"
-    )
-    run_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = run_dir / "epoch_metrics.jsonl"
-    summary_path = run_dir / "summary.json"
-    config_path = run_dir / "config.json"
-    notes_path = run_dir / "qualitative_notes.txt"
-    notes_path.write_text(
-        "Training run qualitative notes\n"
-        "==============================\n\n"
-        "- smoothness:\n"
-        "- oscillation:\n"
-        "- divergence:\n"
-        "- collapse signs:\n",
-        encoding="utf-8",
-    )
-    return run_dir, config_path, metrics_path, summary_path
-
-
-def _extract_representation_variance_stats(h: torch.Tensor | None) -> RepresentationVarianceStats:
-    if h is None:
-        return RepresentationVarianceStats(mean=float("nan"), min=float("nan"), max=float("nan"))
-    value = h.detach().float()
-    if value.ndim > 2:
-        value = value.reshape(value.shape[0], -1)
-    variance = torch.var(value, dim=0, unbiased=False)
-    return RepresentationVarianceStats(
-        mean=float(variance.mean().item()),
-        min=float(variance.min().item()),
-        max=float(variance.max().item()),
-    )
-
-
-def _empty_token_diversity_stats() -> TokenDiversityStats:
-    return TokenDiversityStats(
-        token_variance=float("nan"),
-        inter_token_variance=float("nan"),
-        token_norm_mean=float("nan"),
-        token_norm_min=float("nan"),
-        token_norm_max=float("nan"),
-        pairwise_cosine_similarity=float("nan"),
-        pairwise_cosine_distance=float("nan"),
-        collapse_score=float("nan"),
-    )
-
-
-def _extract_token_diversity_stats(tokens: torch.Tensor | None) -> TokenDiversityStats:
-    if tokens is None or tokens.ndim != 3:
-        return _empty_token_diversity_stats()
-    value = tokens.detach().float()
-    token_variance = torch.var(value, unbiased=False)
-    inter_token_variance = torch.var(value, dim=1, unbiased=False).mean()
-    norms = torch.linalg.vector_norm(value, dim=-1)
-    if value.shape[1] < 2:
-        pairwise_similarity = torch.tensor(float("nan"), device=value.device)
-    else:
-        normalized = F.normalize(value, p=2, dim=-1, eps=1e-8)
-        cosine = torch.bmm(normalized, normalized.transpose(1, 2))
-        token_count = value.shape[1]
-        off_diagonal = ~torch.eye(token_count, dtype=torch.bool, device=value.device).unsqueeze(0)
-        pairwise_similarity = cosine.masked_select(off_diagonal).mean()
-    pairwise_similarity_float = float(pairwise_similarity.item())
-    pairwise_distance = (
-        1.0 - pairwise_similarity_float
-        if not np.isnan(pairwise_similarity_float)
-        else float("nan")
-    )
-    collapse_score = float(
-        float(inter_token_variance.item()) < 1e-6
-        or (not np.isnan(pairwise_similarity_float) and pairwise_similarity_float > 0.98)
-    )
-    return TokenDiversityStats(
-        token_variance=float(token_variance.item()),
-        inter_token_variance=float(inter_token_variance.item()),
-        token_norm_mean=float(norms.mean().item()),
-        token_norm_min=float(norms.min().item()),
-        token_norm_max=float(norms.max().item()),
-        pairwise_cosine_similarity=pairwise_similarity_float,
-        pairwise_cosine_distance=pairwise_distance,
-        collapse_score=collapse_score,
-    )
-
-
-def _empty_idsi_metrics(*, device: torch.device, dtype: torch.dtype) -> IDSIMetrics:
-    zero = torch.zeros((), device=device, dtype=dtype)
-    empty_stats = IDSIDistributionStats(count=0, total=0.0, sum_sq=0.0, max=float("nan"))
-    return IDSIMetrics(
-        layer_names=(),
-        global_stats=empty_stats,
-        layer_stats=(),
-        loss=zero,
-        hidden_norm_total=0.0,
-        hidden_norm_count=0,
-    )
-
-
-def _distribution_stats_from_delta(delta: torch.Tensor) -> IDSIDistributionStats:
-    values = delta.detach().float().reshape(-1)
-    count = int(values.numel())
-    if count <= 0:
-        return IDSIDistributionStats(count=0, total=0.0, sum_sq=0.0, max=float("nan"))
-    return IDSIDistributionStats(
-        count=count,
-        total=float(values.sum().item()),
-        sum_sq=float(torch.sum(values * values).item()),
-        max=float(values.max().item()),
-    )
-
-
-def _compute_idsi_metrics_from_pairs(
-    layer_names: Sequence[str],
-    layer_inputs: Sequence[torch.Tensor],
-    layer_outputs: Sequence[torch.Tensor],
-    *,
-    loss_layer_names: Sequence[str] | None = None,
-    epsilon: float = IDSI_EPSILON,
-) -> IDSIMetrics:
-    if len(layer_inputs) != len(layer_outputs):
-        raise ValueError("Layer-IDSI input/output tensor counts do not match")
-    if len(layer_inputs) != len(layer_names):
-        raise ValueError("Layer-IDSI layer name count does not match tensor count")
-    if not layer_inputs:
-        raise ValueError("Layer-IDSI requires at least one monitored tensor pair")
-
-    loss_name_set: frozenset[str] | None = (
-        None if loss_layer_names is None else frozenset(loss_layer_names)
-    )
-
-    layer_stats: list[IDSIDistributionStats] = []
-    loss_eligible_losses: list[torch.Tensor] = []
-    global_count = 0
-    global_total = 0.0
-    global_sum_sq = 0.0
-    global_max = -float("inf")
-    hidden_norm_total = 0.0
-    hidden_norm_count = 0
-
-    for layer_name, layer_input, layer_output in zip(layer_names, layer_inputs, layer_outputs):
-        if tuple(layer_input.shape) != tuple(layer_output.shape):
-            raise ValueError(
-                f"Layer-IDSI tensors for {layer_name!r} must be shape-matched; "
-                f"got {tuple(layer_input.shape)} and {tuple(layer_output.shape)}"
-            )
-        input_flat = layer_input.float().flatten(start_dim=1)
-        output_flat = layer_output.float().flatten(start_dim=1)
-        residual = output_flat - input_flat
-        denominator = torch.linalg.vector_norm(input_flat.detach(), dim=1).clamp_min(float(epsilon))
-        relative_delta = torch.linalg.vector_norm(residual.detach(), dim=1) / denominator
-        layer_loss = torch.mean(torch.square(torch.linalg.vector_norm(residual, dim=1) / denominator))
-        stats = _distribution_stats_from_delta(relative_delta * IDSI_LOG_SCALE)
-
-        layer_stats.append(stats)
-        if loss_name_set is None or layer_name in loss_name_set:
-            loss_eligible_losses.append(layer_loss)
-        global_count += stats.count
-        global_total += stats.total
-        global_sum_sq += stats.sum_sq
-        if stats.count > 0:
-            global_max = max(global_max, stats.max)
-        hidden_norm_total += float(denominator.detach().sum().item())
-        hidden_norm_count += int(denominator.numel())
-
-    global_stats = IDSIDistributionStats(
-        count=global_count,
-        total=global_total,
-        sum_sq=global_sum_sq,
-        max=global_max if global_count > 0 else float("nan"),
-    )
-    if loss_eligible_losses:
-        idsi_loss = torch.stack(loss_eligible_losses).mean()
-    else:
-        idsi_loss = torch.zeros((), device=layer_inputs[0].device, dtype=layer_inputs[0].dtype)
-
-    return IDSIMetrics(
-        layer_names=tuple(str(name) for name in layer_names),
-        global_stats=global_stats,
-        layer_stats=tuple(layer_stats),
-        loss=idsi_loss,
-        hidden_norm_total=hidden_norm_total,
-        hidden_norm_count=hidden_norm_count,
-    )
-
-
-def _compute_idsi(h: torch.Tensor | None, t_h: torch.Tensor | None) -> float:
-    if h is None or t_h is None:
-        return float("nan")
-    metrics = _compute_idsi_metrics_from_pairs(("classifier_pre_head",), (h,), (t_h,))
-    return float(metrics.global_stats.mean)
-
-
-def _resolve_forward_output(
-    forward_output: Any,
-    *,
-    omega_enabled: bool,
-) -> ForwardComponents:
-    if not isinstance(forward_output, tuple):
-        return ForwardComponents(forward_output, None, None, (), (), None)
-    if not omega_enabled and len(forward_output) == 1:
-        return ForwardComponents(forward_output[0], None, None, (), (), None)
-    if not omega_enabled and len(forward_output) == 2:
-        logits, h = forward_output
-        return ForwardComponents(logits, h, None, (), (), None)
-    if not isinstance(forward_output, tuple):
-        raise ValueError("Omega-enabled forward path must return tuple outputs")
-    if len(forward_output) == 3:
-        logits, h, t_h = forward_output
-        token_metric_tokens = t_h if isinstance(t_h, torch.Tensor) and t_h.ndim == 3 else None
-        return ForwardComponents(logits, h, t_h, (), (), token_metric_tokens)
-    if len(forward_output) == 5:
-        logits, h, t_h, layer_inputs, layer_outputs = forward_output
-        return ForwardComponents(
-            logits=logits,
-            h=h,
-            t_h=t_h,
-            layer_inputs=tuple(layer_inputs),
-            layer_outputs=tuple(layer_outputs),
-            token_metric_tokens=t_h if isinstance(t_h, torch.Tensor) and t_h.ndim == 3 else None,
-        )
-    if len(forward_output) == 6:
-        logits, h, t_h, layer_inputs, layer_outputs, token_metric_tokens = forward_output
-        return ForwardComponents(
-            logits=logits,
-            h=h,
-            t_h=t_h,
-            layer_inputs=tuple(layer_inputs),
-            layer_outputs=tuple(layer_outputs),
-            token_metric_tokens=token_metric_tokens,
-        )
-    raise ValueError("Omega-enabled forward path must return (logits, h, T(h)) or Layer-IDSI outputs")
-
-def _resolve_idsi_loss_layer_names(
-    model: TorchCNN,
-    *,
-    omega_enabled: bool,
-    idsi_enabled: bool,
-) -> tuple[str, ...] | None:
-    """Decide which layers contribute to the L_IDSI term.
-
-    Per MAOIDL, the IDSI loss is a regularizer on *attractor dynamics*
-    (hidden-state transitions), not on generic feature extraction. So:
-      - CNN path: only the Omega projector (``classifier_pre_head``).
-      - Token path: only the transformer blocks.
-    CNN backbone stages and the token projection stay monitor-only.
-    """
-    if not idsi_enabled:
-        return None
-    if model.tokenize:
-        return tuple(
-            f"transformer_token_block_{index + 1}"
-            for index in range(model.transformer_depth)
-        )
-    if omega_enabled:
-        return ("classifier_pre_head",)
-    return None
-
-def _select_forward_callable(
-    model: TorchCNN,
-    *,
-    omega_enabled: bool,
-    idsi_enabled: bool,
-    token_metrics_enabled: bool = False,
-) -> Callable[[torch.Tensor], Any]:
-    if model.tokenize:
-        if omega_enabled or idsi_enabled or token_metrics_enabled:
-            return model.forward_with_token_dynamics_and_layer_idsi
-        return model
-    if omega_enabled and idsi_enabled:
-        return model.forward_with_omega_and_layer_idsi
-    if omega_enabled:
-        return model.forward_with_omega
-    return model
-
-
-def list_labeled_paths(
-    data_dir: Path,
-    fallback_num_classes: int,
-    allow_unlabeled_root: bool = False,
-) -> tuple[list[Path], np.ndarray, list[str], bool]:
-    class_dirs = sorted(path for path in data_dir.iterdir() if path.is_dir())
-    exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    if class_dirs:
-        paths: list[Path] = []
-        labels: list[int] = []
-        class_names: list[str] = []
-        class_id = 0
-        for directory in class_dirs:
-            files = [entry for entry in sorted(directory.iterdir()) if entry.suffix.lower() in exts]
-            if not files:
-                continue
-            paths.extend(files)
-            labels.extend([class_id] * len(files))
-            class_names.append(directory.name)
-            class_id += 1
-        if paths:
-            return paths, np.asarray(labels, dtype=np.int64), class_names, False
-    if not allow_unlabeled_root:
-        raise SystemExit(
-            "No class subdirectories found. Expected `data_dir/class_name/*.jpg` layout. "
-            "Use --allow-unlabeled-root to synthesize labels if needed."
-        )
-    files = [entry for entry in sorted(data_dir.iterdir()) if entry.suffix.lower() in exts]
-    if not files:
-        raise SystemExit(f"No images found in {data_dir}")
-    if fallback_num_classes <= 0:
-        raise SystemExit("fallback_num_classes must be > 0 when unlabeled root images are used")
-    labels = np.arange(len(files), dtype=np.int64) % fallback_num_classes
-    class_names = [str(index) for index in range(fallback_num_classes)]
-    return files, labels, class_names, True
-
-
-def class_distribution(labels: np.ndarray, num_classes: int) -> np.ndarray:
-    return np.bincount(labels, minlength=num_classes).astype(np.int64)
-
-
-def make_class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
-    counts = class_distribution(labels, num_classes).astype(np.float64)
-    weights = np.zeros((num_classes,), dtype=np.float64)
-    non_zero = counts > 0
-    if not np.any(non_zero):
-        return np.ones((num_classes,), dtype=np.float64)
-    weights[non_zero] = labels.size / (np.sum(non_zero) * counts[non_zero])
-    weights[non_zero] /= np.mean(weights[non_zero])
-    return weights
-
-
-def stable_partition_index(path: Path, num_parts: int) -> int:
-    """Hash a path into a stable partition id so repeated runs shard consistently."""
-    if num_parts <= 1:
-        return 0
-    digest = hashlib.md5(str(path.resolve()).lower().encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) % num_parts
-
-
-def choose_partition(args) -> int:
-    """Resolve the active data partition, optionally rotating across runs."""
-    if not args.auto_next_partition:
-        return max(0, min(args.partition, max(0, args.num_partitions - 1)))
-    state_path = Path(args.partition_state)
-    state = {"num_partitions": args.num_partitions, "next": 0}
-    try:
-        if state_path.is_file():
-            loaded = json.loads(state_path.read_text(encoding="utf-8"))
-            if int(loaded.get("num_partitions", -1)) == args.num_partitions:
-                state = loaded
-    except Exception:
-        pass
-    part = int(state.get("next", 0)) % max(1, args.num_partitions)
-    state["num_partitions"] = args.num_partitions
-    state["next"] = (part + 1) % max(1, args.num_partitions)
-    try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-    except Exception:
-        pass
-    return part
-
-
-def _resolve_device(device_arg: str) -> torch.device:
-    """Resolve `cpu`, `cuda`, or `auto` into a concrete torch device."""
-    if device_arg == "cpu":
-        return torch.device("cpu")
-    if device_arg == "cuda":
-        if not torch.cuda.is_available():
-            raise SystemExit("--device=cuda requested, but CUDA is not available")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def _resolve_num_workers(streaming: bool, num_workers_arg: int | None) -> int:
-    if num_workers_arg is not None:
-        if int(num_workers_arg) < 0:
-            raise SystemExit("--num-workers must be >= 0")
-        return int(num_workers_arg)
-    return 4 if streaming else 0
-
-
-def _seed_data_loader_worker(worker_id: int, *, base_seed: int) -> None:
-    """Keep worker init pickle-safe so Windows spawn can launch DataLoader workers."""
-    worker_seed = int(base_seed) + int(worker_id)
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
-def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
-    return partial(_seed_data_loader_worker, base_seed=int(base_seed))
+def _seed_worker(worker_id: int, *, base_seed: int) -> None:
+    seed = int(base_seed) + int(worker_id)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 def _collate_image_batch(batch: Sequence[tuple[torch.Tensor, int]]) -> tuple[torch.Tensor, torch.Tensor]:
     images, labels = zip(*batch)
-    image_tensor = torch.stack(images, dim=0).contiguous()
-    label_tensor = torch.as_tensor(labels, dtype=torch.int64).contiguous()
-    return image_tensor, label_tensor
+    return (
+        torch.stack(images, dim=0).contiguous(),
+        torch.as_tensor(labels, dtype=torch.int64).contiguous(),
+    )
 
 
-def _build_data_loader(
+def _build_loader(
     dataset: Dataset[tuple[torch.Tensor, int]],
     *,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
     pin_memory: bool,
-    base_seed: int,
+    seed: int,
 ) -> DataLoader[tuple[torch.Tensor, torch.Tensor]]:
     generator = torch.Generator()
-    generator.manual_seed(int(base_seed))
-    loader_kwargs: dict[str, Any] = {
+    generator.manual_seed(int(seed))
+    kwargs: dict[str, Any] = {
         "batch_size": int(batch_size),
         "shuffle": bool(shuffle),
         "num_workers": int(num_workers),
@@ -935,275 +132,20 @@ def _build_data_loader(
         "generator": generator,
     }
     if num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
-        loader_kwargs["worker_init_fn"] = _make_worker_init_fn(base_seed)
-    return DataLoader[tuple[torch.Tensor, torch.Tensor]](dataset, **loader_kwargs)
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+        kwargs["worker_init_fn"] = partial(_seed_worker, base_seed=int(seed))
+    return DataLoader[tuple[torch.Tensor, torch.Tensor]](dataset, **kwargs)
 
 
-def _load_all_images(paths: Sequence[Path], input_size: tuple[int, int]) -> np.ndarray:
-    batch = np.empty((len(paths), input_size[0], input_size[1], 3), dtype=np.float32)
-    for index, image_path in enumerate(paths):
-        image = load_image(image_path)
-        batch[index] = preprocess_image(
-            image,
-            target_size=input_size,
-            normalize_to=config.NORMALIZE_TO,
-            input_value_range=config.INPUT_VALUE_RANGE,
-        ).astype(np.float32)
-    return batch
-
-
-def _move_input_batch(
-    x_batch: torch.Tensor,
-    device: torch.device,
-    *,
-    use_channels_last: bool,
-) -> torch.Tensor:
-    x_tensor = x_batch.to(
-        device=device,
-        dtype=torch.float32,
-        non_blocking=(device.type == "cuda"),
-    )
-    if use_channels_last:
-        x_tensor = x_tensor.contiguous(memory_format=torch.channels_last)
-    return x_tensor
-
-
-def _move_label_batch(y_batch: torch.Tensor, device: torch.device) -> torch.Tensor:
-    return y_batch.to(device=device, dtype=torch.long, non_blocking=(device.type == "cuda"))
-
-
-def _make_target_distribution(
-    labels: torch.Tensor,
-    num_classes: int,
-    label_smoothing: float,
-    *,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    label_smoothing = float(label_smoothing)
-    if not (0.0 <= label_smoothing < 1.0):
-        raise ValueError("label_smoothing must satisfy 0 <= value < 1")
-    labels = labels.to(dtype=torch.long).view(-1)
-    targets = torch.full(
-        (int(labels.shape[0]), int(num_classes)),
-        fill_value=label_smoothing / num_classes,
-        device=labels.device,
-        dtype=dtype,
-    )
-    targets.scatter_(
-        1,
-        labels.unsqueeze(1),
-        1.0 - label_smoothing + (label_smoothing / num_classes),
-    )
-    return targets
-
-
-def _soft_cross_entropy_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    class_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Compute weighted soft-label cross entropy for hard, smoothed, or mixed labels."""
-    log_probs = F.log_softmax(logits, dim=1)
-    per_sample_nll = -(targets * log_probs).sum(dim=1)
-    if class_weights is None:
-        return per_sample_nll.mean()
-    sample_weights = (targets * class_weights.view(1, -1)).sum(dim=1)
-    return (sample_weights * per_sample_nll).sum() / sample_weights.sum().clamp_min(1e-12)
-
-
-def _focal_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    gamma: float,
-    alpha_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Compute generalized focal loss for standard or label-smoothed targets."""
-    probs = torch.softmax(logits, dim=1)
-    log_probs = torch.log_softmax(logits, dim=1)
-    pt = (targets * probs).sum(dim=1)
-    ce = -(targets * log_probs).sum(dim=1)
-    focal_factor = torch.pow((1.0 - pt).clamp(min=0.0, max=1.0), float(gamma))
-    if alpha_weights is None:
-        sample_alpha = torch.ones_like(pt)
-    else:
-        sample_alpha = (targets * alpha_weights.view(1, -1)).sum(dim=1)
-    return (sample_alpha * focal_factor * ce).sum() / sample_alpha.sum().clamp_min(1e-12)
-
-
-def _compute_batch_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    use_focal_loss: bool,
-    focal_gamma: float,
-    ce_class_weights: torch.Tensor | None,
-    focal_alpha_weights: torch.Tensor | None,
-) -> torch.Tensor:
-    """Select the correct loss path for the current run-level policy."""
-    if use_focal_loss:
-        return _focal_loss(logits, targets, gamma=focal_gamma, alpha_weights=focal_alpha_weights)
-    return _soft_cross_entropy_loss(logits, targets, class_weights=ce_class_weights)
-
-
-def _compute_total_loss_components(
-    forward_output: Any,
-    targets: torch.Tensor,
-    *,
-    omega_enabled: bool,
-    omega_lambda: float,
-    idsi_lambda: float,
-    idsi_layer_names: Sequence[str] | None = None,
-    idsi_loss_layer_names: Sequence[str] | None = None,
-    use_focal_loss: bool,
-    focal_gamma: float,
-    ce_class_weights: torch.Tensor | None,
-    focal_alpha_weights: torch.Tensor | None,
-) -> BatchLossComponents:
-    components = _resolve_forward_output(forward_output, omega_enabled=omega_enabled)
-    logits = components.logits
-    ce_loss = _compute_batch_loss(
-        logits,
-        targets,
-        use_focal_loss=use_focal_loss,
-        focal_gamma=focal_gamma,
-        ce_class_weights=ce_class_weights,
-        focal_alpha_weights=focal_alpha_weights,
-    )
-    zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
-    h = components.h
-    t_h = components.t_h
-    if omega_enabled:
-        if h is None or t_h is None:
-            raise ValueError("Omega-enabled forward path must provide h and T(h)")
-        attr_target = t_h.detach() if h.ndim == 3 else t_h
-        attr_loss = torch.mean(torch.square(h - attr_target))
-    else:
-        attr_loss = zero
-
-    if components.layer_inputs:
-        layer_names = tuple(
-            idsi_layer_names
-            if idsi_layer_names is not None
-            else (f"layer_{index + 1}" for index in range(len(components.layer_inputs)))
-        )
-        idsi_metrics = _compute_idsi_metrics_from_pairs(
-            layer_names,
-            components.layer_inputs,
-            components.layer_outputs,
-            loss_layer_names=idsi_loss_layer_names,
-        )
-    elif h is not None and t_h is not None:
-        if float(idsi_lambda) > 0.0:
-            raise ValueError("idsi_lambda > 0 requires forward_with_omega_and_layer_idsi outputs")
-        idsi_metrics = _compute_idsi_metrics_from_pairs(("classifier_pre_head",), (h,), (t_h,))
-        idsi_metrics = IDSIMetrics(
-            layer_names=idsi_metrics.layer_names,
-            global_stats=idsi_metrics.global_stats,
-            layer_stats=idsi_metrics.layer_stats,
-            loss=torch.zeros((), device=logits.device, dtype=logits.dtype),
-            hidden_norm_total=idsi_metrics.hidden_norm_total,
-            hidden_norm_count=idsi_metrics.hidden_norm_count,
-        )
-    else:
-        if float(idsi_lambda) > 0.0:
-            raise ValueError("idsi_lambda > 0 requires Layer-IDSI forward outputs")
-        idsi_metrics = _empty_idsi_metrics(device=logits.device, dtype=logits.dtype)
-    idsi_loss = idsi_metrics.loss if components.layer_inputs else zero
-    total_loss = ce_loss + (float(omega_lambda) * attr_loss) + (float(idsi_lambda) * idsi_metrics.loss)
-    return BatchLossComponents(
-        total_loss=total_loss,
-        ce_loss=ce_loss,
-        attr_loss=attr_loss,
-        idsi_loss=idsi_loss,
-        logits=logits,
-        h_stats=_extract_representation_variance_stats(h),
-        idsi_metrics=idsi_metrics,
-        token_stats=_extract_token_diversity_stats(components.token_metric_tokens),
-    )
-
-
-def _beta_sample_on_device(beta_alpha: float, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    concentration = torch.tensor(float(beta_alpha), device=device, dtype=dtype)
-    return torch.distributions.Beta(concentration, concentration).sample().to(device=device, dtype=dtype)
-
-
-def _apply_mixup_torch(
-    x_batch: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    beta_alpha: float,
-) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor]:
-    if int(x_batch.shape[0]) < 2:
-        lam = torch.ones((), device=x_batch.device, dtype=x_batch.dtype)
-        return x_batch, targets, False, lam
-    lam = _beta_sample_on_device(beta_alpha, device=x_batch.device, dtype=x_batch.dtype)
-    permutation = torch.randperm(int(x_batch.shape[0]), device=x_batch.device)
-    lam_targets = lam.to(device=targets.device, dtype=targets.dtype)
-    mixed_x = lam * x_batch + (1.0 - lam) * x_batch[permutation]
-    mixed_targets = lam_targets * targets + (1.0 - lam_targets) * targets[permutation]
-    return mixed_x, mixed_targets, True, lam
-
-
-def _apply_cutmix_torch(
-    x_batch: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    beta_alpha: float,
-) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor]:
-    if int(x_batch.shape[0]) < 2:
-        lam = torch.ones((), device=x_batch.device, dtype=x_batch.dtype)
-        return x_batch, targets, False, lam
-
-    batch_size, _, height, width = x_batch.shape
-    lam_sample = _beta_sample_on_device(beta_alpha, device=x_batch.device, dtype=x_batch.dtype)
-    cut_ratio = torch.sqrt(torch.clamp(1.0 - lam_sample, min=0.0, max=1.0))
-
-    cut_w = torch.clamp(torch.round(torch.tensor(float(width), device=x_batch.device, dtype=x_batch.dtype) * cut_ratio), min=1.0, max=float(width)).to(dtype=torch.int64)
-    cut_h = torch.clamp(torch.round(torch.tensor(float(height), device=x_batch.device, dtype=x_batch.dtype) * cut_ratio), min=1.0, max=float(height)).to(dtype=torch.int64)
-
-    center_x = torch.randint(0, width, (1,), device=x_batch.device, dtype=torch.int64).item()
-    center_y = torch.randint(0, height, (1,), device=x_batch.device, dtype=torch.int64).item()
-    x1 = max(0, center_x - int(cut_w.item()) // 2)
-    y1 = max(0, center_y - int(cut_h.item()) // 2)
-    x2 = min(width, center_x + (int(cut_w.item()) + 1) // 2)
-    y2 = min(height, center_y + (int(cut_h.item()) + 1) // 2)
-
-    permutation = torch.randperm(batch_size, device=x_batch.device)
-    mixed_x = x_batch.clone()
-    mixed_x[:, :, y1:y2, x1:x2] = x_batch[permutation, :, y1:y2, x1:x2]
-
-    patch_area = float(max(0, y2 - y1) * max(0, x2 - x1))
-    lam = torch.tensor(
-        1.0 - (patch_area / float(height * width)),
-        device=x_batch.device,
-        dtype=x_batch.dtype,
-    )
-    lam_targets = lam.to(device=targets.device, dtype=targets.dtype)
-    mixed_targets = lam_targets * targets + (1.0 - lam_targets) * targets[permutation]
-    return mixed_x, mixed_targets, True, lam
-
-
-def _apply_batch_mix_torch(
-    x_batch: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    prob: float,
-    beta_alpha: float,
-    cutmix_ratio: float,
-) -> tuple[torch.Tensor, torch.Tensor, str, torch.Tensor]:
-    if int(x_batch.shape[0]) < 2 or float(prob) <= 0.0:
-        lam = torch.ones((), device=x_batch.device, dtype=x_batch.dtype)
-        return x_batch, targets, "none", lam
-    if torch.rand((), device=x_batch.device) >= float(prob):
-        lam = torch.ones((), device=x_batch.device, dtype=x_batch.dtype)
-        return x_batch, targets, "none", lam
-    if torch.rand((), device=x_batch.device) < float(cutmix_ratio):
-        mixed_x, mixed_targets, _, lam = _apply_cutmix_torch(x_batch, targets, beta_alpha=beta_alpha)
-        return mixed_x, mixed_targets, "cutmix", lam
-    mixed_x, mixed_targets, _, lam = _apply_mixup_torch(x_batch, targets, beta_alpha=beta_alpha)
-    return mixed_x, mixed_targets, "mixup", lam
+def _resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit("--device=cuda requested, but CUDA is not available")
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _resolve_amp_dtype(device: torch.device, amp_mode: str) -> torch.dtype | None:
@@ -1218,7 +160,7 @@ def _resolve_amp_dtype(device: torch.device, amp_mode: str) -> torch.dtype | Non
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
-def _make_grad_scaler(device: torch.device, amp_dtype: torch.dtype | None) -> Any:
+def _make_grad_scaler(device: torch.device, amp_dtype: torch.dtype | None):
     enabled = bool(device.type == "cuda" and amp_dtype == torch.float16)
     amp_module = getattr(torch, "amp", None)
     grad_scaler_cls = getattr(amp_module, "GradScaler", None) if amp_module is not None else None
@@ -1227,17 +169,70 @@ def _make_grad_scaler(device: torch.device, amp_dtype: torch.dtype | None) -> An
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def _make_autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
+def _autocast(device: torch.device, amp_dtype: torch.dtype | None):
     return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
 
 
-def _configure_runtime_kernels(device: torch.device, *, fixed_input_shape: bool) -> bool:
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")
-    use_channels_last = device.type == "cuda"
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.benchmark = bool(device.type == "cuda" and fixed_input_shape)
-    return use_channels_last
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr_value: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr_value)
+
+
+def _build_optimizer(
+    args: argparse.Namespace,
+    model: TorchCNN,
+    lr_value: float,
+) -> torch.optim.Optimizer:
+    regular: list[torch.nn.Parameter] = []
+    prototype: list[torch.nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("head.centers") or name.startswith("head.raw_radii"):
+            prototype.append(parameter)
+        else:
+            regular.append(parameter)
+    groups: list[dict[str, Any]] = [{"params": regular, "weight_decay": float(args.weight_decay)}]
+    if prototype:
+        groups.append({"params": prototype, "weight_decay": 0.0})
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(groups, lr=float(lr_value))
+    return torch.optim.SGD(groups, lr=float(lr_value), momentum=float(args.momentum))
+
+
+def _apply_backbone_freeze_state(model: TorchCNN, frozen: bool, freeze_bn_affine: bool) -> None:
+    for parameter in model.iter_head_parameters():
+        parameter.requires_grad = True
+    for parameter in model.iter_backbone_parameters():
+        parameter.requires_grad = not frozen
+    for bn_layer in model.backbone_batchnorm_layers():
+        if frozen:
+            bn_layer.eval()
+            if bn_layer.weight is not None:
+                bn_layer.weight.requires_grad = not freeze_bn_affine
+            if bn_layer.bias is not None:
+                bn_layer.bias.requires_grad = not freeze_bn_affine
+        else:
+            bn_layer.train()
+            if bn_layer.weight is not None:
+                bn_layer.weight.requires_grad = True
+            if bn_layer.bias is not None:
+                bn_layer.bias.requires_grad = True
+
+
+def _set_prototype_trainable(model: TorchCNN, trainable: bool) -> None:
+    model.head.set_trainable(trainable)
+
+
+def _grad_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
+    norms = [
+        torch.linalg.vector_norm(parameter.grad.detach().float(), ord=2)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not norms:
+        return float("nan")
+    return float(torch.linalg.vector_norm(torch.stack(norms), ord=2).item())
 
 
 def _backward_and_step(
@@ -1252,1399 +247,1147 @@ def _backward_and_step(
     if scaler is not None and getattr(scaler, "is_enabled", lambda: False)():
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        gradient_norm = _compute_gradient_norm(parameters)
+        norm = _grad_norm(parameters)
         if grad_clip > 0.0:
-            torch.nn.utils.clip_grad_norm_(parameters, max_norm=grad_clip)
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm=float(grad_clip))
         scaler.step(optimizer)
         scaler.update()
-        return gradient_norm
+        return norm
     loss.backward()
-    gradient_norm = _compute_gradient_norm(parameters)
+    norm = _grad_norm(parameters)
     if grad_clip > 0.0:
-        torch.nn.utils.clip_grad_norm_(parameters, max_norm=grad_clip)
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm=float(grad_clip))
     optimizer.step()
-    return gradient_norm
+    return norm
 
 
-def _compute_gradient_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
-    grad_norms = [
-        torch.linalg.vector_norm(parameter.grad.detach().float(), ord=2)
-        for parameter in parameters
-        if parameter.grad is not None
-    ]
-    if not grad_norms:
-        return float("nan")
-    return float(torch.linalg.vector_norm(torch.stack(grad_norms), ord=2).item())
+def _class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
+    counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=num_classes).astype(np.float64)
+    weights = np.zeros((num_classes,), dtype=np.float64)
+    present = counts > 0
+    if not np.any(present):
+        return np.ones((num_classes,), dtype=np.float64)
+    weights[present] = labels.size / (np.sum(present) * counts[present])
+    weights[present] /= np.mean(weights[present])
+    return weights
 
 
-def _synchronize_device(device: torch.device) -> None:
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_serializable(payload), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_serializable(payload), sort_keys=True) + "\n")
+
+
+def _serializable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _serializable(inner) for key, inner in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_serializable(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            return str(value)
+    return value
+
+
+def _prepare_run_dir(args: argparse.Namespace, tag: str, index: DatasetIndex) -> Path:
+    root = Path(args.json_dir)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = root / f"{timestamp}-{tag}-seed_{int(args.seed)}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    _write_json(
+        run_dir / "config.json",
+        {
+            "args": vars(args),
+            "tag": tag,
+            "class_names": list(index.class_names),
+            "tree": index.tree.to_dict(),
+            "class_counts": index.class_counts.tolist(),
+            "node_weights": index.node_weights.tolist(),
+        },
+    )
+    return run_dir
+
+
+def _move_module_to_device(module: torch.nn.Module, device: torch.device) -> torch.nn.Module:
+    module.to(device=device)
     if device.type == "cuda":
-        torch.cuda.synchronize(device=device)
+        module.to(memory_format=torch.channels_last)
+    return module
 
 
-def _benchmark_train_steps(
-    *,
-    forward_callable: Callable[[torch.Tensor], Any],
-    raw_model: TorchCNN,
-    optimizer: torch.optim.Optimizer,
-    scaler,
-    x_batch: torch.Tensor,
-    y_batch_idx: torch.Tensor,
-    num_classes: int,
-    label_smoothing: float,
-    use_focal_loss: bool,
-    focal_gamma: float,
-    ce_class_weights: torch.Tensor | None,
-    focal_alpha_weights: torch.Tensor | None,
-    omega_enabled: bool,
-    omega_lambda: float,
-    idsi_enabled: bool,
-    idsi_lambda: float,
-    idsi_layer_names: Sequence[str] | None,
-    idsi_loss_layer_names: Sequence[str] | None,
-    grad_clip: float,
-    device: torch.device,
-    amp_dtype: torch.dtype | None,
-    warmup_steps: int,
-    measure_steps: int,
-) -> float:
-    raw_model.train()
-    times: list[float] = []
-    targets = _make_target_distribution(
-        y_batch_idx,
-        num_classes,
-        label_smoothing=label_smoothing,
-        dtype=torch.float32,
-    )
-    total_steps = int(warmup_steps) + int(measure_steps)
-    for step in range(total_steps):
-        optimizer.zero_grad(set_to_none=True)
-        _synchronize_device(device)
-        start = time.perf_counter()
-        with _make_autocast_context(device, amp_dtype):
-            forward_output = forward_callable(x_batch)
-            loss_components = _compute_total_loss_components(
-                forward_output,
-                targets,
-                omega_enabled=omega_enabled,
-                omega_lambda=omega_lambda,
-                idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
-                idsi_layer_names=idsi_layer_names,
-                idsi_loss_layer_names=idsi_loss_layer_names,
-                use_focal_loss=use_focal_loss,
-                focal_gamma=focal_gamma,
-                ce_class_weights=ce_class_weights,
-                focal_alpha_weights=focal_alpha_weights,
-            )
-            loss = loss_components.total_loss
-        _backward_and_step(
-            loss,
-            optimizer,
-            raw_model,
-            grad_clip=grad_clip,
-            scaler=scaler,
-        )
-        _synchronize_device(device)
-        elapsed = time.perf_counter() - start
-        if step >= warmup_steps:
-            times.append(elapsed)
-    return float(np.median(np.asarray(times, dtype=np.float64)))
+def _move_batch(x: torch.Tensor, y: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    x = x.to(device=device, dtype=torch.float32, non_blocking=device.type == "cuda")
+    if device.type == "cuda":
+        x = x.contiguous(memory_format=torch.channels_last)
+    y = y.to(device=device, dtype=torch.long, non_blocking=device.type == "cuda")
+    return x, y
 
 
-def _should_keep_compiled_model(
-    eager_step_median: float,
-    compiled_step_median: float,
-    *,
-    required_speedup_ratio: float = 0.95,
-) -> bool:
-    return float(compiled_step_median) < (float(eager_step_median) * float(required_speedup_ratio))
+def _accuracy(logits: torch.Tensor, labels: torch.Tensor) -> tuple[int, int]:
+    correct = int((torch.argmax(logits, dim=1) == labels).sum().item())
+    return correct, int(labels.numel())
 
 
-def _clone_model_for_benchmark(
-    model: TorchCNN,
-    *,
-    device: torch.device,
-    use_channels_last: bool,
-) -> TorchCNN:
-    cloned = copy.deepcopy(model)
-    if use_channels_last:
-        cloned.to(device=device, memory_format=torch.channels_last)
-    else:
-        cloned.to(device=device)
-    return cloned
-
-
-def _maybe_enable_compiled_forward_model(
-    *,
-    model: TorchCNN,
-    args: argparse.Namespace,
-    benchmark_batch: tuple[torch.Tensor, torch.Tensor] | None,
-    benchmark_lr: float,
-    num_classes: int,
-    label_smoothing: float,
-    use_focal_loss: bool,
-    focal_gamma: float,
-    ce_class_weights: torch.Tensor | None,
-    focal_alpha_weights: torch.Tensor | None,
-    omega_enabled: bool,
-    omega_lambda: float,
-    idsi_enabled: bool,
-    idsi_lambda: float,
-    idsi_loss_layer_names: Sequence[str] | None,
-    token_metrics_enabled: bool,
-    grad_clip: float,
-    device: torch.device,
-    amp_dtype: torch.dtype | None,
-    use_channels_last: bool,
-) -> Callable[[torch.Tensor], Any] | None:
-    if args.compile_mode == "off":
-        return None
-    if device.type != "cuda":
-        if args.compile_mode == "on":
-            raise SystemExit("--compile-mode=on requires CUDA")
-        return None
-    if not hasattr(torch, "compile"):
-        if args.compile_mode == "on":
-            raise SystemExit("torch.compile is unavailable in this PyTorch build")
-        print("[warn] torch.compile unavailable; continuing in eager mode.")
-        return None
-
-    if args.compile_mode == "on":
-        try:
-            compiled = torch.compile(
-                _select_forward_callable(
-                    model,
-                    omega_enabled=omega_enabled,
-                    idsi_enabled=idsi_enabled,
-                    token_metrics_enabled=token_metrics_enabled,
-                )
-            )
-            print("Enabled torch.compile (--compile-mode=on).")
-            return compiled
-        except Exception as exc:
-            raise SystemExit(f"Failed to enable torch.compile: {exc}") from exc
-
-    if benchmark_batch is None:
-        return None
-
-    x_cpu, y_cpu = benchmark_batch
-    x_device = _move_input_batch(x_cpu, device, use_channels_last=use_channels_last)
-    y_device = _move_label_batch(y_cpu, device)
-
-    try:
-        eager_model = _clone_model_for_benchmark(model, device=device, use_channels_last=use_channels_last)
-        eager_optimizer = _build_optimizer(args, eager_model, lr_value=benchmark_lr)
-        eager_scaler = _make_grad_scaler(device, amp_dtype)
-        eager_time = _benchmark_train_steps(
-            forward_callable=_select_forward_callable(
-                eager_model,
-                omega_enabled=omega_enabled,
-                idsi_enabled=idsi_enabled,
-                token_metrics_enabled=token_metrics_enabled,
-            ),
-            raw_model=eager_model,
-            optimizer=eager_optimizer,
-            scaler=eager_scaler,
-            x_batch=x_device,
-            y_batch_idx=y_device,
-            num_classes=num_classes,
-            label_smoothing=label_smoothing,
-            use_focal_loss=use_focal_loss,
-            focal_gamma=focal_gamma,
-            ce_class_weights=ce_class_weights,
-            focal_alpha_weights=focal_alpha_weights,
-            omega_enabled=omega_enabled,
-            omega_lambda=omega_lambda,
-            idsi_enabled=idsi_enabled,
-            idsi_lambda=idsi_lambda,
-            idsi_layer_names=eager_model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
-            idsi_loss_layer_names=idsi_loss_layer_names,
-            grad_clip=grad_clip,
-            device=device,
-            amp_dtype=amp_dtype,
-            warmup_steps=5,
-            measure_steps=10,
-        )
-
-        compiled_model = _clone_model_for_benchmark(model, device=device, use_channels_last=use_channels_last)
-        compiled_forward = torch.compile(
-            _select_forward_callable(
-                compiled_model,
-                omega_enabled=omega_enabled,
-                idsi_enabled=idsi_enabled,
-                token_metrics_enabled=token_metrics_enabled,
-            )
-        )
-        compiled_optimizer = _build_optimizer(args, compiled_model, lr_value=benchmark_lr)
-        compiled_scaler = _make_grad_scaler(device, amp_dtype)
-        compiled_time = _benchmark_train_steps(
-            forward_callable=compiled_forward,
-            raw_model=compiled_model,
-            optimizer=compiled_optimizer,
-            scaler=compiled_scaler,
-            x_batch=x_device,
-            y_batch_idx=y_device,
-            num_classes=num_classes,
-            label_smoothing=label_smoothing,
-            use_focal_loss=use_focal_loss,
-            focal_gamma=focal_gamma,
-            ce_class_weights=ce_class_weights,
-            focal_alpha_weights=focal_alpha_weights,
-            omega_enabled=omega_enabled,
-            omega_lambda=omega_lambda,
-            idsi_enabled=idsi_enabled,
-            idsi_lambda=idsi_lambda,
-            idsi_layer_names=compiled_model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
-            idsi_loss_layer_names=idsi_loss_layer_names,
-            grad_clip=grad_clip,
-            device=device,
-            amp_dtype=amp_dtype,
-            warmup_steps=5,
-            measure_steps=10,
-        )
-
-        if not _should_keep_compiled_model(eager_time, compiled_time):
-            print(
-                f"[info] torch.compile disabled: eager median step {eager_time:.6f}s, "
-                f"compiled median step {compiled_time:.6f}s"
-            )
-            return None
-
-        live_compiled_forward = torch.compile(
-            _select_forward_callable(
-                model,
-                omega_enabled=omega_enabled,
-                idsi_enabled=idsi_enabled,
-                token_metrics_enabled=token_metrics_enabled,
-            )
-        )
-        print(
-            f"Enabled torch.compile: eager median step {eager_time:.6f}s, "
-            f"compiled median step {compiled_time:.6f}s"
-        )
-        return live_compiled_forward
-    except Exception as exc:
-        print(f"[warn] torch.compile disabled: {exc}")
-        return None
-
-
-def evaluate_loader(
-    model: nn.Module,
-    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    num_classes: int,
-    device: torch.device,
-    *,
-    forward_callable: Callable[[torch.Tensor], Any] | None,
-    use_channels_last: bool,
-    amp_dtype: torch.dtype | None,
-    use_focal_loss: bool,
-    focal_gamma: float,
-    ce_class_weights: torch.Tensor | None,
-    focal_alpha_weights: torch.Tensor | None,
-    omega_enabled: bool,
-    omega_lambda: float,
-    idsi_lambda: float,
-    idsi_layer_names: Sequence[str] | None = None,
-    idsi_loss_layer_names: Sequence[str] | None = None,
-) -> dict[str, float]:
-    if len(loader.dataset) == 0:
-        return {
-            "loss_total": float("nan"),
-            "loss_ce": float("nan"),
-            "loss_attr": float("nan"),
-            "loss_idsi": float("nan"),
-            "acc": float("nan"),
-            "val_h_var_mean": float("nan"),
-            "val_h_var_min": float("nan"),
-            "val_h_var_max": float("nan"),
-            "val_token_variance": float("nan"),
-            "val_inter_token_variance": float("nan"),
-            "val_token_norm_mean": float("nan"),
-            "val_token_norm_min": float("nan"),
-            "val_token_norm_max": float("nan"),
-            "val_token_pairwise_cosine_similarity": float("nan"),
-            "val_token_pairwise_cosine_distance": float("nan"),
-            "val_token_collapse_score": float("nan"),
-            "IDSI": float("nan"),
-        }
-    total_loss = 0.0
-    total_ce_loss = 0.0
-    total_attr_loss = 0.0
-    total_idsi_loss = 0.0
-    total_correct = 0
-    total_h_var_mean = 0.0
-    total_h_var_min = 0.0
-    total_h_var_max = 0.0
-    total_idsi = 0.0
-    total_idsi_count = 0
-    token_stats_agg = EpochTokenStatsAggregator()
-    num_batches = 0
-    model.eval()
-    with torch.no_grad():
-        for x_cpu, y_cpu in loader:
-            x_batch = _move_input_batch(x_cpu, device, use_channels_last=use_channels_last)
-            y_batch = _move_label_batch(y_cpu, device)
-            targets = _make_target_distribution(
-                y_batch,
-                num_classes,
-                label_smoothing=0.0,
-                dtype=torch.float32,
-            )
-            with _make_autocast_context(device, amp_dtype):
-                forward_output = (forward_callable or model)(x_batch)
-                loss_components = _compute_total_loss_components(
-                    forward_output,
-                    targets,
-                    omega_enabled=omega_enabled,
-                    omega_lambda=omega_lambda,
-                    idsi_lambda=idsi_lambda,
-                    idsi_layer_names=idsi_layer_names,
-                    idsi_loss_layer_names=idsi_loss_layer_names,
-                    use_focal_loss=use_focal_loss,
-                    focal_gamma=focal_gamma,
-                    ce_class_weights=ce_class_weights,
-                    focal_alpha_weights=focal_alpha_weights,
-                )
-            total_loss += float(loss_components.total_loss.item())
-            total_ce_loss += float(loss_components.ce_loss.item())
-            total_attr_loss += float(loss_components.attr_loss.item())
-            total_idsi_loss += float(loss_components.idsi_loss.item())
-            logits = loss_components.logits
-            h_stats = loss_components.h_stats
-            total_correct += int((torch.argmax(logits, dim=1) == y_batch).sum().item())
-            total_h_var_mean += h_stats.mean
-            total_h_var_min += h_stats.min
-            total_h_var_max += h_stats.max
-            token_stats_agg.update(loss_components.token_stats)
-            idsi_stats = loss_components.idsi_metrics.global_stats
-            if idsi_stats.count > 0:
-                total_idsi += idsi_stats.total
-                total_idsi_count += idsi_stats.count
-            num_batches += 1
-    metrics = {
-        "loss_total": total_loss / max(1, num_batches),
-        "loss_ce": total_ce_loss / max(1, num_batches),
-        "loss_attr": total_attr_loss / max(1, num_batches),
-        "loss_idsi": total_idsi_loss / max(1, num_batches),
-        "acc": total_correct / max(1, len(loader.dataset)),
-        "val_h_var_mean": total_h_var_mean / max(1, num_batches),
-        "val_h_var_min": total_h_var_min / max(1, num_batches),
-        "val_h_var_max": total_h_var_max / max(1, num_batches),
-        "IDSI": total_idsi / max(1, total_idsi_count) if total_idsi_count > 0 else float("nan"),
+def _empty_metrics() -> dict[str, float]:
+    return {
+        "loss_total": float("nan"),
+        "loss_ce": float("nan"),
+        "loss_intra": float("nan"),
+        "loss_sep": float("nan"),
+        "loss_nest": float("nan"),
+        "loss_cov": float("nan"),
+        "loss_center": float("nan"),
+        "acc": float("nan"),
+        "gradient_norm": float("nan"),
     }
-    metrics.update(token_stats_agg.summary("val"))
-    return metrics
 
 
-def load_weights_forgiving(model: TorchCNN, checkpoint_path: str | Path, skip_prefixes: tuple[str, ...] = ("fc2.",)) -> tuple[list[str], list[str]]:
-    checkpoint = Path(checkpoint_path)
-    state, _ = load_checkpoint_state(checkpoint, map_location="cpu")
-    current = model.state_dict()
-    loaded: list[str] = []
-    skipped: list[str] = []
-    filtered: dict[str, torch.Tensor] = {}
-    for key, target in current.items():
-        if any(key.startswith(prefix) for prefix in skip_prefixes):
-            skipped.append(key)
-            continue
-        source = state.get(key)
-        if source is None or tuple(source.shape) != tuple(target.shape):
-            skipped.append(key)
-            continue
-        filtered[key] = source
-        loaded.append(key)
-    model.load_state_dict(filtered, strict=False)
-    return loaded, skipped
+@torch.no_grad()
+def evaluate_loader(
+    model: torch.nn.Module,
+    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None,
+    device: torch.device,
+    *,
+    lambdas: Mapping[str, float],
+    gamma: float,
+    eta: float,
+    class_weights: torch.Tensor | None,
+    amp_dtype: torch.dtype | None,
+) -> dict[str, float]:
+    if loader is None or len(cast(Sized, loader.dataset)) == 0:
+        return _empty_metrics()
+    model.eval()
+    totals = {key: 0.0 for key in ("total", "ce", "intra", "sep", "nest", "cov", "center")}
+    correct = 0
+    count = 0
+    for x_cpu, y_cpu in loader:
+        x, y = _move_batch(x_cpu, y_cpu, device)
+        with _autocast(device, amp_dtype):
+            h = cast(TorchCNN, model).forward_embedding(x)
+            terms = compute_maol_losses(
+                cast(TorchCNN, model).head,
+                h,
+                y,
+                lambdas=lambdas,
+                gamma=gamma,
+                eta=eta,
+                class_weights=class_weights,
+            )
+        totals["total"] += float(terms.total.item())
+        totals["ce"] += float(terms.ce.item())
+        totals["intra"] += float(terms.intra.item())
+        totals["sep"] += float(terms.sep.item())
+        totals["nest"] += float(terms.nest.item())
+        totals["cov"] += float(terms.cov.item())
+        totals["center"] += float(terms.center.item())
+        batch_correct, batch_count = _accuracy(terms.logits, y)
+        correct += batch_correct
+        count += batch_count
+    batches = max(1, len(loader))
+    return {
+        "loss_total": totals["total"] / batches,
+        "loss_ce": totals["ce"] / batches,
+        "loss_intra": totals["intra"] / batches,
+        "loss_sep": totals["sep"] / batches,
+        "loss_nest": totals["nest"] / batches,
+        "loss_cov": totals["cov"] / batches,
+        "loss_center": totals["center"] / batches,
+        "acc": correct / max(1, count),
+        "gradient_norm": float("nan"),
+    }
 
 
-def _apply_backbone_freeze_state(model: TorchCNN, backbone_frozen: bool, freeze_bn_affine: bool) -> None:
-    """Apply the temporary freeze policy after each `model.train()` call."""
-    for parameter in model.iter_head_parameters():
-        parameter.requires_grad = True
-
-    for parameter in model.iter_backbone_parameters():
-        parameter.requires_grad = not backbone_frozen
-
-    for bn_layer in model.backbone_batchnorm_layers():
-        if backbone_frozen:
-            bn_layer.eval()
-            if bn_layer.weight is not None:
-                bn_layer.weight.requires_grad = not freeze_bn_affine
-            if bn_layer.bias is not None:
-                bn_layer.bias.requires_grad = not freeze_bn_affine
-        else:
-            bn_layer.train()
-            if bn_layer.weight is not None:
-                bn_layer.weight.requires_grad = True
-            if bn_layer.bias is not None:
-                bn_layer.bias.requires_grad = True
-
-
-def _build_optimizer(
-    args: argparse.Namespace,
-    model: TorchCNN,
-    lr_value: float,
-) -> torch.optim.Optimizer:
-    """Recreate the optimizer intentionally when freeze state changes."""
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if args.optimizer == "adamw":
-        return torch.optim.AdamW(parameters, lr=lr_value, weight_decay=args.weight_decay)
-    return torch.optim.SGD(parameters, lr=lr_value, momentum=args.momentum, weight_decay=args.weight_decay)
-
-
-def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr_value: float) -> None:
-    for group in optimizer.param_groups:
-        group["lr"] = lr_value
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train image classifier with the PyTorch backend")
-    parser.add_argument("--help-md", action="store_true", help="Print Markdown guide and exit")
-    parser.add_argument("--data-dir", type=str, default=None, help="Directory with train images")
-    parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE, help="Batch size")
-    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker count (defaults to 4 for streaming, 0 for preloaded)")
-    parser.add_argument("--lr", type=float, nargs="+", default=[1e-3], help="One learning rate per phase")
-    parser.add_argument("--phase-count", type=int, default=1, help="Number of contiguous training phases")
-    parser.add_argument("--warmup-epochs", type=int, default=0, help="Warmup epochs at the start of each phase")
-    parser.add_argument("--freeze-patience", type=int, default=8, help="Epochs without val_acc improvement before freezing the backbone")
-    parser.add_argument("--freeze-epoch-num", type=int, default=10, help="How many epochs each temporary freeze window lasts")
-    parser.add_argument("--after-unfreeze-lr-change", type=float, default=1e-4, help="Additive LR decrement applied after unfreeze when allowed")
-    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw", help="Optimizer type")
-    parser.add_argument("--momentum", type=float, default=0.9, help="Momentum (for SGD)")
-    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay")
-    parser.add_argument("--dropout", type=float, default=0.5, help="Dropout probability in classifier head")
-    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing factor")
-    parser.add_argument("--val-split", type=float, default=0.2, help="Validation split ratio")
-    parser.add_argument("--min-lr-ratio", type=float, default=0.2, help="Minimum LR ratio for cosine schedule")
-    parser.add_argument("--lr-schedule", choices=["cosine", "step", "constant"], default="cosine", help="LR schedule type")
-    parser.add_argument("--step-size", type=int, default=10, help="StepLR epoch interval inside each phase")
-    parser.add_argument("--gamma", type=float, default=0.5, help="StepLR decay factor")
-    parser.add_argument("--early-stop-metric", choices=["val_loss", "val_acc"], default="val_loss", help="Metric for early stopping")
-    parser.add_argument("--grad-clip", type=float, default=5.0, help="Global gradient clip norm (0 disables)")
-    parser.add_argument("--class-weighting", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--focal-loss", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--focal-gamma", type=float, default=1.5, help="Focal-loss gamma parameter")
-    parser.add_argument("--focal-alpha", choices=["auto", "none"], default="auto", help="Focal alpha weighting policy")
-    parser.add_argument("--mixup", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mixup-alpha", type=float, default=0.2, help="Shared Beta(alpha, alpha) parameter for MixUp and CutMix")
-    parser.add_argument("--mixup-prob", type=float, default=0.4, help="Per-batch probability of enabling MixUp/CutMix routing")
-    parser.add_argument("--cutmix-ratio", type=float, default=0.5, help="Conditional probability of using CutMix once batch mixing is enabled")
-    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--ema-decay", type=float, default=0.999, help="Base EMA decay applied after each optimizer step")
-    parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs")
-    parser.add_argument("--min-delta", type=float, default=1e-3, help="Minimum improvement for monitored metrics")
-    parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "best_torch_model.pt"))
-    parser.add_argument("--experiment-dir", type=str, default="runs", help="Root directory for training run artifacts")
-    parser.add_argument("--json-dir", type=str, default=None, help="Root directory for per-run JSONL tracking artifacts. Defaults to --experiment-dir.")
-    plot_group = parser.add_mutually_exclusive_group()
-    plot_group.add_argument("--plot-once", action="store_true", help="Show and save the metrics plot after training finishes")
-    plot_group.add_argument("--plot-real-time", action="store_true", help="Show the metrics plot when training starts and refresh it after each epoch")
-    parser.add_argument("--plot-output-format", choices=["png", "jpg", "jpeg"], default="png", help="Final metrics plot image format")
-    parser.add_argument("--plot-output-dir", type=str, default=None, help="Directory for the final metrics plot. Defaults to the run JSON directory.")
-    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--rotation", type=float, default=12.0, help="Maximum absolute random rotation in degrees")
-    parser.add_argument("--brightness", type=float, default=0.2, help="Brightness jitter strength in [0, 1]")
-    parser.add_argument("--contrast", type=float, default=0.2, help="Contrast jitter strength in [0, 1]")
-    parser.add_argument("--saturation", type=float, default=0.2, help="Saturation jitter strength in [0, 1]")
-    parser.add_argument("--model-width-scale", type=float, default=0.75, help="Width multiplier for the stage-2 convolution block")
-    parser.add_argument("--omega-loss", action=argparse.BooleanOptionalAction, default=False, help="Enable the Phase 1 Omega-loss auxiliary branch")
-    parser.add_argument("--omega-lambda", type=float, default=0.0, help="Weight applied to the Phase 1 Omega attractor loss")
-    parser.add_argument("--idsi-lambda", type=float, default=0.005, help="Weight applied to the Phase 1.2 Layer-IDSI loss when --omega-loss is enabled")
-    parser.add_argument("--omega-projector-depth", type=int, default=1, help="Omega projector depth: 1 or 2 linear layers")
-    parser.add_argument("--omega-hidden-dim", type=int, default=DEFAULT_OMEGA_FEATURE_DIM, help="Hidden width for the 2-layer Omega projector")
-    parser.add_argument("--tokenize", action=argparse.BooleanOptionalAction, default=False, help="Enable Phase2 tokenized feature representation")
-    parser.add_argument("--token-dim", type=int, default=128, help="Token embedding dimension for Phase2")
-    parser.add_argument("--transformer-depth", type=int, default=1, help="Number of lightweight transformer blocks")
-    parser.add_argument("--attention-heads", type=int, default=4, help="Attention head count for token transformer")
-    parser.add_argument("--transformer-mlp-ratio", type=float, default=2.0, help="Expansion ratio for transformer FFN")
-    parser.add_argument("--token-pool", choices=["mean", "cls"], default="mean", help="Pooling strategy for token classification")
-    parser.add_argument("--token-positional-encoding", choices=["none", "learned", "sinusoidal"], default="learned", help="Positional encoding type for tokens")
-    parser.add_argument("--token-dropout", type=float, default=0.1, help="Dropout inside transformer token block")
-    parser.add_argument("--transformer-layernorm", choices=["pre", "post"], default="pre", help="Transformer LayerNorm placement")
-    parser.add_argument("--token-omega-loss", action=argparse.BooleanOptionalAction, default=True, help="Apply Omega loss in token space")
-    parser.add_argument("--token-idsi", action=argparse.BooleanOptionalAction, default=True, help="Enable Layer-IDSI monitoring for token transformer")
-    parser.add_argument("--token-diversity-monitor", action=argparse.BooleanOptionalAction, default=True, help="Track token diversity metrics")
-    parser.add_argument("--allow-unlabeled-root", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True, help="If true, stream batches from disk; if false, preload all images into memory.")
-    parser.add_argument("--amp-mode", choices=["auto", "on", "off"], default="auto", help="AMP policy for CUDA training")
-    parser.add_argument("--compile-mode", choices=["auto", "on", "off"], default="auto", help="torch.compile policy")
-    parser.add_argument("--init-from", type=str, default=None, help="Path to checkpoint .pt/.pth to initialize weights")
-    parser.add_argument("--num-partitions", type=int, default=1, help="Split training set into P disjoint shards")
-    parser.add_argument("--partition", type=int, default=0, help="Train only on shard id [0..P-1]")
-    parser.add_argument("--auto-next-partition", action=argparse.BooleanOptionalAction, default=False, help="Rotate partition id across runs and save state to --partition-state")
-    parser.add_argument("--partition-state", type=str, default=str(config.CHECKPOINT_DIR / "partition_state.json"), help="State file for --auto-next-partition")
-    parser.add_argument("--class-count", type=int, default=None, help="Total number of classes. Defaults to the detected dataset class count.")
-    parser.add_argument("--enforce-readonly-dataset", action=argparse.BooleanOptionalAction, default=True, help="Verify Dataset unchanged before/after run")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Training device")
-    parser.add_argument(
-        "--freeze-bn-affine",
-        type=parse_bool_flag,
-        nargs="?",
-        const=True,
-        default=True,
-        help="When false, keep BN affine parameters trainable during backbone freeze",
-    )
-    args = parser.parse_args()
-
-    if args.help_md:
-        md_path = Path(__file__).resolve().parents[2] / "Nix_Vision_Pro.md"
-        try:
-            print(md_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise SystemExit(f"Help file not found or unreadable: {exc}") from exc
-        return
-
-    if args.phase_count > args.epochs:
-        raise SystemExit("--phase-count cannot be greater than --epochs")
-    if not (0.0 <= float(args.label_smoothing) < 1.0):
-        raise SystemExit("--label-smoothing must satisfy 0 <= value < 1")
-    try:
-        lr_values = validate_phase_learning_rates(args.lr, args.phase_count)
-        freeze_patience, freeze_epoch_num, after_unfreeze_lr_change = validate_freeze_cycle_args(
-            args.freeze_patience,
-            args.freeze_epoch_num,
-            args.after_unfreeze_lr_change,
-        )
-        augment_config = validate_augmentation_args(
-            args.rotation,
-            args.brightness,
-            args.contrast,
-            args.saturation,
-        )
-        mixup_alpha = validate_mixup_alpha(args.mixup_alpha)
-        mixup_prob = validate_mixup_probability(args.mixup_prob)
-        cutmix_ratio = validate_cutmix_ratio(args.cutmix_ratio)
-        ema_decay = validate_ema_decay(args.ema_decay)
-        focal_gamma = validate_focal_gamma(args.focal_gamma)
-        width_scale = validate_model_width_scale(args.model_width_scale)
-        omega_lambda, idsi_lambda, omega_projector_depth, omega_hidden_dim = _validate_omega_args(
-            omega_loss=bool(args.omega_loss),
-            omega_lambda=args.omega_lambda,
-            idsi_lambda=args.idsi_lambda,
-            omega_projector_depth=args.omega_projector_depth,
-            omega_hidden_dim=args.omega_hidden_dim,
-        )
-        token_dim, transformer_depth, attention_heads, transformer_mlp_ratio, token_dropout = _validate_token_args(
-            token_dim=args.token_dim,
-            transformer_depth=args.transformer_depth,
-            attention_heads=args.attention_heads,
-            transformer_mlp_ratio=args.transformer_mlp_ratio,
-            token_dropout=args.token_dropout,
-        )
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
-    device = _resolve_device(args.device)
-    amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
-    use_channels_last = _configure_runtime_kernels(device, fixed_input_shape=True)
-    omega_enabled = bool(args.omega_loss and (not args.tokenize or args.token_omega_loss))
-    token_metrics_enabled = bool(args.tokenize and args.token_diversity_monitor)
-    idsi_enabled = bool(
-        idsi_lambda > 0.0
-        and (
-            (bool(args.omega_loss) and not args.tokenize)
-            or (bool(args.tokenize) and bool(args.token_idsi))
-        )
-    )
-
-    data_dir = Path(args.data_dir) if args.data_dir else Path(config.DATA_DIR)
-    data_dir = data_dir.resolve()
-    pre_signature = tree_signature(data_dir) if args.enforce_readonly_dataset else None
-    rng = np.random.default_rng(args.seed)
-
-    fallback_num_classes = (
-        int(args.class_count)
-        if args.class_count is not None
-        else max(1, config.get_num_classes(data_dir, require_images=True))
-    )
-    paths, labels, class_names, synthetic_labels = list_labeled_paths(
-        data_dir,
-        fallback_num_classes=fallback_num_classes,
-        allow_unlabeled_root=args.allow_unlabeled_root,
-    )
-    detected_classes = int(labels.max() + 1) if labels.size else 0
-    if args.class_count is not None and args.class_count < detected_classes:
-        raise SystemExit(f"--class-count={args.class_count} < detected={detected_classes}")
-    num_classes = int(args.class_count) if args.class_count is not None else detected_classes
-    resolved_class_names = (
-        class_names
-        if synthetic_labels
-        else config.get_class_names(data_dir, class_count=num_classes, require_images=True)
-    )
-    print(f"Using num_classes={num_classes} (detected={detected_classes}) on device={device}")
-    print(f"Using classes={resolved_class_names}")
-
-    indices = rng.permutation(len(paths))
-    num_val = int(max(0.0, min(0.9, args.val_split)) * len(paths))
-    val_idx = indices[:num_val]
-    train_idx = indices[num_val:]
-    train_paths_all = [paths[index] for index in train_idx]
-    val_paths = [paths[index] for index in val_idx]
-    y_train_all = labels[train_idx]
-    y_val = labels[val_idx] if num_val > 0 else None
-
-    num_partitions = max(1, int(args.num_partitions))
-    partition = choose_partition(args)
-    if partition < 0 or partition >= num_partitions:
-        raise SystemExit(f"--partition must be in [0, {num_partitions - 1}]")
-    if num_partitions > 1:
-        keep_mask = [stable_partition_index(path, num_partitions) == partition for path in train_paths_all]
-        train_paths = [path for path, keep in zip(train_paths_all, keep_mask) if keep]
-        y_train = y_train_all[np.asarray(keep_mask, dtype=bool)]
-        if len(train_paths) == 0:
-            raise SystemExit("Selected partition contains no samples; adjust --num-partitions/--partition.")
-        print(f"Partitioning: {num_partitions} shards, using shard {partition} -> {len(train_paths)} samples")
-    else:
-        train_paths = train_paths_all
-        y_train = y_train_all
-
-    train_counts = class_distribution(y_train, num_classes)
-    print("Train samples:", y_train.size, " class_counts=", train_counts.tolist())
-    if y_val is not None:
-        val_counts = class_distribution(y_val, num_classes)
-        print("Val samples:", y_val.size, " class_counts=", val_counts.tolist())
-
-    inverse_frequency_weights = None
-    if args.class_weighting or args.focal_alpha == "auto":
-        inverse_frequency_weights = make_class_weights(y_train, num_classes)
-    ce_class_weights = None
-    if args.class_weighting and inverse_frequency_weights is not None:
-        ce_class_weights = torch.as_tensor(inverse_frequency_weights, dtype=torch.float32, device=device)
-    focal_alpha_weights = None
-    if args.focal_alpha == "auto" and inverse_frequency_weights is not None:
-        focal_alpha_weights = torch.as_tensor(inverse_frequency_weights, dtype=torch.float32, device=device)
-
-    base_use_focal_loss = bool(args.focal_loss)
-    input_size = config.INPUT_SIZE
-    pin_memory = bool(device.type == "cuda")
-    batch_size = max(1, int(args.batch_size))
-    num_workers = _resolve_num_workers(bool(args.streaming), args.num_workers)
-
-    x_train = None
-    x_val = None
-    if not args.streaming:
-        print("Preloading images into memory (float32)...")
-        x_train = _load_all_images(train_paths, input_size)
-        if y_val is not None and len(val_paths) > 0:
-            x_val = _load_all_images(val_paths, input_size)
-
-    train_dataset = TorchImageDataset(
-        labels=y_train,
-        input_size=input_size,
-        paths=train_paths if args.streaming else None,
-        preloaded_images=x_train,
-        augment_config=augment_config if args.augment else None,
-    )
-    val_dataset = None
-    if y_val is not None and len(val_paths) > 0:
-        val_dataset = TorchImageDataset(
-            labels=y_val,
-            input_size=input_size,
-            paths=val_paths if args.streaming else None,
-            preloaded_images=x_val,
-            augment_config=None,
-        )
-
-    train_loader = _build_data_loader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        base_seed=args.seed,
-    )
-    val_loader = None
-    if val_dataset is not None:
-        val_loader = _build_data_loader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers if args.streaming else 0,
-            pin_memory=pin_memory,
-            base_seed=args.seed + 10_000,
-        )
-
-    model = TorchCNN(
-        input_size=input_size,
-        num_classes=num_classes,
-        seed=args.seed,
-        dropout_p=args.dropout,
-        width_scale=width_scale,
-        omega_enabled=bool(args.omega_loss and not args.tokenize),
-        omega_projector_depth=omega_projector_depth,
-        omega_hidden_dim=omega_hidden_dim,
-        tokenize=bool(args.tokenize),
-        token_dim=token_dim,
-        transformer_depth=transformer_depth,
-        attention_heads=attention_heads,
-        transformer_mlp_ratio=transformer_mlp_ratio,
-        token_pool=args.token_pool,
-        token_positional_encoding=args.token_positional_encoding,
-        token_dropout=token_dropout,
-        transformer_layernorm=args.transformer_layernorm,
-    )
-    if use_channels_last:
-        model.to(device=device, memory_format=torch.channels_last)
-    else:
-        model.to(device=device)
-    print(f"Using stage2_channels={model.stage2_channels} (width_scale={model.width_scale:.3f})")
-    if model.tokenize:
-        print(
-            f"Using Phase2 tokens: grid={model.token_grid_size[0]}x{model.token_grid_size[1]} "
-            f"dim={model.token_dim} depth={model.transformer_depth} heads={model.attention_heads}"
-        )
-    if args.init_from:
-        try:
-            model.load_weights(args.init_from, map_location=device)
-            print(f"Initialized weights from: {args.init_from}")
-        except Exception as exc:
-            print(f"[warn] Strict load failed: {exc}")
-            loaded, skipped = load_weights_forgiving(model, args.init_from, skip_prefixes=("fc2.",))
-            print(f"Loaded {len(loaded)} keys from checkpoint; skipped {len(skipped)} (for example, classifier or resized feature tensors)")
-            if use_channels_last:
-                model.to(device=device, memory_format=torch.channels_last)
+@torch.no_grad()
+def evaluate_warmup_ce(
+    model: torch.nn.Module,
+    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None,
+    device: torch.device,
+    *,
+    class_weights: torch.Tensor | None,
+    amp_dtype: torch.dtype | None,
+) -> dict[str, float]:
+    if loader is None or len(cast(Sized, loader.dataset)) == 0:
+        return {"loss_ce": float("nan"), "acc": float("nan")}
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    count = 0
+    batches = 0
+    for x_cpu, y_cpu in loader:
+        x, y = _move_batch(x_cpu, y_cpu, device)
+        with _autocast(device, amp_dtype):
+            h = cast(TorchCNN, model).forward_embedding(x)
+            logits = cast(TorchCNN, model).head.logits(h)
+            if class_weights is None:
+                loss = F.cross_entropy(logits, y)
             else:
-                model.to(device=device)
+                per_sample = F.cross_entropy(logits, y, reduction="none")
+                weights = class_weights.to(device=logits.device, dtype=logits.dtype)[y]
+                loss = (per_sample * weights).sum() / weights.sum().clamp_min(1e-12)
+        total_loss += float(loss.item())
+        batch_correct, batch_count = _accuracy(logits, y)
+        correct += batch_correct
+        count += batch_count
+        batches += 1
+    return {"loss_ce": total_loss / max(1, batches), "acc": correct / max(1, count)}
 
-    idsi_loss_layer_names = _resolve_idsi_loss_layer_names(
-        model,
-        omega_enabled=omega_enabled,
-        idsi_enabled=idsi_enabled,
-    )
 
-    num_batches = max(1, len(train_loader))
-    phase_map = build_epoch_phase_map(args.epochs, args.phase_count)
-    current_phase_index = -1
-    current_phase_base_lr = lr_values[0]
-    phase_lr_offset = 0.0
-    phase_best_val_acc = -float("inf")
-    phase_plateau_epochs = 0
-    freeze_epochs_remaining = 0
-    backbone_frozen = False
+def _expanded_labels(counts: torch.Tensor) -> list[int]:
+    labels: list[int] = []
+    for class_index, count in enumerate(counts.detach().cpu().tolist()):
+        labels.extend([class_index] * int(count))
+    return labels
 
-    best_val_loss = float("inf")
-    best_val_acc = 0.0
-    best_saved = False
-    bad_epochs = 0
-    current_lr = current_phase_base_lr
-    best_epoch = 0
-    collapse_low_variance_epochs = 0
-    final_epoch_metrics: dict[str, Any] | None = None
 
-    _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
-    optimizer: torch.optim.Optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
+def run_warmup(
+    model: TorchCNN,
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    clean_train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None,
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    class_weights: torch.Tensor | None,
+) -> tuple[WarmupStats, list[dict[str, Any]]]:
+    """Warm-up: frozen prototype centers, tau=1 for 100 steps, then tau_warm, CE only."""
+    head = model.head
+    head.set_trainable(False)
+    head.tau.fill_(1.0)
+    optimizer = _build_optimizer(args, model, lr_value=float(args.lr[0]))
+    amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
     scaler = _make_grad_scaler(device, amp_dtype)
 
-    compile_probe_batch = None
-    try:
-        compile_probe_batch = next(iter(train_loader))
-    except StopIteration:
-        compile_probe_batch = None
-    compiled_forward_model = _maybe_enable_compiled_forward_model(
-        model=model,
-        args=args,
-        benchmark_batch=compile_probe_batch,
-        benchmark_lr=current_phase_base_lr,
-        num_classes=num_classes,
-        label_smoothing=float(args.label_smoothing),
-        use_focal_loss=base_use_focal_loss,
-        focal_gamma=focal_gamma,
-        ce_class_weights=ce_class_weights,
-        focal_alpha_weights=focal_alpha_weights,
-        omega_enabled=omega_enabled,
-        omega_lambda=omega_lambda,
-        idsi_enabled=idsi_enabled,
-        idsi_lambda=idsi_lambda,
-        idsi_loss_layer_names=idsi_loss_layer_names,
-        token_metrics_enabled=token_metrics_enabled,
-        grad_clip=float(args.grad_clip),
-        device=device,
-        amp_dtype=amp_dtype,
-        use_channels_last=use_channels_last,
+    rows: list[dict[str, Any]] = []
+    global_step = 0
+    tau_warm = 1.0
+    num_batches = max(1, len(train_loader))
+    for epoch in range(int(args.maol_warmup_epochs)):
+        model.eval()
+        means, counts, tau_epoch = compute_class_means(
+            model.forward_embedding,
+            clean_train_loader,
+            device,
+            model.num_classes,
+            model.embedding_dim,
+        )
+        head.set_centers(means)
+        head.set_node_weights(model.tree.node_weights_from_labels(_expanded_labels(counts)))
+        tau_warm = max(float(tau_epoch), 1e-6)
+        head.tau.fill_(1.0 if global_step < MAOL_WARMUP_TAU_STEPS else tau_warm)
+        model.train()
+
+        epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_count = 0
+        for batch_index, (x_cpu, y_cpu) in enumerate(train_loader):
+            x, y = _move_batch(x_cpu, y_cpu, device)
+            scheduled_lr = float(args.lr[0])
+            _set_optimizer_lr(optimizer, scheduled_lr)
+            optimizer.zero_grad(set_to_none=True)
+            if global_step >= MAOL_WARMUP_TAU_STEPS and abs(float(head.tau) - tau_warm) > 1e-9:
+                head.tau.fill_(tau_warm)
+            with _autocast(device, amp_dtype):
+                h = model.forward_embedding(x)
+                logits = head.logits(h)
+                if class_weights is None:
+                    loss = F.cross_entropy(logits, y)
+                else:
+                    per_sample = F.cross_entropy(logits, y, reduction="none")
+                    weights = class_weights.to(device=logits.device, dtype=logits.dtype)[y]
+                    loss = (per_sample * weights).sum() / weights.sum().clamp_min(1e-12)
+            _backward_and_step(
+                loss,
+                optimizer,
+                model,
+                grad_clip=float(args.grad_clip),
+                scaler=scaler,
+            )
+            global_step += 1
+            epoch_loss += float(loss.item())
+            batch_correct, batch_count = _accuracy(logits, y)
+            epoch_correct += batch_correct
+            epoch_count += batch_count
+
+        val = evaluate_warmup_ce(model, val_loader, device, class_weights=class_weights, amp_dtype=amp_dtype)
+        row = {
+            "epoch": epoch + 1,
+            "loss_ce": epoch_loss / max(1, num_batches),
+            "train_acc": epoch_correct / max(1, epoch_count),
+            "val_loss_ce": val["loss_ce"],
+            "val_acc": val["acc"],
+            "tau": float(head.tau.detach().cpu().item()),
+            "global_step": global_step,
+        }
+        rows.append(row)
+        print(
+            f"[warmup {epoch + 1}/{args.maol_warmup_epochs}] "
+            f"loss_ce={row['loss_ce']:.4f} train_acc={row['train_acc']:.3f} "
+            f"val_acc={row['val_acc']:.3f} tau={row['tau']:.4f}"
+        )
+
+    model.eval()
+    stats = compute_warmup_statistics(
+        model.forward_embedding,
+        head,
+        clean_train_loader,
+        val_loader,
+        device,
+        model.tree,
+        margin_scale=float(args.maol_margin_scale),
+        mbase_scale=float(args.maol_mbase_scale),
+        mmax_scale=float(args.maol_mmax_scale),
+        n_min=int(args.maol_nmin),
     )
+    apply_warmup_stats(head, stats)
+    head.set_trainable(True)
+    return stats, rows
+
+
+def _checkpoint_metadata(
+    model: TorchCNN,
+    stats: WarmupStats,
+    args: argparse.Namespace,
+    *,
+    is_ema: bool,
+    best_epoch: int,
+) -> dict[str, Any]:
+    return {
+        "is_ema": bool(is_ema),
+        "ema_decay": float(args.ema_decay) if is_ema else None,
+        "best_epoch": int(best_epoch),
+        "lambdas": {
+            "intra": float(args.maol_lambda_intra),
+            "sep": float(args.maol_lambda_sep),
+            "nest": float(args.maol_lambda_nest),
+            "cov": float(args.maol_lambda_cov),
+            "center": float(args.maol_lambda_center),
+        },
+        "warmup_stats": stats.to_metadata(),
+        "maol": {
+            "gamma": float(args.maol_gamma),
+            "eta": float(args.maol_eta),
+            "margin_scale": float(args.maol_margin_scale),
+            "mbase_scale": float(args.maol_mbase_scale),
+            "mmax_scale": float(args.maol_mmax_scale),
+        },
+    }
+
+
+def _lambdas(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "intra": float(args.maol_lambda_intra),
+        "sep": float(args.maol_lambda_sep),
+        "nest": float(args.maol_lambda_nest),
+        "cov": float(args.maol_lambda_cov),
+        "center": float(args.maol_lambda_center),
+    }
+
+
+def _save_warmup(
+    model: TorchCNN,
+    stats: WarmupStats,
+    path: Path,
+    args: argparse.Namespace,
+) -> None:
+    model.save_weights(
+        path,
+        metadata={
+            "stage": "maol_warmup",
+            "is_ema": False,
+            "warmup_stats": stats.to_metadata(),
+            "lambdas": DEFAULT_LAMBDAS,
+            "maol": {
+                "gamma": float(args.maol_gamma),
+                "eta": float(args.maol_eta),
+                "margin_scale": float(args.maol_margin_scale),
+                "mbase_scale": float(args.maol_mbase_scale),
+                "mmax_scale": float(args.maol_mmax_scale),
+            },
+        },
+    )
+
+
+def _load_warmup(
+    path: Path,
+    index: DatasetIndex,
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[TorchCNN, WarmupStats]:
+    config_info = resolve_checkpoint_runtime_config(path, map_location=device)
+    if config_info.tree is None:
+        raise SystemExit(f"{path} is not a MAOL warm-up checkpoint (missing tree metadata)")
+    if tuple(config_info.class_names) != tuple(index.class_names):
+        raise SystemExit("Warm-up checkpoint class order does not match the current nested dataset")
+    if config_info.tree.to_dict() != index.tree.to_dict():
+        raise SystemExit("Warm-up checkpoint tree does not match the current nested dataset")
+    raw_stats = config_info.metadata.get("warmup_stats")
+    if not isinstance(raw_stats, Mapping):
+        raise SystemExit(f"{path} is missing warm-up statistics")
+    stats = WarmupStats.from_metadata(raw_stats)
+    if tuple(stats.c_ema.shape) != (index.tree.num_leaves, config_info.embedding_dim):
+        raise SystemExit("Warm-up statistics do not match the checkpoint embedding dimension")
+    model = TorchCNN(
+        input_size=config_info.input_size,
+        num_classes=config_info.num_classes,
+        tree=index.tree,
+        seed=args.seed,
+        width_scale=config_info.width_scale,
+        embedding_dim=config_info.embedding_dim,
+        node_weights=index.node_weights,
+    )
+    model.load_weights(path, map_location=device, strict=True)
+    apply_warmup_stats(model.head, stats)
+    model.head.set_trainable(True)
+    _move_module_to_device(model, device)
+    return model, stats
+
+
+def _probe(
+    model: TorchCNN,
+    stats: WarmupStats,
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    args: argparse.Namespace,
+    device: torch.device,
+    run_dir: Path,
+) -> Path:
+    """Run a short scale probe.  No model weights are saved."""
+    del stats
+    model.head.set_trainable(True)
+    optimizer = _build_optimizer(args, model, lr_value=float(args.lr[0]))
+    model.train()
+    rows_path = run_dir / "probe_metrics.jsonl"
+    if rows_path.exists():
+        rows_path.unlink()
+    iterator = iter(train_loader)
+    rows: list[dict[str, Any]] = []
+    for step in range(int(args.maol_probe_steps)):
+        try:
+            x_cpu, y_cpu = next(iterator)
+        except StopIteration:
+            iterator = iter(train_loader)
+            x_cpu, y_cpu = next(iterator)
+        x, y = _move_batch(x_cpu, y_cpu, device)
+        optimizer.zero_grad(set_to_none=True)
+        h = model.forward_embedding(x)
+        model.head.update_ema_stats(
+            h.detach(),
+            y,
+            m=0.9,
+            m_q=float(args.maol_mq),
+            n_min=int(args.maol_nmin),
+        )
+        terms = compute_maol_losses(
+            model.head,
+            h,
+            y,
+            lambdas=DEFAULT_LAMBDAS,
+            gamma=float(args.maol_gamma),
+            eta=float(args.maol_eta),
+            class_weights=None,
+        )
+        terms.total.backward(retain_graph=True)
+        total_grad_norm = _grad_norm([p for p in model.parameters() if p.requires_grad])
+        grad_h: dict[str, float] = {}
+        for name, term in terms.named().items():
+            if name == "total":
+                continue
+            try:
+                gradient = torch.autograd.grad(term, h, retain_graph=True, allow_unused=True)[0]
+            except RuntimeError:
+                gradient = None
+            grad_h[name] = float(torch.linalg.vector_norm(gradient).item()) if gradient is not None else 0.0
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        row = {
+            "step": step,
+            "loss": {
+                "CE": float(terms.ce.item()),
+                "intra": float(terms.intra.item()),
+                "sep": float(terms.sep.item()),
+                "nest": float(terms.nest.item()),
+                "cov": float(terms.cov.item()),
+                "center": float(terms.center.item()),
+            },
+            "grad_h": {key.upper() if key == "ce" else key: value for key, value in grad_h.items()},
+            "total_grad_norm": float(total_grad_norm),
+            "lr": float(args.lr[0]),
+        }
+        rows.append(row)
+        _append_jsonl(rows_path, row)
+
+    summary = {
+        "steps": len(rows),
+        "loss_mean": {
+            key: float(np.mean([row["loss"][key] for row in rows])) if rows else float("nan")
+            for key in ("CE", "intra", "sep", "nest", "cov", "center")
+        },
+        "grad_h_mean": {
+            key: float(np.mean([row["grad_h"][key] for row in rows])) if rows else float("nan")
+            for key in ("CE", "intra", "sep", "nest", "cov", "center")
+        },
+        "total_grad_norm_mean": float(np.mean([row["total_grad_norm"] for row in rows])) if rows else float("nan"),
+        "note": "Scale probe only; no model weights were written.",
+    }
+    summary_path = run_dir / "probe_summary.json"
+    _write_json(summary_path, summary)
+    print(f"Probe finished: {len(rows)} steps -> {rows_path}")
+    print(f"Probe summary: {summary_path}")
+    return summary_path
+
+
+def _build_plotter(metrics_path: Path, args: argparse.Namespace):
+    try:
+        from plot import EpochMetricsPlotter, resolve_plot_output_path
+    except Exception as exc:
+        raise SystemExit(f"Failed to initialize metric plotting: {exc}") from exc
+    return EpochMetricsPlotter(
+        metrics_path=metrics_path,
+        output_path=resolve_plot_output_path(
+            metrics_path,
+            output_dir=Path(args.plot_output_dir) if args.plot_output_dir else None,
+            output_format=args.plot_output_format,
+        ),
+    )
+
+
+def _run_training(
+    model: TorchCNN,
+    stats: WarmupStats,
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None,
+    args: argparse.Namespace,
+    device: torch.device,
+    run_dir: Path,
+    *,
+    class_weights: torch.Tensor | None,
+) -> dict[str, Any]:
+    lambdas = _lambdas(args)
+    metrics_path = run_dir / "epoch_metrics.jsonl"
+    summary_path = run_dir / "summary.json"
+    if metrics_path.exists():
+        metrics_path.unlink()
+    plotter = _build_plotter(metrics_path, args) if args.plot_real_time else None
+    metric_rows: list[dict[str, Any]] = []
 
     ema: ModelEMA | None = None
     if args.ema:
         ema_model = TorchCNN(
-            input_size=input_size,
-            num_classes=num_classes,
+            input_size=model.input_size,
+            num_classes=model.num_classes,
+            tree=model.tree,
             seed=args.seed,
-            dropout_p=args.dropout,
-            width_scale=width_scale,
-            omega_enabled=bool(args.omega_loss and not args.tokenize),
-            omega_projector_depth=omega_projector_depth,
-            omega_hidden_dim=omega_hidden_dim,
-            tokenize=bool(args.tokenize),
-            token_dim=token_dim,
-            transformer_depth=transformer_depth,
-            attention_heads=attention_heads,
-            transformer_mlp_ratio=transformer_mlp_ratio,
-            token_pool=args.token_pool,
-            token_positional_encoding=args.token_positional_encoding,
-            token_dropout=token_dropout,
-            transformer_layernorm=args.transformer_layernorm,
+            width_scale=model.width_scale,
+            embedding_dim=model.embedding_dim,
+            node_weights=stats.node_weights.tolist(),
         )
-        if use_channels_last:
-            ema_model.to(device=device, memory_format=torch.channels_last)
-        else:
-            ema_model.to(device=device)
+        _move_module_to_device(ema_model, device)
         for parameter in ema_model.parameters():
             parameter.requires_grad_(False)
         ema_model.eval()
-        ema = ModelEMA(ema_model, decay=ema_decay, phase_warmup_steps=max(1, num_batches))
+        ema = ModelEMA(
+            ema_model,
+            decay=float(args.ema_decay),
+            phase_warmup_steps=max(1, len(train_loader)),
+            skip_prefixes=(
+                "head.c_ema",
+                "head.q",
+                "head.tau",
+                "head.node_weights",
+                "head.margins",
+                "head.sep_weights",
+            ),
+        )
         ema.sync_from(model)
 
-    checkpoint_metadata = {
-        "class_names": list(resolved_class_names),
-        "is_ema": False,
-        "ema_decay": None,
-    }
-    experiment_run_dir: Path | None = None
-    experiment_config_path: Path | None = None
-    experiment_metrics_path: Path | None = None
-    experiment_summary_path: Path | None = None
-    tracking_enabled = bool(args.omega_loss or args.tokenize or args.plot_once or args.plot_real_time)
-    plot_requested = bool(args.plot_once or args.plot_real_time)
-    plot_output_dir = _plot_output_dir_arg(args.plot_output_dir)
-    metric_plotter: Any | None = None
-    metric_rows: list[dict[str, Any]] = []
-    if tracking_enabled:
-        experiment_run_dir, experiment_config_path, experiment_metrics_path, experiment_summary_path = _prepare_experiment_artifacts(
-            experiment_root=Path(args.json_dir or args.experiment_dir),
-            checkpoint_path=Path(args.checkpoint),
-            seed=args.seed,
-            omega_lambda=omega_lambda,
-            idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
-        )
-        if experiment_config_path is None or experiment_metrics_path is None:
-            raise RuntimeError("run tracking artifact paths were not initialized")
-        _write_json(
-            experiment_config_path,
-            {
-                "args": vars(args),
-                "resolved_device": str(device),
-                "resolved_num_classes": int(num_classes),
-                "resolved_class_names": list(resolved_class_names),
-                "resolved_width_scale": float(width_scale),
-                "resolved_stage2_channels": int(model.stage2_channels),
-                "omega_enabled": bool(omega_enabled),
-                "omega_lambda": float(omega_lambda),
-                "idsi_enabled": bool(idsi_enabled),
-                "idsi_lambda": float(idsi_lambda),
-                "idsi_layer_names": list(model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else ()),
-                "idsi_loss_layer_names": list(idsi_loss_layer_names or ()),
-                "omega_projector_depth": int(omega_projector_depth),
-                "omega_hidden_dim": int(omega_hidden_dim),
-                "tokenize": bool(model.tokenize),
-                "token_dim": int(model.token_dim),
-                "transformer_depth": int(model.transformer_depth),
-                "attention_heads": int(model.attention_heads),
-                "transformer_mlp_ratio": float(model.transformer_mlp_ratio),
-                "token_pool": model.token_pool,
-                "token_positional_encoding": model.token_positional_encoding,
-                "token_dropout": float(model.token_dropout_p),
-                "transformer_layernorm": model.transformer_layernorm,
-                "token_diversity_monitor": bool(token_metrics_enabled),
-                "checkpoint_path": str(Path(args.checkpoint).resolve()),
-                "metrics_path": str(experiment_metrics_path.resolve()),
-            },
-        )
-    if args.plot_real_time:
-        if experiment_metrics_path is None:
-            raise RuntimeError("plot-real-time requires an epoch metrics path")
-        metric_plotter = _build_epoch_metrics_plotter(
-            metrics_path=experiment_metrics_path,
-            output_dir=plot_output_dir,
-            output_format=args.plot_output_format,
-        )
-        metric_plotter.update(metric_rows)
+    optimizer = _build_optimizer(args, model, lr_value=float(args.lr[0]))
+    amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
+    scaler = _make_grad_scaler(device, amp_dtype)
+    phase_map = build_epoch_phase_map(int(args.epochs), int(args.phase_count))
+    current_phase = -1
+    phase_base_lr = float(args.lr[0])
+    phase_offset = 0.0
+    phase_best_acc = -float("inf")
+    plateau_epochs = 0
+    freeze_remaining = 0
+    backbone_frozen = False
 
-    for epoch in range(args.epochs):
-        phase_config = phase_map[epoch]
-        if phase_config.phase_index != current_phase_index:
-            current_phase_index = phase_config.phase_index
-            current_phase_base_lr = lr_values[current_phase_index]
-            phase_lr_offset = 0.0
-            phase_best_val_acc = -float("inf")
-            phase_plateau_epochs = 0
-            freeze_epochs_remaining = 0
+    best_val_acc = 0.0
+    best_val_loss = float("inf")
+    best_epoch = 0
+    bad_epochs = 0
+    final_metrics: dict[str, Any] = {}
+    num_batches = max(1, len(train_loader))
+    current_lr = phase_base_lr
+
+    for epoch in range(int(args.epochs)):
+        phase = phase_map[epoch]
+        if phase.phase_index != current_phase:
+            current_phase = phase.phase_index
+            phase_base_lr = float(args.lr[current_phase])
+            phase_offset = 0.0
+            phase_best_acc = -float("inf")
+            plateau_epochs = 0
+            freeze_remaining = 0
             backbone_frozen = False
             model.train()
-            _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
-            optimizer = _build_optimizer(args, model, lr_value=current_phase_base_lr)
+            _apply_backbone_freeze_state(model, False, bool(args.freeze_bn_affine))
+            optimizer = _build_optimizer(args, model, lr_value=phase_base_lr)
             scaler = _make_grad_scaler(device, amp_dtype)
-            print(
-                f"Phase {current_phase_index + 1}/{args.phase_count}  "
-                f"base_lr={current_phase_base_lr:.6f}  "
-                f"epochs={phase_config.epochs_in_phase}  "
-                "cosine_restarts_per_phase=yes"
-            )
+            print(f"[phase {current_phase + 1}/{args.phase_count}] base_lr={phase_base_lr:.6f}")
 
         model.train()
-        epoch_backbone_frozen = backbone_frozen
-        _apply_backbone_freeze_state(model, backbone_frozen=epoch_backbone_frozen, freeze_bn_affine=args.freeze_bn_affine)
-        epoch_loss = 0.0
-        epoch_ce_loss = 0.0
-        epoch_attr_loss = 0.0
-        epoch_idsi_loss = 0.0
+        epoch_totals = {key: 0.0 for key in ("total", "ce", "intra", "sep", "nest", "cov", "center")}
         epoch_correct = 0
-        epoch_h_var_mean = 0.0
-        epoch_h_var_min = float("inf")
-        epoch_h_var_max = -float("inf")
-        epoch_idsi_metrics = EpochIDSIAggregator()
-        epoch_token_stats = EpochTokenStatsAggregator()
-        epoch_gradient_norm = 0.0
-        epoch_gradient_norm_count = 0
+        epoch_count = 0
+        grad_norm_total = 0.0
+        grad_norm_count = 0
+        hidden_norm_total = 0.0
+        hidden_norm_count = 0
 
         for batch_index, (x_cpu, y_cpu) in enumerate(train_loader):
-            y_batch_idx = _move_label_batch(y_cpu, device)
-            x_batch = _move_input_batch(x_cpu, device, use_channels_last=use_channels_last)
-
-            mix_mode = "none"
-            if args.mixup:
-                target_distribution = _make_target_distribution(
-                    y_batch_idx,
-                    num_classes,
-                    label_smoothing=0.0,
-                    dtype=torch.float32,
-                )
-                x_batch, target_distribution, mix_mode, _ = _apply_batch_mix_torch(
-                    x_batch,
-                    target_distribution,
-                    prob=mixup_prob,
-                    beta_alpha=mixup_alpha,
-                    cutmix_ratio=cutmix_ratio,
-                )
-                if mix_mode == "none":
-                    target_distribution = _make_target_distribution(
-                        y_batch_idx,
-                        num_classes,
-                        label_smoothing=float(args.label_smoothing),
-                        dtype=torch.float32,
-                    )
-            else:
-                target_distribution = _make_target_distribution(
-                    y_batch_idx,
-                    num_classes,
-                    label_smoothing=float(args.label_smoothing),
-                    dtype=torch.float32,
-                )
-
+            x, y = _move_batch(x_cpu, y_cpu, device)
             scheduled_lr = compute_phase_learning_rate(
-                base_lr=current_phase_base_lr,
+                base_lr=phase_base_lr,
                 schedule=args.lr_schedule,
-                min_lr_ratio=args.min_lr_ratio,
-                gamma=args.gamma,
-                step_size=args.step_size,
-                warmup_epochs=args.warmup_epochs,
-                epoch_index_in_phase=phase_config.epoch_index_in_phase,
-                epochs_in_phase=phase_config.epochs_in_phase,
+                min_lr_ratio=float(args.min_lr_ratio),
+                gamma=float(args.gamma),
+                step_size=int(args.step_size),
+                warmup_epochs=int(args.warmup_epochs),
+                epoch_index_in_phase=phase.epoch_index_in_phase,
+                epochs_in_phase=phase.epochs_in_phase,
                 batch_index=batch_index,
                 num_batches=num_batches,
             )
             current_lr = compute_effective_learning_rate(
                 scheduled_lr,
-                phase_lr_offset,
-                current_phase_base_lr,
-                args.min_lr_ratio,
+                phase_offset,
+                phase_base_lr,
+                float(args.min_lr_ratio),
             )
             _set_optimizer_lr(optimizer, current_lr)
-
             optimizer.zero_grad(set_to_none=True)
-            forward_callable: Callable[[torch.Tensor], Any]
-            if compiled_forward_model is not None:
-                forward_callable = compiled_forward_model
-            else:
-                forward_callable = _select_forward_callable(
-                    model,
-                    omega_enabled=omega_enabled,
-                    idsi_enabled=idsi_enabled,
-                    token_metrics_enabled=token_metrics_enabled,
+            with _autocast(device, amp_dtype):
+                h = model.forward_embedding(x)
+                model.head.update_ema_stats(
+                    h.detach(),
+                    y,
+                    m=0.9,
+                    m_q=float(args.maol_mq),
+                    n_min=int(args.maol_nmin),
                 )
-            with _make_autocast_context(device, amp_dtype):
-                batch_use_focal_loss = bool(base_use_focal_loss and mix_mode == "none")
-                forward_output = forward_callable(x_batch)
-                loss_components = _compute_total_loss_components(
-                    forward_output,
-                    target_distribution,
-                    omega_enabled=omega_enabled,
-                    omega_lambda=omega_lambda,
-                    idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
-                    idsi_layer_names=model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
-                    idsi_loss_layer_names=idsi_loss_layer_names,
-                    use_focal_loss=batch_use_focal_loss,
-                    focal_gamma=focal_gamma,
-                    ce_class_weights=ce_class_weights,
-                    focal_alpha_weights=focal_alpha_weights,
+                terms = compute_maol_losses(
+                    model.head,
+                    h,
+                    y,
+                    lambdas=lambdas,
+                    gamma=float(args.maol_gamma),
+                    eta=float(args.maol_eta),
+                    class_weights=class_weights,
                 )
             gradient_norm = _backward_and_step(
-                loss_components.total_loss,
+                terms.total,
                 optimizer,
                 model,
                 grad_clip=float(args.grad_clip),
                 scaler=scaler,
             )
             if not np.isnan(gradient_norm):
-                epoch_gradient_norm += gradient_norm
-                epoch_gradient_norm_count += 1
+                grad_norm_total += gradient_norm
+                grad_norm_count += 1
+            hidden_norm_total += float(torch.linalg.vector_norm(h.detach().float(), dim=-1).mean().item())
+            hidden_norm_count += 1
             if ema is not None:
-                phase_step = phase_config.epoch_index_in_phase * num_batches + batch_index
-                ema.update(model, step_in_phase=phase_step, mix_active=(mix_mode != "none"))
+                ema.update(model, step_in_phase=phase.epoch_index_in_phase * num_batches + batch_index)
+            for key, value in (
+                ("total", terms.total),
+                ("ce", terms.ce),
+                ("intra", terms.intra),
+                ("sep", terms.sep),
+                ("nest", terms.nest),
+                ("cov", terms.cov),
+                ("center", terms.center),
+            ):
+                epoch_totals[key] += float(value.item())
+            batch_correct, batch_count = _accuracy(terms.logits, y)
+            epoch_correct += batch_correct
+            epoch_count += batch_count
 
-            logits = loss_components.logits
-            h_stats = loss_components.h_stats
-            epoch_loss += float(loss_components.total_loss.item())
-            epoch_ce_loss += float(loss_components.ce_loss.item())
-            epoch_attr_loss += float(loss_components.attr_loss.item())
-            epoch_idsi_loss += float(loss_components.idsi_loss.item())
-            epoch_idsi_metrics.update(loss_components.idsi_metrics)
-            epoch_token_stats.update(loss_components.token_stats)
-            metric_targets = torch.argmax(target_distribution, dim=1)
-            epoch_correct += int((torch.argmax(logits, dim=1) == metric_targets).sum().item())
-            epoch_h_var_mean += h_stats.mean
-            if not np.isnan(h_stats.min):
-                epoch_h_var_min = min(epoch_h_var_min, h_stats.min)
-            if not np.isnan(h_stats.max):
-                epoch_h_var_max = max(epoch_h_var_max, h_stats.max)
-
-        avg_loss = epoch_loss / max(1, num_batches)
-        avg_ce_loss = epoch_ce_loss / max(1, num_batches)
-        avg_attr_loss = epoch_attr_loss / max(1, num_batches)
-        avg_idsi_loss = epoch_idsi_loss / max(1, num_batches)
-        train_acc = epoch_correct / max(1, len(train_dataset))
-        train_h_var_mean = epoch_h_var_mean / max(1, num_batches)
-        train_h_var_min = epoch_h_var_min if epoch_h_var_min != float("inf") else float("nan")
-        train_h_var_max = epoch_h_var_max if epoch_h_var_max != -float("inf") else float("nan")
-        train_idsi_summary = epoch_idsi_metrics.summary()
-        train_token_summary = epoch_token_stats.summary("train")
-        train_idsi = float(train_idsi_summary["IDSI"])
-        train_gradient_norm = (
-            epoch_gradient_norm / epoch_gradient_norm_count
-            if epoch_gradient_norm_count > 0
-            else float("nan")
+        train_acc = epoch_correct / max(1, epoch_count)
+        avg = {key: value / num_batches for key, value in epoch_totals.items()}
+        eval_model = ema.ema_model if ema is not None else model
+        val = evaluate_loader(
+            eval_model,
+            val_loader,
+            device,
+            lambdas=lambdas,
+            gamma=float(args.maol_gamma),
+            eta=float(args.maol_eta),
+            class_weights=class_weights,
+            amp_dtype=amp_dtype,
         )
-
-        if val_loader is not None and y_val is not None and len(val_paths) > 0:
-            eval_model = ema.ema_model if ema is not None else model
-            eval_model.eval()
-            eval_forward_callable: Callable[[torch.Tensor], Any] | None = None
-            if eval_model is model and compiled_forward_model is not None:
-                eval_forward_callable = compiled_forward_model
+        val_acc = val["acc"]
+        val_loss = val["loss_total"]
+        previous_best_acc = best_val_acc
+        if not np.isnan(val_acc):
+            best_val_acc = max(best_val_acc, val_acc)
+        improved = (
+            val_loss < (best_val_loss - float(args.min_delta))
+            if args.early_stop_metric == "val_loss"
+            else val_acc > (previous_best_acc + float(args.min_delta))
+        )
+        if improved:
+            if args.early_stop_metric == "val_loss":
+                best_val_loss = val_loss
             else:
-                eval_forward_callable = _select_forward_callable(
-                    cast(TorchCNN, eval_model),
-                    omega_enabled=omega_enabled,
-                    idsi_enabled=idsi_enabled,
-                    token_metrics_enabled=token_metrics_enabled,
-                )
-            val_metrics = evaluate_loader(
-                eval_model,
-                val_loader,
-                num_classes,
-                device,
-                forward_callable=eval_forward_callable,
-                use_channels_last=use_channels_last,
-                amp_dtype=amp_dtype,
-                use_focal_loss=base_use_focal_loss,
-                focal_gamma=focal_gamma,
-                ce_class_weights=ce_class_weights,
-                focal_alpha_weights=focal_alpha_weights,
-                omega_enabled=omega_enabled,
-                omega_lambda=omega_lambda,
-                idsi_lambda=idsi_lambda if idsi_enabled else 0.0,
-                idsi_layer_names=model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else None,
-                idsi_loss_layer_names=idsi_loss_layer_names,
+                best_val_acc = val_acc
+            best_epoch = epoch + 1
+            bad_epochs = 0
+            checkpoint_model = eval_model
+            checkpoint_model.save_weights(
+                Path(args.checkpoint),
+                metadata=_checkpoint_metadata(model, stats, args, is_ema=ema is not None, best_epoch=best_epoch),
             )
-            val_loss = val_metrics["loss_total"]
-            val_acc = val_metrics["acc"]
-
-            improved = (val_loss < (best_val_loss - args.min_delta)) if args.early_stop_metric == "val_loss" else (val_acc > (best_val_acc + args.min_delta))
-            if improved:
-                if args.early_stop_metric == "val_loss":
-                    best_val_loss = val_loss
-                else:
-                    best_val_acc = val_acc
-                best_epoch = epoch + 1
-                checkpoint_model = ema.ema_model if ema is not None else model
-                checkpoint_metadata["is_ema"] = bool(ema is not None)
-                checkpoint_metadata["ema_decay"] = float(ema_decay) if ema is not None else None
-                checkpoint_model.save_weights(args.checkpoint, metadata=checkpoint_metadata)
-                best_saved = True
-                bad_epochs = 0
-            else:
-                bad_epochs += 1
+        else:
+            bad_epochs += 1
             if args.early_stop_metric != "val_loss":
                 best_val_loss = min(best_val_loss, val_loss)
             if args.early_stop_metric != "val_acc":
                 best_val_acc = max(best_val_acc, val_acc)
 
-            if epoch_backbone_frozen:
-                if val_acc > (phase_best_val_acc + args.min_delta):
-                    phase_best_val_acc = val_acc
-                freeze_epochs_remaining -= 1
-                if freeze_epochs_remaining <= 0:
-                    next_phase_start_lr = lr_values[current_phase_index + 1] if current_phase_index + 1 < len(lr_values) else None
-                    phase_lr_offset, deduction_applied = adjust_phase_lr_offset_after_unfreeze(
-                        current_effective_lr=current_lr,
-                        phase_lr_offset=phase_lr_offset,
-                        after_unfreeze_lr_change=after_unfreeze_lr_change,
-                        phase_base_lr=current_phase_base_lr,
-                        min_lr_ratio=args.min_lr_ratio,
-                        next_phase_start_lr=next_phase_start_lr,
-                    )
+        if args.freeze_enabled and val_loader is not None:
+            if backbone_frozen:
+                if val_acc > phase_best_acc + float(args.min_delta):
+                    phase_best_acc = val_acc
+                freeze_remaining -= 1
+                if freeze_remaining <= 0:
                     backbone_frozen = False
-                    phase_plateau_epochs = 0
-                    model.train()
-                    _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
+                    _apply_backbone_freeze_state(model, False, bool(args.freeze_bn_affine))
                     optimizer = _build_optimizer(args, model, lr_value=current_lr)
                     scaler = _make_grad_scaler(device, amp_dtype)
-                    lr_message = "reduced" if deduction_applied else "kept"
-                    print(
-                        f"Backbone unfrozen at epoch {epoch + 1}: cumulative lr offset {lr_message} at {phase_lr_offset:.6f}."
-                    )
             else:
-                if val_acc > (phase_best_val_acc + args.min_delta):
-                    phase_best_val_acc = val_acc
-                    phase_plateau_epochs = 0
+                if val_acc > phase_best_acc + float(args.min_delta):
+                    phase_best_acc = val_acc
+                    plateau_epochs = 0
                 else:
-                    phase_plateau_epochs += 1
-                    if phase_plateau_epochs >= freeze_patience:
+                    plateau_epochs += 1
+                    if plateau_epochs >= int(args.freeze_patience):
                         backbone_frozen = True
-                        freeze_epochs_remaining = freeze_epoch_num
-                        phase_plateau_epochs = 0
-                        model.train()
-                        _apply_backbone_freeze_state(model, backbone_frozen=True, freeze_bn_affine=args.freeze_bn_affine)
+                        freeze_remaining = int(args.freeze_epoch_num)
+                        plateau_epochs = 0
+                        _apply_backbone_freeze_state(model, True, bool(args.freeze_bn_affine))
                         optimizer = _build_optimizer(args, model, lr_value=current_lr)
                         scaler = _make_grad_scaler(device, amp_dtype)
-                        print(
-                            f"Backbone frozen at epoch {epoch + 1}: val_acc plateaued for {freeze_patience} epochs; "
-                            f"training the head for {freeze_epoch_num} epochs."
-                        )
 
-            gap = train_acc - val_acc
-            marker = " *" if improved else ""
-            mode_text = "head-only" if epoch_backbone_frozen else "full"
-            print(
-                f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
-                f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}  "
-                f"val_loss={val_loss:.4f}  val_acc={val_acc:.3f}  gap={gap:.3f}{marker}"
-            )
-            final_epoch_metrics = {
-                "epoch": epoch + 1,
-                "phase": current_phase_index + 1,
-                "mode": mode_text,
-                "lr": float(current_lr),
-                "train_loss_total": float(avg_loss),
-                "train_loss_ce": float(avg_ce_loss),
-                "train_loss_attr": float(avg_attr_loss),
-                "train_loss_idsi": float(avg_idsi_loss),
-                "train_acc": float(train_acc),
-                "val_loss_total": float(val_metrics["loss_total"]),
-                "val_loss_ce": float(val_metrics["loss_ce"]),
-                "val_loss_attr": float(val_metrics["loss_attr"]),
-                "val_loss_idsi": float(val_metrics["loss_idsi"]),
-                "val_acc": float(val_acc),
-                "generalization_gap": float(gap),
-                "train_h_var_mean": float(train_h_var_mean),
-                "train_h_var_min": float(train_h_var_min),
-                "train_h_var_max": float(train_h_var_max),
-                "val_h_var_mean": float(val_metrics["val_h_var_mean"]),
-                "val_h_var_min": float(val_metrics["val_h_var_min"]),
-                "val_h_var_max": float(val_metrics["val_h_var_max"]),
-                "val_token_variance": float(val_metrics["val_token_variance"]),
-                "val_inter_token_variance": float(val_metrics["val_inter_token_variance"]),
-                "val_token_norm_mean": float(val_metrics["val_token_norm_mean"]),
-                "val_token_norm_min": float(val_metrics["val_token_norm_min"]),
-                "val_token_norm_max": float(val_metrics["val_token_norm_max"]),
-                "val_token_pairwise_cosine_similarity": float(
-                    val_metrics["val_token_pairwise_cosine_similarity"]
-                ),
-                "val_token_pairwise_cosine_distance": float(
-                    val_metrics["val_token_pairwise_cosine_distance"]
-                ),
-                "val_token_collapse_score": float(val_metrics["val_token_collapse_score"]),
-                "IDSI": float(train_idsi),
-                "gradient_norm": float(train_gradient_norm),
-                "improved": bool(improved),
-            }
-            final_epoch_metrics.update(train_idsi_summary)
-            final_epoch_metrics.update(train_token_summary)
-            if omega_enabled:
-                collapse_low_variance_epochs = (
-                    collapse_low_variance_epochs + 1
-                    if train_h_var_mean < OMEGA_COLLAPSE_VARIANCE_THRESHOLD
-                    else 0
-                )
-                final_epoch_metrics["representation_collapse_warning"] = bool(
-                    collapse_low_variance_epochs >= OMEGA_COLLAPSE_EPOCHS
-                )
-            if token_metrics_enabled:
-                final_epoch_metrics["token_collapse_warning"] = bool(
-                    train_token_summary["train_token_collapse_score"] >= 0.5
-                )
-            if tracking_enabled:
-                _record_epoch_metrics(
-                    metrics_path=experiment_metrics_path,
-                    metric_rows=metric_rows,
-                    metric_plotter=metric_plotter,
-                    payload=final_epoch_metrics,
-                )
-            if args.early_stop and bad_epochs >= args.patience:
-                print(f"Early stopping at epoch {epoch + 1}: metric {args.early_stop_metric} did not improve by {args.min_delta} for {args.patience} epochs.")
-                break
-        else:
-            if epoch_backbone_frozen:
-                freeze_epochs_remaining -= 1
-                if freeze_epochs_remaining <= 0:
-                    next_phase_start_lr = lr_values[current_phase_index + 1] if current_phase_index + 1 < len(lr_values) else None
-                    phase_lr_offset, _ = adjust_phase_lr_offset_after_unfreeze(
-                        current_effective_lr=current_lr,
-                        phase_lr_offset=phase_lr_offset,
-                        after_unfreeze_lr_change=after_unfreeze_lr_change,
-                        phase_base_lr=current_phase_base_lr,
-                        min_lr_ratio=args.min_lr_ratio,
-                        next_phase_start_lr=next_phase_start_lr,
-                    )
-                    backbone_frozen = False
-                    phase_plateau_epochs = 0
-                    model.train()
-                    _apply_backbone_freeze_state(model, backbone_frozen=False, freeze_bn_affine=args.freeze_bn_affine)
-                    optimizer = _build_optimizer(args, model, lr_value=current_lr)
-                    scaler = _make_grad_scaler(device, amp_dtype)
-            mode_text = "head-only" if epoch_backbone_frozen else "full"
-            print(
-                f"Epoch {epoch + 1}/{args.epochs}  phase={current_phase_index + 1}/{args.phase_count}  "
-                f"mode={mode_text}  lr={current_lr:.6f}  train_loss={avg_loss:.4f}  train_acc={train_acc:.3f}"
-            )
-            final_epoch_metrics = {
-                "epoch": epoch + 1,
-                "phase": current_phase_index + 1,
-                "mode": mode_text,
-                "lr": float(current_lr),
-                "train_loss_total": float(avg_loss),
-                "train_loss_ce": float(avg_ce_loss),
-                "train_loss_attr": float(avg_attr_loss),
-                "train_loss_idsi": float(avg_idsi_loss),
-                "train_acc": float(train_acc),
-                "val_loss_total": float("nan"),
-                "val_loss_ce": float("nan"),
-                "val_loss_attr": float("nan"),
-                "val_loss_idsi": float("nan"),
-                "val_acc": float("nan"),
-                "generalization_gap": float("nan"),
-                "train_h_var_mean": float(train_h_var_mean),
-                "train_h_var_min": float(train_h_var_min),
-                "train_h_var_max": float(train_h_var_max),
-                "val_h_var_mean": float("nan"),
-                "val_h_var_min": float("nan"),
-                "val_h_var_max": float("nan"),
-                "val_token_variance": float("nan"),
-                "val_inter_token_variance": float("nan"),
-                "val_token_norm_mean": float("nan"),
-                "val_token_norm_min": float("nan"),
-                "val_token_norm_max": float("nan"),
-                "val_token_pairwise_cosine_similarity": float("nan"),
-                "val_token_pairwise_cosine_distance": float("nan"),
-                "val_token_collapse_score": float("nan"),
-                "IDSI": float(train_idsi),
-                "gradient_norm": float(train_gradient_norm),
-                "improved": False,
-            }
-            final_epoch_metrics.update(train_idsi_summary)
-            final_epoch_metrics.update(train_token_summary)
-            if omega_enabled:
-                collapse_low_variance_epochs = (
-                    collapse_low_variance_epochs + 1
-                    if train_h_var_mean < OMEGA_COLLAPSE_VARIANCE_THRESHOLD
-                    else 0
-                )
-                final_epoch_metrics["representation_collapse_warning"] = bool(
-                    collapse_low_variance_epochs >= OMEGA_COLLAPSE_EPOCHS
-                )
-            if token_metrics_enabled:
-                final_epoch_metrics["token_collapse_warning"] = bool(
-                    train_token_summary["train_token_collapse_score"] >= 0.5
-                )
-            if tracking_enabled:
-                _record_epoch_metrics(
-                    metrics_path=experiment_metrics_path,
-                    metric_rows=metric_rows,
-                    metric_plotter=metric_plotter,
-                    payload=final_epoch_metrics,
-                )
-
-    if val_loader is None or y_val is None or len(val_paths) == 0:
-        checkpoint_model = ema.ema_model if ema is not None else model
-        checkpoint_metadata["is_ema"] = bool(ema is not None)
-        checkpoint_metadata["ema_decay"] = float(ema_decay) if ema is not None else None
-        checkpoint_model.save_weights(args.checkpoint, metadata=checkpoint_metadata)
-        best_saved = True
-    if best_saved:
-        print(f"Saved checkpoint: {args.checkpoint}")
-
-    if tracking_enabled and experiment_summary_path is not None:
-        representation_collapse_warning = bool(
-            final_epoch_metrics is not None
-            and final_epoch_metrics.get("representation_collapse_warning", False)
+        gap = train_acc - val_acc
+        final_metrics = {
+            "epoch": epoch + 1,
+            "phase": current_phase + 1,
+            "lr": float(current_lr),
+            "train_loss_total": float(avg["total"]),
+            "train_loss_ce": float(avg["ce"]),
+            "train_loss_intra": float(avg["intra"]),
+            "train_loss_sep": float(avg["sep"]),
+            "train_loss_nest": float(avg["nest"]),
+            "train_loss_cov": float(avg["cov"]),
+            "train_loss_center": float(avg["center"]),
+            "train_acc": float(train_acc),
+            "val_loss_total": float(val_loss),
+            "val_loss_ce": float(val["loss_ce"]),
+            "val_loss_intra": float(val["loss_intra"]),
+            "val_loss_sep": float(val["loss_sep"]),
+            "val_loss_nest": float(val["loss_nest"]),
+            "val_loss_cov": float(val["loss_cov"]),
+            "val_loss_center": float(val["loss_center"]),
+            "val_acc": float(val_acc),
+            "generalization_gap": float(gap),
+            "gradient_norm": float(grad_norm_total / max(1, grad_norm_count)),
+            "hidden_norm": float(hidden_norm_total / max(1, hidden_norm_count)),
+            "tau": float(model.head.tau.detach().cpu().item()),
+            "d_intra": float(stats.d_intra),
+            "d_inter": float(stats.d_inter),
+            "margin_cap": float(stats.margin_cap),
+            "mean_leaf_radius": float(model.head.radii.mean().detach().cpu().item()),
+            "mean_leaf_center_norm": float(torch.linalg.vector_norm(model.head.centers, dim=-1).mean().item()),
+            "lambda_intra": float(lambdas["intra"]),
+            "lambda_sep": float(lambdas["sep"]),
+            "lambda_nest": float(lambdas["nest"]),
+            "lambda_cov": float(lambdas["cov"]),
+            "lambda_center": float(lambdas["center"]),
+            "improved": bool(improved),
+            "backbone_frozen": bool(backbone_frozen),
+        }
+        metric_rows.append(final_metrics)
+        _append_jsonl(metrics_path, final_metrics)
+        if plotter is not None:
+            plotter.update(metric_rows)
+        print(
+            f"[epoch {epoch + 1}/{args.epochs}] lr={current_lr:.6f} "
+            f"train_loss={avg['total']:.4f} train_acc={train_acc:.3f} "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} gap={gap:.3f}"
+            + (" *" if improved else "")
         )
-        _write_json(
-            experiment_summary_path,
-            {
-                "run_dir": str(experiment_run_dir) if experiment_run_dir is not None else None,
-                "checkpoint_path": str(Path(args.checkpoint).resolve()),
-                "best_epoch": int(best_epoch),
-                "best_val_loss": float(best_val_loss),
-                "best_val_acc": float(best_val_acc),
-                "final_epoch_metrics": final_epoch_metrics or {},
-                "representation_collapse_warning": representation_collapse_warning,
-                "collapse_variance_threshold": float(OMEGA_COLLAPSE_VARIANCE_THRESHOLD),
-                "collapse_consecutive_epochs": int(OMEGA_COLLAPSE_EPOCHS),
-                "omega_lambda": float(omega_lambda),
-                "idsi_lambda": float(idsi_lambda),
-                "idsi_enabled": bool(idsi_enabled),
-                "idsi_layer_names": list(model.idsi_layer_names if (idsi_enabled or token_metrics_enabled) else ()),
-                "idsi_loss_layer_names": list(idsi_loss_layer_names or ()),
-                "omega_projector_depth": int(omega_projector_depth),
-                "omega_hidden_dim": int(omega_hidden_dim),
-                "tokenize": bool(model.tokenize),
-                "token_dim": int(model.token_dim),
-                "transformer_depth": int(model.transformer_depth),
-                "attention_heads": int(model.attention_heads),
-                "transformer_mlp_ratio": float(model.transformer_mlp_ratio),
-                "token_pool": model.token_pool,
-                "token_positional_encoding": model.token_positional_encoding,
-                "token_dropout": float(model.token_dropout_p),
-                "transformer_layernorm": model.transformer_layernorm,
-                "token_diversity_monitor": bool(token_metrics_enabled),
-                "contraction_is_empirical": True,
-                "plot_requested": bool(plot_requested),
-                "plot_mode": "real_time" if args.plot_real_time else ("once" if args.plot_once else "none"),
-            },
+        if args.early_stop and bad_epochs >= int(args.patience):
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+    if val_loader is None or len(cast(Sized, val_loader.dataset)) == 0:
+        model.save_weights(
+            Path(args.checkpoint),
+            metadata=_checkpoint_metadata(model, stats, args, is_ema=False, best_epoch=best_epoch),
         )
-        print(f"Saved run artifacts: {experiment_run_dir}")
+
+    summary = {
+        "run_dir": str(run_dir),
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "best_epoch": int(best_epoch),
+        "best_val_acc": float(best_val_acc),
+        "best_val_loss": float(best_val_loss),
+        "final_metrics": final_metrics,
+        "warmup_stats": stats.to_metadata(),
+        "lambdas": lambdas,
+        "class_names": list(model.class_names),
+        "tree": model.tree.to_dict(),
+        "note": "MAOL run; MixUp, CutMix, focal loss and label smoothing are not used.",
+    }
+    _write_json(summary_path, summary)
+    if args.plot_once and metric_rows:
+        plotter = _build_plotter(metrics_path, args)
+        plotter.save(metric_rows)
+        plotter.show(block=True)
+    return summary
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.epochs <= 0:
+        raise SystemExit("--epochs must be > 0")
+    if args.batch_size <= 0:
+        raise SystemExit("--batch-size must be > 0")
+    if args.num_workers < 0:
+        raise SystemExit("--num-workers must be >= 0")
+    if not (0.0 <= args.val_split < 1.0):
+        raise SystemExit("--val-split must satisfy 0 <= value < 1")
+    if args.maol_warmup_epochs < 5:
+        raise SystemExit("--maol-warmup-epochs must be >= 5")
+    if args.maol_probe_steps <= 0:
+        raise SystemExit("--maol-probe-steps must be > 0")
+    if args.maol_probe_only and args.maol_warmup_only:
+        raise SystemExit("--maol-probe-only and --maol-warmup-only are mutually exclusive")
+    if args.gamma <= 0.0:
+        raise SystemExit("--gamma must be > 0")
+    if not (0.0 < args.maol_gamma < 1.0):
+        raise SystemExit("--maol-gamma must satisfy 0 < value < 1")
+    if args.maol_eta < 0.0:
+        raise SystemExit("--maol-eta must be >= 0")
+    if not (0.0 <= args.maol_mq < 1.0):
+        raise SystemExit("--maol-mq must satisfy 0 <= value < 1")
+    if args.maol_nmin < 1:
+        raise SystemExit("--maol-nmin must be >= 1")
+    for name in (
+        "maol_margin_scale",
+        "maol_mbase_scale",
+        "maol_mmax_scale",
+    ):
+        if float(getattr(args, name)) <= 0.0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be > 0")
+    for name in ("maol_lambda_intra", "maol_lambda_sep", "maol_lambda_nest", "maol_lambda_cov", "maol_lambda_center"):
+        if float(getattr(args, name)) < 0.0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be >= 0")
+    if args.phase_count > args.epochs:
+        raise SystemExit("--phase-count cannot be greater than --epochs")
+    try:
+        validate_augmentation_args(args.rotation, args.brightness, args.contrast, args.saturation)
+        validate_ema_decay(args.ema_decay)
+        validate_model_width_scale(args.model_width_scale)
+        validate_freeze_cycle_args(args.freeze_patience, args.freeze_epoch_num, args.after_unfreeze_lr_change)
+        validate_phase_learning_rates(args.lr, args.phase_count)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _verify_dataset_unchanged(data_dir: Path, pre_signature, enabled: bool) -> None:
+    if enabled and pre_signature is not None and tree_signature(data_dir) != pre_signature:
+        raise SystemExit("Dataset changed during run; aborting (read-only enforcement).")
+
+
+def _choose_partition(args: argparse.Namespace) -> int:
+    parts = max(1, int(args.num_partitions))
+    if not args.auto_next_partition:
+        return max(0, min(int(args.partition), parts - 1))
+    state_path = Path(args.partition_state)
+    state = {"num_partitions": parts, "next": 0}
+    try:
+        if state_path.is_file():
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if int(loaded.get("num_partitions", -1)) == parts:
+                state = loaded
+    except Exception:
+        pass
+    part = int(state.get("next", 0)) % parts
+    state["num_partitions"] = parts
+    state["next"] = (part + 1) % parts
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    except OSError:
+        pass
+    return part
+
+
+def _partition_index(path: Path, parts: int) -> int:
+    digest = hashlib.md5(str(path.resolve()).lower().encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % parts
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train a MAOL CNN classifier")
+    parser.add_argument("--data-dir", type=str, default=str(config.DATA_DIR))
+    parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, nargs="+", default=[config.LEARNING_RATE])
+    parser.add_argument("--phase-count", type=int, default=1)
+    parser.add_argument("--warmup-epochs", type=int, default=0, help="LR warm-up epochs inside each phase")
+    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--val-split", type=float, default=0.2)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.05)
+    parser.add_argument("--lr-schedule", choices=["cosine", "step", "constant"], default="cosine")
+    parser.add_argument("--step-size", type=int, default=10)
+    parser.add_argument("--gamma", type=float, default=0.5)
+    parser.add_argument("--early-stop-metric", choices=["val_loss", "val_acc"], default="val_acc")
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--class-weighting", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ema-decay", type=float, default=0.9993)
+    parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--min-delta", type=float, default=1e-6)
+    parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "maol_model.pt"))
+    parser.add_argument("--json-dir", type=str, default="runs")
+    parser.add_argument("--plot-once", action="store_true")
+    parser.add_argument("--plot-real-time", action="store_true")
+    parser.add_argument("--plot-output-format", choices=["png", "jpg", "jpeg"], default="png")
+    parser.add_argument("--plot-output-dir", type=str, default=None)
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rotation", type=float, default=20.0)
+    parser.add_argument("--brightness", type=float, default=0.25)
+    parser.add_argument("--contrast", type=float, default=0.25)
+    parser.add_argument("--saturation", type=float, default=0.25)
+    parser.add_argument("--model-width-scale", type=float, default=1.5)
+    parser.add_argument("--init-from", type=str, default=None)
+    parser.add_argument("--num-partitions", type=int, default=1)
+    parser.add_argument("--partition", type=int, default=0)
+    parser.add_argument("--auto-next-partition", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--partition-state", type=str, default=str(config.CHECKPOINT_DIR / "partition_state.json"))
+    parser.add_argument("--enforce-readonly-dataset", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--amp-mode", choices=["auto", "on", "off"], default="auto")
+
+    parser.add_argument("--maol-warmup-epochs", type=int, default=5)
+    parser.add_argument("--maol-warmup-only", action="store_true")
+    parser.add_argument("--maol-force-warmup", action="store_true")
+    parser.add_argument("--maol-warmup-ckpt", type=str, default=None)
+    parser.add_argument("--maol-probe-only", action="store_true")
+    parser.add_argument("--maol-probe-steps", type=int, default=100)
+    parser.add_argument("--maol-probe-output", type=str, default=None)
+    parser.add_argument("--maol-lambda-intra", type=float, default=1.0)
+    parser.add_argument("--maol-lambda-sep", type=float, default=1.0)
+    parser.add_argument("--maol-lambda-nest", type=float, default=1.0)
+    parser.add_argument("--maol-lambda-cov", type=float, default=1.0)
+    parser.add_argument("--maol-lambda-center", type=float, default=1.0)
+    parser.add_argument("--maol-gamma", type=float, default=0.5)
+    parser.add_argument("--maol-eta", type=float, default=0.1)
+    parser.add_argument("--maol-mq", type=float, default=0.9)
+    parser.add_argument("--maol-nmin", type=int, default=5)
+    parser.add_argument("--maol-margin-scale", type=float, default=1.25)
+    parser.add_argument("--maol-mbase-scale", type=float, default=0.9)
+    parser.add_argument("--maol-mmax-scale", type=float, default=0.8)
+    parser.add_argument("--freeze-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--freeze-patience", type=int, default=8)
+    parser.add_argument("--freeze-epoch-num", type=int, default=10)
+    parser.add_argument("--after-unfreeze-lr-change", type=float, default=1e-4)
+    parser.add_argument(
+        "--freeze-bn-affine",
+        type=parse_bool_flag,
+        nargs="?",
+        const=True,
+        default=True,
+    )
+    args = parser.parse_args()
+    _validate_args(args)
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    device = _resolve_device(args.device)
+    data_dir = Path(args.data_dir).resolve()
+    pre_signature = tree_signature(data_dir) if args.enforce_readonly_dataset else None
+
+    index = discover_nested_dataset(data_dir)
+    train_indices, val_indices = stratified_split(index.labels, float(args.val_split), seed=int(args.seed))
+    train_paths, y_train, val_paths, y_val = split_dataset(index, train_indices, val_indices)
+
+    num_partitions = max(1, int(args.num_partitions))
+    if num_partitions > 1:
+        partition = _choose_partition(args)
+        keep = [_partition_index(path, num_partitions) == partition for path in train_paths]
+        train_paths = [path for path, flag in zip(train_paths, keep) if flag]
+        y_train = y_train[np.asarray(keep, dtype=bool)]
+        if not train_paths:
+            raise SystemExit("Selected partition contains no samples")
+
+    if len(train_paths) == 0:
+        raise SystemExit("No training images found")
+    class_counts = np.bincount(y_train, minlength=index.tree.num_leaves)
+    print(f"Using {len(index.class_names)} classes, {len(train_paths)} train / {len(val_paths)} val")
+    print(f"Class counts: {class_counts.tolist()}")
+    print(index.tree.describe())
+
+    checkpoint_path = Path(args.checkpoint)
+    warmup_ckpt = (
+        Path(args.maol_warmup_ckpt)
+        if args.maol_warmup_ckpt
+        else checkpoint_path.with_name(checkpoint_path.stem + "_warmup.pt")
+    )
+
+    augment_config = (
+        validate_augmentation_args(args.rotation, args.brightness, args.contrast, args.saturation)
+        if args.augment
+        else None
+    )
+    train_dataset = TorchImageDataset(train_paths, y_train, config.INPUT_SIZE, augment_config=augment_config)
+    clean_train_dataset = TorchImageDataset(train_paths, y_train, config.INPUT_SIZE, augment_config=None)
+    val_dataset = (
+        TorchImageDataset(val_paths, y_val, config.INPUT_SIZE, augment_config=None)
+        if len(val_paths) > 0
+        else None
+    )
+    pin_memory = device.type == "cuda"
+    train_loader = _build_loader(
+        train_dataset,
+        batch_size=int(args.batch_size),
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        pin_memory=pin_memory,
+        seed=int(args.seed),
+    )
+    clean_train_loader = _build_loader(
+        clean_train_dataset,
+        batch_size=int(args.batch_size),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        pin_memory=pin_memory,
+        seed=int(args.seed) + 1,
+    )
+    val_loader = (
+        _build_loader(
+            val_dataset,
+            batch_size=int(args.batch_size),
+            shuffle=False,
+            num_workers=int(args.num_workers),
+            pin_memory=pin_memory,
+            seed=int(args.seed) + 2,
+        )
+        if val_dataset is not None
+        else None
+    )
+
+    class_weights_tensor = None
+    if args.class_weighting:
+        class_weights_tensor = torch.as_tensor(
+            _class_weights(y_train, index.tree.num_leaves), dtype=torch.float32, device=device
+        )
+
+    node_weights = index.tree.node_weights_from_labels(y_train.tolist())
+    model = TorchCNN(
+        input_size=config.INPUT_SIZE,
+        num_classes=index.tree.num_leaves,
+        tree=index.tree,
+        seed=int(args.seed),
+        width_scale=float(args.model_width_scale),
+        embedding_dim=256,
+        node_weights=node_weights,
+    )
+    _move_module_to_device(model, device)
+    print(f"Using stage_channels={model.stage_channels} width_scale={model.width_scale:.3f}")
+    if args.init_from:
+        try:
+            model.load_weights(args.init_from, map_location=device, strict=True)
+            print(f"Initialized from MAOL checkpoint: {args.init_from}")
+        except Exception as exc:
+            print(f"[warn] strict initialization failed ({exc}); loading matching backbone tensors only")
+            state, _ = load_checkpoint_state(args.init_from, map_location=device)
+            current = model.state_dict()
+            filtered = {
+                key: value
+                for key, value in state.items()
+                if key in current and tuple(current[key].shape) == tuple(value.shape)
+            }
+            model.load_state_dict(filtered, strict=False)
+            print(f"Loaded {len(filtered)} matching tensors from {args.init_from}")
+
+    run_tag = "maol-probe" if args.maol_probe_only else ("maol-warmup" if args.maol_warmup_only else "maol")
+    run_dir = Path(args.maol_probe_output) if args.maol_probe_output else _prepare_run_dir(args, run_tag, index)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.maol_probe_only:
+        if not warmup_ckpt.is_file():
+            raise SystemExit(f"Probe requires a warm-up checkpoint: {warmup_ckpt}")
+        model, stats = _load_warmup(warmup_ckpt, index, args=args, device=device)
+        _probe(model, stats, train_loader, args, device, run_dir)
+        _verify_dataset_unchanged(data_dir, pre_signature, bool(args.enforce_readonly_dataset))
+        return
+
+    if warmup_ckpt.is_file() and not args.maol_warmup_only and not args.maol_force_warmup:
+        print(f"Loading warm-up checkpoint: {warmup_ckpt}")
+        model, stats = _load_warmup(warmup_ckpt, index, args=args, device=device)
+    else:
+        print(f"Running MAOL warm-up for {args.maol_warmup_epochs} epochs")
+        stats, warmup_rows = run_warmup(
+            model,
+            train_loader,
+            clean_train_loader,
+            val_loader,
+            args,
+            device,
+            class_weights=class_weights_tensor,
+        )
+        _save_warmup(model, stats, warmup_ckpt, args)
+        _write_json(run_dir / "warmup_stats.json", stats.to_metadata())
+        for row in warmup_rows:
+            _append_jsonl(run_dir / "warmup_metrics.jsonl", row)
+        print(f"Saved warm-up checkpoint: {warmup_ckpt}")
+        if args.maol_warmup_only:
+            _verify_dataset_unchanged(data_dir, pre_signature, bool(args.enforce_readonly_dataset))
+            return
+
+    summary = _run_training(
+        model,
+        stats,
+        train_loader,
+        val_loader,
+        args,
+        device,
+        run_dir,
+        class_weights=class_weights_tensor,
+    )
+    print(f"Run summary: {run_dir / 'summary.json'}")
+    print(f"Best epoch: {summary['best_epoch']}  best_val_acc={summary['best_val_acc']:.4f}")
 
     if args.enforce_readonly_dataset and pre_signature is not None:
-        post_signature = tree_signature(data_dir)
-        if post_signature != pre_signature:
-            raise SystemExit("Dataset changed during run; aborting (read-only enforcement).")
-
-    if plot_requested and experiment_metrics_path is not None:
-        saved_plot_path = _finalize_metric_plot(
-            metric_plotter=metric_plotter,
-            metric_rows=metric_rows,
-            metrics_path=experiment_metrics_path,
-            output_dir=plot_output_dir,
-            output_format=args.plot_output_format,
-        )
-        print(f"Saved metric plot: {saved_plot_path}")
-
-    print("Training finished.")
+        _verify_dataset_unchanged(data_dir, pre_signature, True)
 
 
 if __name__ == "__main__":

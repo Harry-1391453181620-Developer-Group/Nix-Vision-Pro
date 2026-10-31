@@ -8,12 +8,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_TMP_ROOT = ROOT / '.pytest-tmp'
+TEST_TMP_ROOT = ROOT / '.maol_tmp'
 
 
 def _resolve_writable_tmp_root() -> Path:
     candidates = (
         TEST_TMP_ROOT,
+        ROOT / '.pytest-tmp',
         ROOT / 'runs' / '_pytest_tmp',
     )
     for candidate in candidates:
@@ -21,7 +22,8 @@ def _resolve_writable_tmp_root() -> Path:
             candidate.mkdir(parents=True, exist_ok=True)
             probe = candidate / '.write_probe'
             probe.write_text('ok', encoding='utf-8')
-            probe.unlink()
+            # The sandbox may allow writes but deny deletions on workspace
+            # entries.  Keep the tiny probe file; it is ignored by git.
             return candidate
         except OSError:
             continue

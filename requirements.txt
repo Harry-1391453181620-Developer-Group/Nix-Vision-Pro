@@ -1,4 +1,4 @@
-# Core numeric backend retained for the legacy implementation.
+# Numeric arrays used by preprocessing and metric accumulation.
 numpy>=2.0,<3
 
 # Image loading and preprocessing.

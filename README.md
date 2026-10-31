@@ -1,233 +1,252 @@
-# Nix Vision Pro
+# Nix Vision Pro — MAOL
 
-A Python 3.13.2 image classification project with two maintained backends:
-- `backends/torch/` is the default training and inference path.
-- `backends/numpy/` preserves the NumPy implementation for comparison and fallback.
+CNN-only image classification implementing **MAOL (Multi-Attractor Optimized
+Learning)**.  The active theory is `MAOL.docx`; the old MAOIDL Omega/IDSI system,
+the token transformer, and the NumPy backend were removed.
 
-Project history is versioned under `Agent_History/`. Substantive contributions are expected to update the relevant history entries along with code and docs.
+## What MAOL is
 
-The default architecture in both backends is width-scaled in stage 2:
-`[Conv(32), Conv(32), SE, Pool] -> [Conv(round(64*scale)), Conv(round(64*scale)), SE, Pool] -> [Conv(128), Conv(128), SE, Pool] -> Flatten -> FC(256) -> Dropout(0.5) -> FC(num_classes)`.
+Each class is a leaf **well**: a center `c` and radius `r` in the 256-d embedding
+space.  Wells are nested in a tree defined by the dataset directory hierarchy.
+Only leaf centers/radii are learnable; parent centers/radii are derived bottom-up
+from child centers and subtree training counts.
 
-Default width scale is `0.75`, so the default stage-2 width is `48`. When you load a checkpoint, inference now reconstructs `num_classes`, `width_scale`, `stage2_channels`, and `input_size` from checkpoint metadata or legacy weight shapes, so `--model-width-scale` is usually unnecessary for saved checkpoints.
+Classification uses a prototype head, not a linear classifier:
 
-The PyTorch backend also has an optional Phase 2 tokenized dynamics path behind `--tokenize`. It keeps the CNN backbone as the primary feature extractor, reshapes the final CNN feature map into a lightweight spatial token set, applies a shallow residual transformer dynamics block, and classifies from mean-pooled tokens by default. The NumPy backend remains the legacy CNN comparison path.
+```text
+logits_c = -||h - c_c||^2 / tau
+```
 
-## Runtime Baseline
+`h` is the `fc1 + ReLU` representation of the five-stage CNN.  No additional
+module is inserted into the backbone.
 
-- Python: `3.13.2`
-- Virtual environment: `.venv`
-- Default backend: `torch`
-- Legacy backend: `numpy`
-- Active training data source: real image files under `Dataset/` or an explicit `--data-dir`
+The six losses are:
+
+```text
+L_MAOL = L_CE
+       + lambda_1 * L_intra
+       + lambda_2 * L_sep
+       + lambda_3 * L_nest
+       + lambda_4 * L_cov
+       + lambda_5 * L_center
+```
+
+All terms use the effective-count denominators from the updated document:
+`L_CE`/`L_intra` over batch size, `L_sep` over valid sibling pairs, `L_cov`/
+`L_center` over present leaf classes, `L_nest` over non-root nodes.
+
+During warm-up, leaf centers are recomputed at the start of each epoch from the
+current backbone and kept frozen (`requires_grad=False`); only `L_CE` is used.
+For the first 100 warm-up iterations `tau=1.0`; afterwards
+`tau_warm = mean ||h_i - c_yi||^2`.  At the end of warm-up the document's
+statistics (`c_EMA`, `q`, `d_intra`, `d_inter`, confusion weights, margins,
+`tau0 = d_intra^2`) are initialized and the wells are unfrozen.
+
+## Dataset layout
+
+The tree is encoded by directories.  A leaf is a directory containing images and
+no child class directories:
+
+```text
+Dataset/
+  living-matters/
+    animals/
+      cat/
+      dog/
+      ...
+    plants/
+      daisy/
+      ...
+  non-living-matters/
+    artificial/
+      airplane/
+      ...
+    natural/
+      mountain/
+      ...
+```
+
+Leaf directory names are the class labels and must be unique.  A directory may
+not contain both images and nested class directories.
+
+The current dataset has 18 leaf classes and 34,233 images.
+
+## Architecture
+
+- Five stages: `Conv -> BN -> ReLU -> Conv -> BN -> ReLU -> SE -> MaxPool`
+- Width scale over `(32, 64, 128, 256, 256)`; default `1.5`
+- `h = ReLU(fc1(flatten(features)))`, 256-d
+- `PrototypeHead` with 18 leaf wells (current dataset)
+- Input `224 x 224`, total stride `/32`
+- No transformer, no Omega projector, no IDSI projections, no linear classifier
 
 ## Install
 
 ```powershell
-python -m venv --system-site-packages .venv
-.\.venv\Scripts\Activate.ps1
+python -m venv --system-site-packages venv313
+.\venv313\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
 
-The current dependency set covers the whole project:
-- `torch`
-- `numpy`
-- `pillow`
-- `opencv-python`
-- `matplotlib`
-- `pytest`
+Python 3.13 is the tested runtime.  Training was validated on the DGX Spark via
+Syncthing and locally on CPU for smoke tests.
 
-## Main Entry Points
+## Training workflow
 
-- `train.py` - backend-dispatching training entrypoint
-- `predict.py` - backend-dispatching inference entrypoint
-- `gui.py` - backend-dispatching GUI entrypoint
-- `model.py` - compatibility facade exposing the default model class
+### 1. Warm-up only
 
-## Dataset Contract
-
-Training and inference read labeled image files from `Dataset/<class_name>/...` by default.
-The runtime class list is detected from the active dataset layout, and checkpoint-backed inference prefers checkpoint metadata when it matches the saved model.
-This repository no longer includes built-in synthetic or Wikimedia dataset builders because they were stale with the active real-image runtime path.
-
-## Training Policy Highlights
-
-- `--augment` now applies a shared RandAugment-style policy in `utils/training.py` for both backends.
-- Each training image samples two ops from the shared pool: `rotate`, `brightness`, `contrast`, `saturation`, `sharpness`, `posterize`, `solarize`, `autocontrast`, `equalize`, `invert`, and `cutout`.
-- `--rotation`, `--brightness`, `--contrast`, and `--saturation` still control the user-facing strength limits.
-- Batch mixing is now a single gate: `--mixup-prob 0.4` decides whether to mix, then `--cutmix-ratio 0.5` decides between CutMix and MixUp for that batch.
-- Validation is always clean: no RandAugment, no MixUp, and no CutMix.
-- Mixed batches force label smoothing to `0` for that batch and only use cross entropy. Non-mixed batches can still use focal loss.
-- `--ema` is enabled by default with `--ema-decay 0.999`.
-- EMA updates run immediately after `optimizer.step()`, evaluate the EMA weights for validation, and save best checkpoints from EMA weights.
-- EMA tracks the full model state, including BN buffers, so validation does not drift from stale running statistics.
-- The torch trainer now uses `DataLoader`, worker seeding, contiguous tensor collation, `pin_memory` on CUDA, and non-blocking transfer for both inputs and labels.
-- Torch MixUp and CutMix now run on device tensors after transfer instead of round-tripping through NumPy on the CPU path.
-- Torch training enables `channels_last`, `torch.backends.cudnn.benchmark`, and AMP automatically on supported CUDA runs.
-- `--compile-mode auto` benchmarks eager vs compiled train steps after warmup and keeps `torch.compile` only when it actually improves median step time.
-- Phase 1 Omega-loss is available in the torch trainer with `--omega-loss`; it adds a shallow projector on the existing 256-d penultimate representation and logs CE, attractor loss, and representation-variance diagnostics.
-- Phase 1.2 Layer-IDSI is enabled for Omega runs by default with `--idsi-lambda 0.005`. It adds a numerically small layer-wise stability loss on matched feature spaces for `stage1`, `stage2`, `stage3`, and `classifier_pre_head`.
-- Phase 2 tokenized dynamics is available in the torch trainer with `--tokenize`. New controls include `--token-dim`, `--transformer-depth`, `--attention-heads`, `--transformer-mlp-ratio`, `--token-pool {mean,cls}`, `--token-positional-encoding {none,learned,sinusoidal}`, `--token-dropout`, `--transformer-layernorm {pre,post}`, `--token-omega-loss`, `--token-idsi`, and `--token-diversity-monitor`.
-- In token mode, Layer-IDSI monitors `stage1`, `stage2`, `stage3`, `token_projection`, and `transformer_token_block`. It does not monitor attention heads or transformer sublayers separately.
-- Token metrics include token variance, inter-token variance, token norm statistics, mean pairwise cosine similarity/distance, and token collapse warnings.
-- Training run artifacts are written directly under `runs/<timestamp>-.../`.
-- Run metrics log `IDSI`, `IDSI mean`, `IDSI max`, and `IDSI std` from the per-sample relative fluctuation distribution, scaled by `100` for readability. Layer-wise arrays are logged under `layer_IDSI*` keys with stable `layer_IDSI_names`.
-- Run metrics also log `gradient_norm` from the existing backward pass before clipping and `hidden_norm` as the mean L2 norm over monitored feature tensors.
-- Train-side representation variance metrics are named `train_h_var_max`, `train_h_var_mean`, and `train_h_var_min` in JSONL files and plots.
-- `train.py` can show and save metric plots with `--plot-once` after training or `--plot-real-time` during training.
-- New checkpoints are structured as `model + meta`, while legacy raw checkpoints still load.
-- Multiphase LR, warmup, cosine restarts, and temporary backbone freeze remain supported in both training backends.
-
-## Training
-
-Recommended PyTorch training command:
+Warm-up must be at least 5 epochs:
 
 ```powershell
-$args = @(
-"--backend", "torch",
-
-"--data-dir", "Dataset",
-"--device", "cuda",
-"--num-workers", "4",
-"--streaming",
-"--seed", "42",
-"--class-count", "13",
-
-"--amp-mode", "auto",
-"--compile-mode", "auto",
-
-"--epochs", "120",
-"--phase-count", "1", 
-"--batch-size", "128",
-
-"--optimizer", "adamw",
-"--lr", "0.00045",
-"--lr-schedule", "cosine",
-"--min-lr-ratio", "0.005",
-"--warmup-epochs", "5",
-"--weight-decay", "4e-4",
-"--grad-clip", "5.0",
-
-"--dropout", "0.30",
-"--label-smoothing", "0.04",
-"--no-focal-loss",
-
-"--augment",
-"--rotation", "20",
-"--brightness", "0.25",
-"--contrast", "0.25",
-"--saturation", "0.25",
-
-"--mixup",
-"--mixup-alpha", "0.3",
-"--mixup-prob", "0",
-"--cutmix-ratio", "0.2",
-
-"--model-width-scale", "1.5",
-
-"--freeze-bn-affine", "false",
-"--freeze-patience", "1000",
-"--freeze-epoch-num", "1",
-
-"--ema",
-"--ema-decay", "0.9993",
-
-"--early-stop",
-"--early-stop-metric", "val_acc",
-"--patience", "50",
-"--min-delta", "0.000001",
-
-"--checkpoint", "checkpoints/best_torch_model.pt",
-
-"--no-focal-loss",
-
-"--omega-loss",   （
-"--omega-lambda", "0.35",
-"--omega-projector-depth", "1",
-"--omega-hidden-dim", "256",
-
-"--idsi-lambda", "0.25",
-
-"--tokenize",
-"--token-dim", "128",
-"--transformer-depth", "1",
-"--attention-heads", "4",
-"--transformer-mlp-ratio", "2.0",
-"--token-pool", "mean",
-"--token-positional-encoding", "learned",
-"--token-dropout", "0.10",
-"--transformer-layernorm", "pre",
-"--token-omega-loss",
-"--token-idsi",
-"--token-diversity-monitor",
-
-"--json-dir", "runs",
-"--plot-real-time",
-"--plot-output-format", "png"
-
-"--enforce-readonly-dataset"
-
-"--num-partitions", "1",
-"--partition", "0"
-
-)
-
-python.exe train.py @args
+python train.py `
+  --data-dir Dataset `
+  --device cuda `
+  --epochs 1 `
+  --batch-size 128 `
+  --model-width-scale 1.5 `
+  --maol-warmup-epochs 5 `
+  --maol-warmup-only `
+  --checkpoint checkpoints/maol_model.pt `
+  --maol-warmup-ckpt checkpoints/maol_warmup.pt `
+  --json-dir runs
 ```
 
-Legacy NumPy training remains available:
+This writes `checkpoints/maol_warmup.pt` (backbone + wells + statistics +
+margins) and a run directory under `runs/`.
+
+### 2. Scale probe
+
+The probe starts from the warm-up checkpoint, runs exactly 100 optimizer steps
+with all lambdas at `1.0`, records the six loss means and gradient norms, and
+writes JSON only.  It does not save model weights.
 
 ```powershell
-python.exe train.py --backend numpy --data-dir Dataset --epochs 100 --phase-count 2 --lr 0.002 0.0005 --warmup-epochs 3 --batch-size 32 --streaming --optimizer adamw --weight-decay 1e-5 --dropout 0.3 --label-smoothing 0.05 --class-weighting --focal-loss --focal-gamma 1.5 --focal-alpha auto --augment --rotation 12 --brightness 0.2 --contrast 0.2 --saturation 0.2 --model-width-scale 0.75 --lr-schedule cosine --min-lr-ratio 0.2 --grad-clip 5.0 --early-stop --early-stop-metric val_acc --patience 15 --min-delta 0.001 --freeze-bn-affine false --freeze-patience 8 --freeze-epoch-num 10 --after-unfreeze-lr-change 0.0001 --mixup --mixup-alpha 0.2 --mixup-prob 0.4 --cutmix-ratio 0.5 --ema --ema-decay 0.999 --checkpoint checkpoints/best_numpy_model.npz
+python train.py `
+  --data-dir Dataset `
+  --device cuda `
+  --maol-probe-only `
+  --maol-probe-steps 100 `
+  --maol-warmup-ckpt checkpoints/maol_warmup.pt `
+  --checkpoint checkpoints/maol_model.pt `
+  --json-dir runs
 ```
 
-## Experiment Plotting
+Outputs:
 
-Runs write per-epoch metrics to `runs/<timestamp>-.../epoch_metrics.jsonl`.
-To show a plot after training finishes and save an image beside the JSONL file:
+- `probe_metrics.jsonl`: one row per step with `loss`, `grad_h`,
+  `total_grad_norm`
+- `probe_summary.json`: means and a note that no model was saved
+
+`grad_h` records each term's gradient norm w.r.t. the shared embedding `h`.
+`L_nest`, `L_cov`, and `L_center` do not depend on `h`, so their `grad_h` is
+`0`; their scale is visible through `loss`.
+
+Lambda guidance from the theory/probe plan:
+
+- If a term's `grad_h` is more than 10x `CE`, lower its lambda to `0.1` or
+  `0.01`.
+- If a term's `grad_h` is more than 100x smaller than `CE`, raise its lambda to
+  `2-5`.
+- Target: all six terms within roughly one order of magnitude.
+- `L_sep` is noisy early because batch means are noisy; starting at `0.1` is
+  reasonable.
+- `L_cov` and `L_center` are stability terms; keep them in `0.1-1.0`.
+
+### 3. Full MAOL training
 
 ```powershell
-.\.venv\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-once
+python train.py `
+  --data-dir Dataset `
+  --device cuda `
+  --epochs 120 `
+  --batch-size 128 `
+  --model-width-scale 1.5 `
+  --maol-warmup-ckpt checkpoints/maol_warmup.pt `
+  --maol-lambda-intra 0.1 `
+  --maol-lambda-sep 0.1 `
+  --maol-lambda-nest 1.0 `
+  --maol-lambda-cov 0.5 `
+  --maol-lambda-center 0.5 `
+  --checkpoint checkpoints/maol_model.pt `
+  --json-dir runs `
+  --plot-real-time
 ```
 
-To open the plot window at training start, refresh it after each epoch, and save the final image:
-
-```powershell
-.\.venv\Scripts\python.exe train.py --backend torch --omega-loss --omega-lambda 0.05 --idsi-lambda 0.005 --plot-real-time
-```
-
-Plot-related options are `--json-dir`, `--plot-output-format {png,jpg,jpeg}`, and `--plot-output-dir`.
-The plotter keeps all metrics in one matplotlib window, includes global and layer-wise IDSI panels, and adapts dynamically to however many monitored layers are present in the JSONL rows.
-Phase 2 token metrics are optional scalar panels, so older Phase 1/1.2 JSONL files remain readable.
-`plot.py` is a helper module used by `train.py`; it is not a standalone command.
-
-## Checkpoints
-
-- New checkpoints save a structured payload with the model weights under `model` plus metadata under `meta`.
-- The metadata includes `checkpoint_version`, `backend`, `num_classes`, `width_scale`, `stage2_channels`, `input_size`, `class_names`, and whether the saved weights are EMA weights.
-- Torch checkpoints may also include Phase 1 Omega metadata: `omega_enabled`, `omega_projector_depth`, and `omega_hidden_dim`; inference reconstructs this branch when present but still predicts from logits only.
-- Torch checkpoints may also include Phase 2 token metadata such as `tokenize`, `token_dim`, transformer settings, token pooling, and positional encoding. Inference reconstructs the token path before loading weights when those metadata are present.
-- `load_weights()` still accepts older plain state-dict checkpoints, so older training runs remain usable.
-- Torch and NumPy inference now rebuild the model from checkpoint metadata first and fall back to legacy weight-shape inference when metadata is missing.
-- If you pass `--class-count` or `--model-width-scale` while also loading weights, conflicting overrides now fail clearly instead of silently building the wrong model shape.
-- Load only trusted checkpoints. The PyTorch loader prefers `weights_only=True`, but older interpreter combinations can still fall back to normal `torch.load()` for compatibility.
+If `--maol-warmup-ckpt` exists, full training loads it and skips warm-up.  Use
+`--maol-force-warmup` to regenerate it.  Without the flag, a missing warm-up
+checkpoint is created automatically before full training.
 
 ## Inference
 
 ```powershell
-python.exe predict.py --backend torch Dataset/airplane/0000001.jpg --weights checkpoints/best_torch_model.pt --probabilities --top-k 3 --device cuda
-python.exe predict.py --backend numpy Dataset/airplane/0000001.jpg --weights checkpoints/best_numpy_model.npz --probabilities --top-k 3
+python predict.py Dataset/living-matters/animals/cat/0001.jpg `
+  --weights checkpoints/maol_model.pt --probabilities --top-k 3 --device cuda
 ```
+
+Only MAOL prototype checkpoints are accepted.  Old MAOIDL token/linear
+checkpoints intentionally fail with a clear message; the old architecture is not
+part of this build.
 
 ## GUI
 
 ```powershell
-python.exe gui.py --backend torch --data-dir Dataset
-python.exe gui.py --backend numpy --data-dir Dataset
+python gui.py --checkpoint checkpoints/maol_model.pt
+```
+
+The GUI is a "MAOL field station": open a checkpoint, then open an image or
+camera.  It shows the nearest leaf well, confidence, top-5 probability bars, tree
+size, `tau`, and checkpoint metadata.  It does **not** load old MAOIDL models.
+
+## Metrics and plotting
+
+Each run writes:
+
+```text
+runs/<timestamp>-maol-seed_42/
+  config.json
+  warmup_metrics.jsonl      # when warm-up ran in this directory
+  warmup_stats.json
+  epoch_metrics.jsonl
+  summary.json
+```
+
+Per epoch the trainer logs train/val total, CE, intra, sep, nest, cov, center,
+accuracy, gap, gradient norm, hidden norm, `tau`, `d_intra`, `d_inter`,
+`margin_cap`, mean leaf radius, mean leaf center norm, and the five lambdas.
+
+Plotting is owned by the trainer:
+
+```powershell
+python train.py ... --plot-once
+python train.py ... --plot-real-time
+```
+
+`plot.py` can also be run directly to pick an existing JSONL file.
+
+## Training policy notes
+
+- MixUp, CutMix, focal loss, and label smoothing are removed.
+- RandAugment remains; validation is always clean.
+- EMA is optional and **off by default** for MAOL; if enabled, well statistics
+  (`c_EMA`, `q`, `tau`, margins) are copied exactly rather than blended.
+- Class weighting is optional and **off by default** (standard CE).
+- Temporary backbone freeze is optional and **off by default**.
+- AMP is supported with `--amp-mode {auto,on,off}`.
+- Checkpoints are loaded with `weights_only=True`; load only trusted files.
+
+## Initializing from the old CNN backbone
+
+`--init-from` accepts an old MAOIDL checkpoint and loads only matching backbone
+tensors (the old token/linear head is skipped).  This is useful for starting MAOL
+from the 93.6% pure-CE CNN backbone.
+
+```powershell
+python train.py ... --init-from checkpoints/best_torch_model_with_pure_ce_loss.pt
 ```
 
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -v -p no:cacheprovider
+$env:MPLBACKEND = "Agg"
+.\venv313\Scripts\python.exe -m pytest tests -q -p no:cacheprovider
 ```

@@ -1,4 +1,4 @@
-"""Top-level GUI entrypoint with backend dispatch."""
+"""Top-level MAOL GUI entrypoint."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def _pop_backend_arg(argv: list[str], default: str = "torch") -> tuple[str, list
             continue
         if arg == "--backend":
             if index + 1 >= len(argv):
-                raise SystemExit("--backend requires a value: numpy or torch")
+                raise SystemExit("--backend requires a value (torch)")
             backend = argv[index + 1].strip().lower()
             skip_next = True
             continue
@@ -23,25 +23,16 @@ def _pop_backend_arg(argv: list[str], default: str = "torch") -> tuple[str, list
             backend = arg.split("=", 1)[1].strip().lower()
             continue
         out.append(arg)
-    if backend not in {"numpy", "torch"}:
-        raise SystemExit(f"Unsupported backend: {backend}")
+    if backend != "torch":
+        raise SystemExit(f"Unsupported backend: {backend}. NumPy support was removed; use --backend torch.")
     return backend, out
 
 
 def main() -> None:
-    backend, forwarded_argv = _pop_backend_arg(sys.argv[1:])
-    if any(arg in {"-h", "--help"} for arg in forwarded_argv):
-        print("Global option: --backend {torch,numpy} (default: torch)")
+    _, forwarded_argv = _pop_backend_arg(sys.argv[1:])
     sys.argv = [sys.argv[0], *forwarded_argv]
-    try:
-        if backend == "numpy":
-            from backends.numpy.gui_backend import main as backend_main
-        else:
-            from backends.torch.gui_backend import main as backend_main
-    except Exception as exc:
-        if backend == "torch":
-            raise SystemExit(f"Failed to load the PyTorch backend: {exc}. Use `py -3.13 gui.py` or `--backend numpy`.") from exc
-        raise
+    from backends.torch.gui_backend import main as backend_main
+
     backend_main()
 
 

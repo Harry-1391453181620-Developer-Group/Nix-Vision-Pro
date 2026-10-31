@@ -1,7 +1,8 @@
-"""Helper functions for plotting training epoch metrics.
+"""MAOL training metric plotting.
 
-This module is intentionally not a CLI. Use `train.py --plot-once` or
-`train.py --plot-real-time` so training owns the plotting lifecycle.
+The trainer owns the plotting lifecycle (``--plot-once`` / ``--plot-real-time``).
+This module stays helper-only, but the old standalone picker is retained for
+quick inspection of an existing JSONL file.
 """
 
 from __future__ import annotations
@@ -13,59 +14,35 @@ from typing import Any
 
 
 SCALAR_PLOT_METRICS = [
-    "generalization_gap",
-    "train_h_var_max",
-    "train_h_var_mean",
-    "train_h_var_min",
-    "train_token_variance",
-    "train_inter_token_variance",
-    "train_token_norm_mean",
-    "train_token_norm_min",
-    "train_token_norm_max",
-    "train_token_pairwise_cosine_similarity",
-    "train_token_pairwise_cosine_distance",
-    "train_token_collapse_score",
-    "lr",
-    "train_acc",
-    "train_loss_attr",
-    "train_loss_ce",
     "train_loss_total",
-    "val_acc",
-    "val_h_var_max",
-    "val_h_var_mean",
-    "val_h_var_min",
-    "val_token_variance",
-    "val_inter_token_variance",
-    "val_token_norm_mean",
-    "val_token_norm_min",
-    "val_token_norm_max",
-    "val_token_pairwise_cosine_similarity",
-    "val_token_pairwise_cosine_distance",
-    "val_token_collapse_score",
-    "val_loss_attr",
-    "val_loss_ce",
-    "val_loss_idsi",
+    "train_loss_ce",
+    "train_loss_intra",
+    "train_loss_sep",
+    "train_loss_nest",
+    "train_loss_cov",
+    "train_loss_center",
     "val_loss_total",
-    "train_loss_idsi",
+    "val_loss_ce",
+    "val_loss_intra",
+    "val_loss_sep",
+    "val_loss_nest",
+    "val_loss_cov",
+    "val_loss_center",
+    "train_acc",
+    "val_acc",
+    "generalization_gap",
+    "lr",
     "gradient_norm",
     "hidden_norm",
+    "tau",
+    "d_intra",
+    "d_inter",
+    "margin_cap",
+    "mean_leaf_radius",
+    "mean_leaf_center_norm",
 ]
 
-GLOBAL_IDSI_METRICS = [
-    "IDSI",
-    "IDSI mean",
-    "IDSI max",
-    "IDSI std",
-]
-
-LAYER_IDSI_METRICS = [
-    "layer_IDSI",
-    "layer_IDSI_mean",
-    "layer_IDSI_max",
-    "layer_IDSI_std",
-]
-
-PLOT_METRICS = SCALAR_PLOT_METRICS + GLOBAL_IDSI_METRICS + LAYER_IDSI_METRICS
+PLOT_METRICS = list(SCALAR_PLOT_METRICS)
 PLOT_OUTPUT_FORMATS = {"png", "jpg", "jpeg"}
 
 
@@ -100,7 +77,7 @@ def resolve_plot_output_path(
 
 
 class EpochMetricsPlotter:
-    def __init__(self, *, metrics_path: Path, output_path: Path, title: str = "Experiment Metrics") -> None:
+    def __init__(self, *, metrics_path: Path, output_path: Path, title: str = "MAOL Experiment Metrics") -> None:
         import matplotlib.pyplot as plt
 
         self.metrics_path = Path(metrics_path)
@@ -108,12 +85,10 @@ class EpochMetricsPlotter:
         self.title = title
         self._plt = plt
         self._interactive = "agg" not in plt.get_backend().lower()
-        self._figure = plt.figure(num="Experiment Metrics")
+        self._figure = plt.figure(num="MAOL Experiment Metrics")
         self._axes: dict[str, Any] = {}
         self._lines: dict[tuple[str, str], Any] = {}
-        self._layer_colors: dict[str, Any] = {}
-        self._legend_line_counts: dict[str, int] = {}
-        self._panel_specs = self._build_panel_specs()
+        self._panel_specs = [(f"scalar:{name}", name, [name]) for name in SCALAR_PLOT_METRICS]
         self._create_axes()
         if self._interactive:
             plt.ion()
@@ -146,13 +121,13 @@ class EpochMetricsPlotter:
         from matplotlib.ticker import MaxNLocator
 
         epochs = [_as_float(row.get("epoch", index + 1)) for index, row in enumerate(rows)]
-
         for panel_id, title, metric_names in self._panel_specs:
             axis = self._axes[panel_id]
-            if panel_id.startswith("layer:"):
-                self._draw_layer_panel(axis, panel_id, title, metric_names[0], rows, epochs)
-            else:
-                self._draw_scalar_panel(axis, panel_id, title, metric_names, rows, epochs)
+            axis.set_title(title)
+            for metric_name in metric_names:
+                values = [_as_float(row.get(metric_name)) for row in rows]
+                line = self._get_line(axis, panel_id, metric_name, label=metric_name)
+                line.set_data(epochs, values)
             axis.grid(True, alpha=0.3)
             axis.set_xlabel("epoch")
             axis.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True, min_n_ticks=3))
@@ -170,30 +145,16 @@ class EpochMetricsPlotter:
         self._figure.subplots_adjust(
             left=0.04,
             right=0.98,
-            bottom=0.04,
-            top=0.94,
+            bottom=0.05,
+            top=0.95,
             wspace=0.35,
-            hspace=0.65,
+            hspace=0.75,
         )
-
-    def _build_panel_specs(self) -> list[tuple[str, str, list[str]]]:
-        specs = [(f"scalar:{metric_name}", metric_name, [metric_name]) for metric_name in SCALAR_PLOT_METRICS]
-        specs.append(("global_idsi", "Global IDSI metrics", list(GLOBAL_IDSI_METRICS)))
-        specs.extend((f"layer:{metric_name}", metric_name, [metric_name]) for metric_name in LAYER_IDSI_METRICS)
-        return specs
 
     def _create_axes(self) -> None:
         cols = 5
         row_count = math.ceil(len(self._panel_specs) / cols)
-
-        # Give every subplot enough vertical space. The number of metrics can
-        # grow over time, so the figure height is derived from row_count.
-        self._figure.set_size_inches(
-            cols * 4.2,
-            row_count * 3.2,
-            forward=True,
-        )
-
+        self._figure.set_size_inches(cols * 4.0, row_count * 3.0, forward=True)
         axes = self._figure.subplots(row_count, cols, squeeze=False).ravel()
         for index, (panel_id, title, _) in enumerate(self._panel_specs):
             axis = axes[index]
@@ -202,55 +163,6 @@ class EpochMetricsPlotter:
         for axis in axes[len(self._panel_specs) :]:
             axis.set_visible(False)
 
-    def _draw_scalar_panel(
-        self,
-        axis: Any,
-        panel_id: str,
-        title: str,
-        metric_names: list[str],
-        rows: list[dict[str, Any]],
-        epochs: list[float],
-    ) -> None:
-        axis.set_title(title)
-        for metric_name in metric_names:
-            values = [_as_float(row.get(metric_name)) for row in rows]
-            line = self._get_line(axis, panel_id, metric_name, label=metric_name)
-            line.set_data(epochs, values)
-        if len(metric_names) > 1:
-            self._refresh_legend(axis, panel_id)
-
-    def _draw_layer_panel(
-        self,
-        axis: Any,
-        panel_id: str,
-        title: str,
-        metric_name: str,
-        rows: list[dict[str, Any]],
-        epochs: list[float],
-    ) -> None:
-        axis.set_title(title)
-        layer_names = self._resolve_layer_names(rows, metric_name)
-        active_keys: set[tuple[str, str]] = set()
-        for layer_index, layer_name in enumerate(layer_names):
-            values = [_as_layer_float(row.get(metric_name), layer_index) for row in rows]
-            line_key = (panel_id, layer_name)
-            active_keys.add(line_key)
-            line = self._get_line(
-                axis,
-                panel_id,
-                layer_name,
-                label=layer_name,
-                color=self._resolve_layer_color(layer_name, layer_index),
-            )
-            line.set_data(epochs, values)
-            line.set_visible(True)
-        for line_key, line in self._lines.items():
-            if line_key[0] == panel_id and line_key not in active_keys:
-                line.set_data([], [])
-                line.set_visible(False)
-        if layer_names:
-            self._refresh_legend(axis, panel_id)
-
     def _get_line(
         self,
         axis: Any,
@@ -258,50 +170,12 @@ class EpochMetricsPlotter:
         metric_name: str,
         *,
         label: str,
-        color: Any | None = None,
     ) -> Any:
         key = (panel_id, metric_name)
         if key not in self._lines:
-            (line,) = axis.plot(
-                [],
-                [],
-                marker="o",
-                linewidth=1.4,
-                markersize=4,
-                label=label,
-                color=color,
-            )
+            (line,) = axis.plot([], [], marker="o", linewidth=1.4, markersize=4, label=label)
             self._lines[key] = line
         return self._lines[key]
-
-    def _refresh_legend(self, axis: Any, panel_id: str) -> None:
-        visible_count = sum(
-            1
-            for (line_panel_id, _), line in self._lines.items()
-            if line_panel_id == panel_id and line.get_visible()
-        )
-        if self._legend_line_counts.get(panel_id) == visible_count:
-            return
-        self._legend_line_counts[panel_id] = visible_count
-        axis.legend(loc="best", fontsize=7)
-
-    def _resolve_layer_names(self, rows: list[dict[str, Any]], metric_name: str) -> list[str]:
-        for row in reversed(rows):
-            names = row.get("layer_IDSI_names")
-            if isinstance(names, list) and names:
-                return [str(name) for name in names]
-        max_count = 0
-        for row in rows:
-            value = row.get(metric_name)
-            if isinstance(value, list):
-                max_count = max(max_count, len(value))
-        return [f"layer_{index + 1}" for index in range(max_count)]
-
-    def _resolve_layer_color(self, layer_name: str, layer_index: int) -> Any:
-        if layer_name not in self._layer_colors:
-            cycle = self._plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
-            self._layer_colors[layer_name] = cycle[layer_index % len(cycle)] if cycle else None
-        return self._layer_colors[layer_name]
 
 
 def _as_float(value: Any) -> float:
@@ -312,14 +186,7 @@ def _as_float(value: Any) -> float:
     return parsed if math.isfinite(parsed) else math.nan
 
 
-def _as_layer_float(value: Any, index: int) -> float:
-    if not isinstance(value, list) or index >= len(value):
-        return math.nan
-    return _as_float(value[index])
-
-
 def _choose_metrics_file() -> Path | None:
-    """Open a file picker and let the user choose a JSONL metrics file."""
     import tkinter as tk
     from tkinter import filedialog
 
@@ -328,35 +195,27 @@ def _choose_metrics_file() -> Path | None:
     root.update()
     try:
         selected = filedialog.askopenfilename(
-            title="Select epoch metrics JSONL file",
+            title="Select MAOL epoch metrics JSONL",
             filetypes=[("JSONL files", "*.jsonl"), ("All files", "*.*")],
         )
     finally:
         root.destroy()
-
     return Path(selected) if selected else None
 
 
 def _plot_selected_file() -> int:
-    """Pick a JSONL file and write epoch_metrics_plot.png beside it."""
     metrics_path = _choose_metrics_file()
     if metrics_path is None:
         return 0
-
     rows = read_metric_rows(metrics_path)
     if not rows:
         raise SystemExit(f"No valid JSON object rows found in: {metrics_path}")
-
     output_path = metrics_path.parent / "epoch_metrics_plot.png"
-    plotter = EpochMetricsPlotter(
-        metrics_path=metrics_path,
-        output_path=output_path,
-    )
+    plotter = EpochMetricsPlotter(metrics_path=metrics_path, output_path=output_path)
     try:
         plotter.save(rows)
     finally:
         plotter.close()
-
     print(f"Plot saved to: {output_path}")
     return 0
 

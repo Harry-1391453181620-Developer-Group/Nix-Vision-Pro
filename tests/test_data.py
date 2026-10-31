@@ -27,7 +27,7 @@ def test_load_image_creates_ndarray():
         arr = load_image(path)
         assert isinstance(arr, np.ndarray)
         assert arr.shape == (8, 10, 3)
-        assert arr.dtype == np.float64
+        assert arr.dtype == np.float32
         assert arr.min() >= 0 and arr.max() <= 255
     finally:
         Path(path).unlink(missing_ok=True)
@@ -53,7 +53,7 @@ def test_preprocess_image_shape_and_range():
     image = np.random.randint(0, 256, (24, 32, 3), dtype=np.uint8).astype(np.float64)
     out = preprocess_image(image, target_size=(16, 16), normalize_to=(0.0, 1.0))
     assert out.shape == (16, 16, 3)
-    assert out.dtype == np.float64
+    assert out.dtype == np.float32
     assert out.min() >= 0 and out.max() <= 1
 
 

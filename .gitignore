@@ -57,6 +57,7 @@ Dataset/
 .worktmp/
 .tmp/
 .pytest-tmp/
+.maol_tmp/
 pytest-cache-files-*/
 *.log
 
@@ -64,20 +65,11 @@ tmp_build_synth.txt
 
 # Other
 littledatawashbear.py
-smart.docx
-smart.docx - 快捷方式.lnk
 best_train_commands.txt
 runs/
 test_image/
-
-
-# Optimizer for future large scale training, reserve for now
-dist_optimizer.py
 
 # Syncthing
 .stignore
 .stfolder
 .stfolder/
-
-#todo
-todo

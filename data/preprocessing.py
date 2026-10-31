@@ -48,7 +48,7 @@ def normalize(
         input_range: (min, max) assumed input range.
 
     Returns:
-        ndarray same shape, float64, values in scale.
+        ndarray same shape, float32, values in scale.
     """
     lo, hi = input_range
     out_lo, out_hi = scale
@@ -74,7 +74,7 @@ def preprocess_image(
         input_value_range: assumed input value range.
 
     Returns:
-        ndarray (target_H, target_W, 3), float64, in normalize_to range.
+        ndarray (target_H, target_W, 3), float32, in normalize_to range.
     """
     out = resize(image, target_size)
     out = normalize(out, scale=normalize_to, input_range=input_value_range)
@@ -91,7 +91,7 @@ def batch_preprocess(
     Preprocess a list of images and stack into a batch.
 
     Returns:
-        ndarray (N, H, W, 3), float64.
+        ndarray (N, H, W, 3), float32.
     """
     out = [preprocess_image(im, target_size, normalize_to, input_value_range) for im in images]
     return np.stack(out, axis=0)

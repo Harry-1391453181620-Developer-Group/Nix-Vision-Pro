@@ -69,7 +69,7 @@ def load_image(path: Union[str, Path]) -> np.ndarray:
         path: Path to the image file (e.g. JPEG, PNG).
 
     Returns:
-        ndarray of shape (H, W, 3), dtype float64, values in [0, 255].
+        ndarray of shape (H, W, 3), dtype float32, values in [0, 255].
         Channel order R, G, B. Grayscale images are converted to RGB by repeating.
     """
     path = Path(path)

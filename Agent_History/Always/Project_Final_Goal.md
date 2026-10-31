@@ -22,3 +22,14 @@
     The IDSI, internal dynamics stability indicator is more like a goal that the other losses to reach, the author will investigate the MAOIDL system because the system seems to be a bit
     wrong when implemented on the code. But I still beleive the original thought one year ago is correect.
                                                                                                                         ---- HLAL-dh Harry Li at 2026/9/19.
+
+## 2026-10-31 direction update
+
+MAOIDL is retired.  The active theory is MAOL (Multi-Attractor Optimized
+Learning), documented in `MAOL.docx`: class images are embedded into nested
+"wells" (centers and radii), the leaf wells are learnable, parent wells are
+derived from their children, and classification is a prototype-head nearest-well
+decision rather than a linear classifier.  The main branch is now CNN-only.
+The Transformer branch, Omega/IDSI instrumentation, NumPy backend, MixUp/CutMix,
+focal loss, and label smoothing were removed.  The long-term goal of image
+identification and segmentation is unchanged.

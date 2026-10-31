@@ -1,0 +1,41 @@
+"""Tests for warm-up statistics and margin utilities."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from maol.stats import WarmupStats, lambert_w
+
+
+def test_lambert_w_inverts_k_times_exp_k() -> None:
+    values = np.array([0.0, 0.1, 1.0, 5.0, 20.0], dtype=np.float64)
+    result = lambert_w(values)
+    np.testing.assert_allclose(result * np.exp(result), values, atol=1e-9)
+
+
+def test_warmup_stats_metadata_round_trip() -> None:
+    stats = WarmupStats(
+        c_ema=torch.zeros((2, 3)),
+        q=torch.ones(2),
+        node_weights=torch.ones(4),
+        d_intra=1.5,
+        d_inter=2.5,
+        margin_cap=3.0,
+        m_base=1.2,
+        m_max=2.4,
+        k0=1.0,
+        alpha=2.0,
+        tau0=2.25,
+        tau_warm=1.8,
+        confusion=torch.zeros((2, 2), dtype=torch.long),
+        w_vu=torch.ones(1),
+        margins=torch.ones(1),
+        sep_weights=torch.ones(1),
+    )
+    restored = WarmupStats.from_metadata(stats.to_metadata())
+    assert restored.d_intra == pytest.approx(1.5)
+    assert torch.allclose(restored.c_ema, stats.c_ema)
+    assert torch.allclose(restored.margins, stats.margins)

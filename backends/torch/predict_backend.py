@@ -1,20 +1,21 @@
-"""PyTorch inference backend."""
+"""MAOL inference backend (CNN prototype head only)."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 
+from backends.torch.model import TorchCNN, resolve_checkpoint_runtime_config
+from data.loaders import load_image
+from data.preprocessing import preprocess_image
 from utils.safety import install_dataset_write_guard
 
 install_dataset_write_guard()
 
 import config
-from backends.torch.model import DEFAULT_OMEGA_FEATURE_DIM, TorchCNN, resolve_checkpoint_runtime_config
-from data.loaders import load_image
-from data.preprocessing import preprocess_image
 
 
 def _resolve_device(device_arg: str) -> torch.device:
@@ -27,127 +28,64 @@ def _resolve_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _validate_checkpoint_overrides(
-    *,
-    class_count_override: int | None,
-    width_scale_override: float | None,
-    checkpoint_num_classes: int,
-    checkpoint_width_scale: float,
-) -> None:
-    if class_count_override is not None and int(class_count_override) != int(checkpoint_num_classes):
+def load_maol_model(weights_path: str | Path, device: torch.device) -> TorchCNN:
+    config_info = resolve_checkpoint_runtime_config(weights_path, map_location=device)
+    if config_info.head_type != "prototype" or config_info.tree is None:
         raise SystemExit(
-            f"--class-count={class_count_override} conflicts with checkpoint num_classes={checkpoint_num_classes}"
+            "This build supports MAOL prototype checkpoints only. "
+            "Old MAOIDL checkpoints are intentionally not compatible."
         )
-    if width_scale_override is not None and abs(float(width_scale_override) - float(checkpoint_width_scale)) > 1e-9:
-        raise SystemExit(
-            f"--model-width-scale={width_scale_override} conflicts with checkpoint width_scale={checkpoint_width_scale:.6f}"
-        )
+    model = TorchCNN(
+        input_size=config_info.input_size,
+        num_classes=config_info.num_classes,
+        tree=config_info.tree,
+        width_scale=config_info.width_scale,
+        embedding_dim=config_info.embedding_dim,
+        seed=42,
+    )
+    model.load_weights(weights_path, map_location=device, strict=True)
+    model.to(device)
+    model.eval()
+    return model
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Predict class for an image with the PyTorch CNN")
+    parser = argparse.ArgumentParser(description="Predict one image with a MAOL prototype checkpoint")
     parser.add_argument("image", type=str, help="Path to image file")
-    parser.add_argument("--weights", type=str, default=None, help="Path to saved weights .pt/.pth (optional)")
-    parser.add_argument("--probabilities", action="store_true", help="Print class probabilities")
-    parser.add_argument("--top-k", type=int, default=3, help="Show top-k predictions")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed (used if no weights)")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Inference device")
-    parser.add_argument("--data-dir", type=str, default=None, help="Dataset root used to resolve class labels")
-    parser.add_argument("--class-count", type=int, default=None, help="Optional class-count override for model output size")
-    parser.add_argument("--model-width-scale", type=float, default=None, help="Optional width multiplier override when no checkpoint is loaded")
+    parser.add_argument("--weights", type=str, required=True, help="MAOL .pt/.pth checkpoint")
+    parser.add_argument("--probabilities", action="store_true")
+    parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
 
     image_path = Path(args.image)
     if not image_path.exists():
         raise SystemExit(f"Image not found: {image_path}")
+    weights_path = Path(args.weights)
+    if not weights_path.is_file():
+        raise SystemExit(f"Weights not found: {weights_path}")
 
     device = _resolve_device(args.device)
-    class_source_dir = Path(args.data_dir) if args.data_dir else None
-    input_size = config.INPUT_SIZE
-    width_scale = 0.75 if args.model_width_scale is None else float(args.model_width_scale)
-    if args.weights:
-        weights_path = Path(args.weights)
-        if weights_path.suffix not in {".pt", ".pth"}:
-            raise SystemExit("Weights file must use .pt or .pth extension")
-        checkpoint_config = resolve_checkpoint_runtime_config(weights_path, map_location=device, default_input_size=input_size)
-        _validate_checkpoint_overrides(
-            class_count_override=args.class_count,
-            width_scale_override=args.model_width_scale,
-            checkpoint_num_classes=checkpoint_config.num_classes,
-            checkpoint_width_scale=checkpoint_config.width_scale,
-        )
-        input_size = checkpoint_config.input_size
-        width_scale = checkpoint_config.width_scale
-        num_classes = checkpoint_config.num_classes
-        class_names = config.resolve_runtime_class_names(
-            class_source_dir,
-            num_classes=num_classes,
-            checkpoint_class_names=checkpoint_config.class_names,
-            require_images=False,
-        )
-    else:
-        try:
-            class_names = config.get_class_names(class_source_dir, class_count=args.class_count, require_images=False)
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
-        num_classes = len(class_names)
-
-    model_kwargs = {}
-    if args.weights:
-        model_kwargs = {
-            "omega_enabled": checkpoint_config.omega_enabled,
-            "omega_projector_depth": checkpoint_config.omega_projector_depth or 1,
-            "omega_hidden_dim": checkpoint_config.omega_hidden_dim or DEFAULT_OMEGA_FEATURE_DIM,
-            "tokenize": checkpoint_config.tokenize,
-            "token_dim": checkpoint_config.token_dim or 128,
-            "transformer_depth": checkpoint_config.transformer_depth or 1,
-            "attention_heads": checkpoint_config.attention_heads or 4,
-            "transformer_mlp_ratio": checkpoint_config.transformer_mlp_ratio or 2.0,
-            "token_pool": checkpoint_config.token_pool or "mean",
-            "token_positional_encoding": checkpoint_config.token_positional_encoding or "learned",
-            "token_dropout": checkpoint_config.token_dropout if checkpoint_config.token_dropout is not None else 0.1,
-            "transformer_layernorm": checkpoint_config.transformer_layernorm or "pre",
-        }
-    model = TorchCNN(
-        input_size=input_size,
-        num_classes=num_classes,
-        seed=args.seed,
-        width_scale=width_scale,
-        **model_kwargs,
-    )
-    model.to(device)
-    if args.weights:
-        try:
-            model.load_weights(weights_path, map_location=device)
-        except RuntimeError as exc:
-            print(
-                f"[warn] Strict checkpoint load failed ({exc}); "
-                "retrying with strict=False (stage IDSI projections will use fresh init)."
-            )
-            model.load_weights(weights_path, map_location=device, strict=False)
-    model.eval()
-
+    model = load_maol_model(weights_path, device)
     image = load_image(image_path)
     x = preprocess_image(
         image,
-        target_size=input_size,
+        target_size=model.input_size,
         normalize_to=config.NORMALIZE_TO,
         input_value_range=config.INPUT_VALUE_RANGE,
     )
-    x_tensor = torch.from_numpy(x).unsqueeze(0).to(device=device, dtype=torch.float32)
-
+    x_tensor = torch.from_numpy(np.transpose(x, (2, 0, 1))).unsqueeze(0).to(device=device, dtype=torch.float32)
     with torch.no_grad():
         logits = model(x_tensor)
         probs = torch.softmax(logits, dim=-1)[0].detach().cpu().numpy()
-    pred_class = int(probs.argmax())
 
-    print(f"Predicted class: {pred_class} ({class_names[pred_class]})")
+    predicted = int(probs.argmax())
+    class_names = tuple(model.class_names)
+    print(f"Predicted class: {predicted} ({class_names[predicted]})")
     if args.probabilities:
-        top_k = max(1, min(args.top_k, num_classes))
-        top_indices = probs.argsort()[::-1][:top_k]
-        print(f"Top {top_k} probabilities:")
-        for index in top_indices:
-            print(f"  {class_names[index]}: {probs[index]:.4f}")
+        top_k = max(1, min(int(args.top_k), int(probs.shape[0])))
+        for index in probs.argsort()[::-1][:top_k]:
+            print(f"  {class_names[int(index)]}: {float(probs[int(index)]):.4f}")
 
 
 if __name__ == "__main__":
