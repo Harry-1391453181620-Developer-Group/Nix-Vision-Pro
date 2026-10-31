@@ -448,6 +448,164 @@ def _expanded_labels(counts: torch.Tensor) -> list[int]:
     return labels
 
 
+def _resolve_warmup_tau(
+    tau_raw: float,
+    tau_floor: float,
+    global_step: int,
+) -> tuple[float, float, bool]:
+    """Resolve the warm-up temperature with a fallback, not a hard clamp.
+
+    The document says tau=1 for the first 100 iterations and then
+    ``mean ||h-c||^2``.  If the class means have collapsed, that estimate is
+    meaningless (e.g. 1e-6), so fall back to 1.0 for stability.  A tiny but
+    nonzero floor would still massively amplify the logits.
+    """
+    raw = float(tau_raw)
+    fallback = (not np.isfinite(raw)) or raw < float(tau_floor)
+    if int(global_step) < MAOL_WARMUP_TAU_STEPS:
+        return 1.0, raw, bool(fallback)
+    if fallback:
+        return 1.0, raw, True
+    return max(raw, 0.0), raw, False
+
+
+def _summarize_values(values: Sequence[float]) -> dict[str, float]:
+    array = np.asarray([float(value) for value in values if np.isfinite(float(value))], dtype=np.float64)
+    if array.size == 0:
+        return {"mean": float("nan"), "median": float("nan"), "p90": float("nan"), "min": float("nan"), "max": float("nan")}
+    return {
+        "mean": float(array.mean()),
+        "median": float(np.median(array)),
+        "p90": float(np.percentile(array, 90)),
+        "min": float(array.min()),
+        "max": float(array.max()),
+    }
+
+
+def _parameter_groups(model: TorchCNN) -> dict[str, list[torch.nn.Parameter]]:
+    groups: dict[str, list[torch.nn.Parameter]] = {
+        "backbone": [],
+        "fc1": [],
+        "centers": [],
+        "radii": [],
+    }
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("head.centers"):
+            groups["centers"].append(parameter)
+        elif name.startswith("head.raw_radii"):
+            groups["radii"].append(parameter)
+        elif name.startswith("fc1"):
+            groups["fc1"].append(parameter)
+        else:
+            groups["backbone"].append(parameter)
+    return groups
+
+
+def _build_warmup_diagnostics(
+    stats: WarmupStats,
+    val_acc: float,
+    num_classes: int,
+    *,
+    tau_floor: float,
+    acc_factor: float,
+    max_q_ratio: float,
+    tau_fallback_epochs: int = 0,
+) -> dict[str, Any]:
+    q = stats.q.detach().float().cpu().numpy()
+    q_median = float(np.median(q)) if q.size else 0.0
+    q_max = float(np.max(q)) if q.size else 0.0
+    q_ratio_value = float(q_max / q_median) if q_median > 0.0 else float("inf")
+    acc_threshold = float(acc_factor) / max(1, int(num_classes))
+
+    checks = {
+        "val_acc": {
+            "value": float(val_acc),
+            "threshold": acc_threshold,
+            "passed": bool(np.isfinite(val_acc) and val_acc >= acc_threshold),
+        },
+        "d_inter_ge_d_intra": {
+            "value": float(stats.d_inter),
+            "threshold": float(stats.d_intra),
+            "passed": bool(stats.d_inter >= stats.d_intra),
+        },
+        "q_max_over_median": {
+            "value": q_ratio_value,
+            "threshold": float(max_q_ratio),
+            "passed": bool(np.isfinite(q_ratio_value) and q_ratio_value <= float(max_q_ratio)),
+        },
+        "tau0_ge_floor": {
+            "value": float(stats.tau0),
+            "threshold": float(tau_floor),
+            "passed": bool(stats.tau0 >= float(tau_floor)),
+        },
+    }
+    failures: list[str] = []
+    if not checks["val_acc"]["passed"]:
+        failures.append(
+            f"val_acc={val_acc:.4f} < {acc_threshold:.4f} (2/{num_classes})"
+        )
+    if not checks["d_inter_ge_d_intra"]["passed"]:
+        failures.append(f"d_inter={stats.d_inter:.4f} < d_intra={stats.d_intra:.4f}")
+    if not checks["q_max_over_median"]["passed"]:
+        failures.append(
+            f"q_max/q_median={q_ratio_value:.2f} > {float(max_q_ratio):.2f}"
+        )
+    if not checks["tau0_ge_floor"]["passed"]:
+        failures.append(f"tau0={stats.tau0:.6g} < tau_floor={float(tau_floor):.6g}")
+
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "checks": checks,
+        "metrics": {
+            "val_acc": float(val_acc),
+            "num_classes": int(num_classes),
+            "d_intra": float(stats.d_intra),
+            "d_inter": float(stats.d_inter),
+            "q_median": q_median,
+            "q_max": q_max,
+            "q_max_over_median": q_ratio_value,
+            "tau0": float(stats.tau0),
+            "tau_warm_raw": float(stats.tau_warm),
+            "tau_fallback_epochs": int(tau_fallback_epochs),
+            "acc_factor": float(acc_factor),
+            "max_q_ratio": float(max_q_ratio),
+            "tau_floor": float(tau_floor),
+        },
+    }
+
+
+def _check_warmup_or_abort(
+    stats: WarmupStats,
+    val_acc: float,
+    num_classes: int,
+    args: argparse.Namespace,
+    run_dir: Path,
+    *,
+    tau_fallback_epochs: int = 0,
+) -> dict[str, Any]:
+    diagnostics = _build_warmup_diagnostics(
+        stats,
+        val_acc,
+        num_classes,
+        tau_floor=float(args.maol_tau_floor),
+        acc_factor=float(args.maol_warmup_min_acc_factor),
+        max_q_ratio=float(args.maol_warmup_max_q_ratio),
+        tau_fallback_epochs=tau_fallback_epochs,
+    )
+    _write_json(run_dir / "warmup_diagnostics.json", diagnostics)
+    if args.maol_warmup_sanity and not diagnostics["passed"]:
+        _write_json(run_dir / "warmup_rejected.json", diagnostics)
+        print("MAOL warm-up sanity check FAILED:")
+        for failure in diagnostics["failures"]:
+            print(f"  - {failure}")
+        print(f"Diagnostics: {run_dir / 'warmup_rejected.json'}")
+        raise SystemExit(2)
+    return diagnostics
+
+
 def run_warmup(
     model: TorchCNN,
     train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
@@ -462,13 +620,20 @@ def run_warmup(
     head = model.head
     head.set_trainable(False)
     head.tau.fill_(1.0)
-    optimizer = _build_optimizer(args, model, lr_value=float(args.lr[0]))
+    warmup_lr = (
+        float(args.maol_warmup_lr)
+        if args.maol_warmup_lr is not None
+        else float(args.lr[0]) * (1.0 if args.init_from else 2.0)
+    )
+    print(f"Warm-up LR: {warmup_lr:.6f} (init_from={args.init_from is not None})")
+    optimizer = _build_optimizer(args, model, lr_value=warmup_lr)
     amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
     scaler = _make_grad_scaler(device, amp_dtype)
 
     rows: list[dict[str, Any]] = []
     global_step = 0
     tau_warm = 1.0
+    tau_fallback_epochs = 0
     num_batches = max(1, len(train_loader))
     for epoch in range(int(args.maol_warmup_epochs)):
         model.eval()
@@ -481,7 +646,13 @@ def run_warmup(
         )
         head.set_centers(means)
         head.set_node_weights(model.tree.node_weights_from_labels(_expanded_labels(counts)))
-        tau_warm = max(float(tau_epoch), 1e-6)
+        tau_warm, tau_raw, tau_fallback = _resolve_warmup_tau(
+            tau_epoch,
+            float(args.maol_tau_floor),
+            global_step,
+        )
+        if tau_fallback:
+            tau_fallback_epochs += 1
         head.tau.fill_(1.0 if global_step < MAOL_WARMUP_TAU_STEPS else tau_warm)
         model.train()
 
@@ -490,8 +661,7 @@ def run_warmup(
         epoch_count = 0
         for batch_index, (x_cpu, y_cpu) in enumerate(train_loader):
             x, y = _move_batch(x_cpu, y_cpu, device)
-            scheduled_lr = float(args.lr[0])
-            _set_optimizer_lr(optimizer, scheduled_lr)
+            _set_optimizer_lr(optimizer, warmup_lr)
             optimizer.zero_grad(set_to_none=True)
             if global_step >= MAOL_WARMUP_TAU_STEPS and abs(float(head.tau) - tau_warm) > 1e-9:
                 head.tau.fill_(tau_warm)
@@ -524,14 +694,20 @@ def run_warmup(
             "train_acc": epoch_correct / max(1, epoch_count),
             "val_loss_ce": val["loss_ce"],
             "val_acc": val["acc"],
-            "tau": float(head.tau.detach().cpu().item()),
+            "tau_raw": float(tau_raw),
+            "tau_used": float(head.tau.detach().cpu().item()),
+            "tau_fallback": bool(tau_fallback),
+            "tau_fallback_epochs": int(tau_fallback_epochs),
+            "warmup_lr": float(warmup_lr),
             "global_step": global_step,
         }
         rows.append(row)
         print(
             f"[warmup {epoch + 1}/{args.maol_warmup_epochs}] "
             f"loss_ce={row['loss_ce']:.4f} train_acc={row['train_acc']:.3f} "
-            f"val_acc={row['val_acc']:.3f} tau={row['tau']:.4f}"
+            f"val_acc={row['val_acc']:.3f} tau_raw={row['tau_raw']:.4g} "
+            f"tau_used={row['tau_used']:.4g}"
+            + (" FALLBACK" if row["tau_fallback"] else "")
         )
 
     model.eval()
@@ -597,6 +773,8 @@ def _save_warmup(
     stats: WarmupStats,
     path: Path,
     args: argparse.Namespace,
+    *,
+    diagnostics: Mapping[str, Any] | None = None,
 ) -> None:
     model.save_weights(
         path,
@@ -604,6 +782,7 @@ def _save_warmup(
             "stage": "maol_warmup",
             "is_ema": False,
             "warmup_stats": stats.to_metadata(),
+            "warmup_diagnostics": dict(diagnostics or {}),
             "lambdas": DEFAULT_LAMBDAS,
             "maol": {
                 "gamma": float(args.maol_gamma),
@@ -614,6 +793,30 @@ def _save_warmup(
             },
         },
     )
+
+
+def _load_backbone_weights(model: TorchCNN, path: str | Path, device: torch.device) -> tuple[int, int]:
+    """Load only CNN/fc1 tensors from an old checkpoint.
+
+    Warm-up must recompute class means from the current backbone, so classifier
+    heads (old fc2/token head or a MAOL prototype head) are never loaded here.
+    """
+    state, _ = load_checkpoint_state(path, map_location=device)
+    current = model.state_dict()
+    allowed_prefixes = ("conv", "bn", "se", "fc1")
+    filtered: dict[str, torch.Tensor] = {}
+    skipped = 0
+    for key, value in state.items():
+        if not key.startswith(allowed_prefixes):
+            skipped += 1
+            continue
+        target = current.get(key)
+        if target is None or tuple(target.shape) != tuple(value.shape):
+            skipped += 1
+            continue
+        filtered[key] = value
+    model.load_state_dict(filtered, strict=False)
+    return len(filtered), skipped
 
 
 def _load_warmup(
@@ -663,11 +866,19 @@ def _probe(
     """Run a short scale probe.  No model weights are saved."""
     del stats
     model.head.set_trainable(True)
+    no_update = bool(args.maol_probe_no_update)
+    if no_update:
+        model.eval()
+    else:
+        model.train()
     optimizer = _build_optimizer(args, model, lr_value=float(args.lr[0]))
-    model.train()
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    group_params = [(name, params) for name, params in _parameter_groups(model).items() if params]
+    group_parameters = [parameter for _, params in group_params for parameter in params]
+
     rows_path = run_dir / "probe_metrics.jsonl"
-    if rows_path.exists():
-        rows_path.unlink()
+    rows_path.parent.mkdir(parents=True, exist_ok=True)
+    rows_path.write_text("", encoding="utf-8")
     iterator = iter(train_loader)
     rows: list[dict[str, Any]] = []
     for step in range(int(args.maol_probe_steps)):
@@ -679,13 +890,14 @@ def _probe(
         x, y = _move_batch(x_cpu, y_cpu, device)
         optimizer.zero_grad(set_to_none=True)
         h = model.forward_embedding(x)
-        model.head.update_ema_stats(
-            h.detach(),
-            y,
-            m=0.9,
-            m_q=float(args.maol_mq),
-            n_min=int(args.maol_nmin),
-        )
+        if not no_update:
+            model.head.update_ema_stats(
+                h.detach(),
+                y,
+                m=0.9,
+                m_q=float(args.maol_mq),
+                n_min=int(args.maol_nmin),
+            )
         terms = compute_maol_losses(
             model.head,
             h,
@@ -696,17 +908,50 @@ def _probe(
             class_weights=None,
         )
         terms.total.backward(retain_graph=True)
-        total_grad_norm = _grad_norm([p for p in model.parameters() if p.requires_grad])
+        total_grad_norm = _grad_norm(parameters)
+        if float(args.grad_clip) > 0.0:
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm=float(args.grad_clip))
+        total_grad_norm_postclip = _grad_norm(parameters)
+
         grad_h: dict[str, float] = {}
+        grad_param: dict[str, dict[str, float]] = {}
         for name, term in terms.named().items():
             if name == "total":
                 continue
             try:
-                gradient = torch.autograd.grad(term, h, retain_graph=True, allow_unused=True)[0]
+                gradients = torch.autograd.grad(
+                    term,
+                    (h, *group_parameters),
+                    retain_graph=True,
+                    allow_unused=True,
+                )
             except RuntimeError:
-                gradient = None
-            grad_h[name] = float(torch.linalg.vector_norm(gradient).item()) if gradient is not None else 0.0
-        optimizer.step()
+                gradients = None
+            h_gradient = gradients[0] if gradients is not None else None
+            grad_h[name] = (
+                float(torch.linalg.vector_norm(h_gradient).item())
+                if h_gradient is not None
+                else 0.0
+            )
+            if args.maol_probe_grad_params:
+                grad_param[name] = {}
+                offset = 0
+                for group_name, params in group_params:
+                    group_norm = 0.0
+                    if gradients is not None:
+                        group_grads = gradients[1 + offset : 1 + offset + len(params)]
+                        norms = [
+                            torch.linalg.vector_norm(gradient.detach().float(), ord=2)
+                            for gradient in group_grads
+                            if gradient is not None
+                        ]
+                        if norms:
+                            group_norm = float(torch.linalg.vector_norm(torch.stack(norms), ord=2).item())
+                    grad_param[name][group_name] = group_norm
+                    offset += len(params)
+
+        if not no_update:
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         row = {
             "step": step,
@@ -719,23 +964,48 @@ def _probe(
                 "center": float(terms.center.item()),
             },
             "grad_h": {key.upper() if key == "ce" else key: value for key, value in grad_h.items()},
+            "grad_param": {
+                key.upper() if key == "ce" else key: value
+                for key, value in grad_param.items()
+            },
             "total_grad_norm": float(total_grad_norm),
+            "total_grad_norm_postclip": float(total_grad_norm_postclip),
+            "tau": float(model.head.tau.detach().cpu().item()),
             "lr": float(args.lr[0]),
+            "no_update": bool(no_update),
         }
         rows.append(row)
         _append_jsonl(rows_path, row)
 
+    loss_keys = ("CE", "intra", "sep", "nest", "cov", "center")
+    loss_stats = {key: _summarize_values([row["loss"][key] for row in rows]) for key in loss_keys}
+    grad_h_stats = {key: _summarize_values([row["grad_h"][key] for row in rows]) for key in loss_keys}
+    total_stats = _summarize_values([row["total_grad_norm"] for row in rows])
+    total_post_stats = _summarize_values([row["total_grad_norm_postclip"] for row in rows])
+    grad_param_stats: dict[str, dict[str, dict[str, float]]] = {}
+    if args.maol_probe_grad_params and rows:
+        for term_name in loss_keys:
+            grad_param_stats[term_name] = {}
+            for group_name, _ in group_params:
+                grad_param_stats[term_name][group_name] = _summarize_values(
+                    [row["grad_param"].get(term_name, {}).get(group_name, 0.0) for row in rows]
+                )
+
     summary = {
         "steps": len(rows),
-        "loss_mean": {
-            key: float(np.mean([row["loss"][key] for row in rows])) if rows else float("nan")
-            for key in ("CE", "intra", "sep", "nest", "cov", "center")
-        },
-        "grad_h_mean": {
-            key: float(np.mean([row["grad_h"][key] for row in rows])) if rows else float("nan")
-            for key in ("CE", "intra", "sep", "nest", "cov", "center")
-        },
-        "total_grad_norm_mean": float(np.mean([row["total_grad_norm"] for row in rows])) if rows else float("nan"),
+        "no_update": bool(no_update),
+        "grad_clip": float(args.grad_clip),
+        "loss_mean": {key: float(np.mean([row["loss"][key] for row in rows])) if rows else float("nan") for key in loss_keys},
+        "grad_h_mean": {key: float(np.mean([row["grad_h"][key] for row in rows])) if rows else float("nan") for key in loss_keys},
+        "total_grad_norm_mean": float(total_stats["mean"]),
+        "total_grad_norm_postclip_mean": float(total_post_stats["mean"]),
+        "loss_stats": loss_stats,
+        "grad_h_stats": grad_h_stats,
+        "grad_param_stats": grad_param_stats,
+        "total_grad_norm_stats": total_stats,
+        "total_grad_norm_postclip_stats": total_post_stats,
+        "tau": float(model.head.tau.detach().cpu().item()),
+        "lr": float(args.lr[0]),
         "note": "Scale probe only; no model weights were written.",
     }
     summary_path = run_dir / "probe_summary.json"
@@ -1092,6 +1362,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--maol-mq must satisfy 0 <= value < 1")
     if args.maol_nmin < 1:
         raise SystemExit("--maol-nmin must be >= 1")
+    if args.maol_tau_floor <= 0.0:
+        raise SystemExit("--maol-tau-floor must be > 0")
+    if args.maol_warmup_min_acc_factor <= 0.0:
+        raise SystemExit("--maol-warmup-min-acc-factor must be > 0")
+    if args.maol_warmup_max_q_ratio <= 0.0:
+        raise SystemExit("--maol-warmup-max-q-ratio must be > 0")
+    if args.maol_warmup_lr is not None and args.maol_warmup_lr <= 0.0:
+        raise SystemExit("--maol-warmup-lr must be > 0 when provided")
     for name in (
         "maol_margin_scale",
         "maol_mbase_scale",
@@ -1199,9 +1477,30 @@ def main() -> None:
     parser.add_argument("--maol-warmup-only", action="store_true")
     parser.add_argument("--maol-force-warmup", action="store_true")
     parser.add_argument("--maol-warmup-ckpt", type=str, default=None)
+    parser.add_argument("--maol-warmup-lr", type=float, default=None, help="Override warm-up LR; default is lr[0] from a pretrained init, 2*lr[0] from scratch")
+    parser.add_argument("--maol-warmup-augment", action=argparse.BooleanOptionalAction, default=False, help="Use RandAugment during warm-up (default: off)")
+    parser.add_argument("--maol-tau-floor", type=float, default=1e-2, help="If tau_warm falls below this, fall back to tau=1.0")
+    parser.add_argument("--maol-warmup-sanity", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--maol-warmup-min-acc-factor", type=float, default=2.0, help="Minimum warm-up val_acc as a multiple of 1/num_classes")
+    parser.add_argument("--maol-warmup-max-q-ratio", type=float, default=10.0, help="Maximum q_max/q_median allowed after warm-up")
     parser.add_argument("--maol-probe-only", action="store_true")
     parser.add_argument("--maol-probe-steps", type=int, default=100)
     parser.add_argument("--maol-probe-output", type=str, default=None)
+    probe_update_group = parser.add_mutually_exclusive_group()
+    probe_update_group.add_argument(
+        "--maol-probe-no-update",
+        dest="maol_probe_no_update",
+        action="store_true",
+        default=True,
+        help="Measure only; never call optimizer.step (default)",
+    )
+    probe_update_group.add_argument(
+        "--maol-probe-update",
+        dest="maol_probe_no_update",
+        action="store_false",
+        help="Allow the probe to update weights (gradients are clipped first)",
+    )
+    parser.add_argument("--maol-probe-grad-params", action=argparse.BooleanOptionalAction, default=True, help="Record per-term gradients for backbone/fc1/centers/radii")
     parser.add_argument("--maol-lambda-intra", type=float, default=1.0)
     parser.add_argument("--maol-lambda-sep", type=float, default=1.0)
     parser.add_argument("--maol-lambda-nest", type=float, default=1.0)
@@ -1303,6 +1602,14 @@ def main() -> None:
         if val_dataset is not None
         else None
     )
+    warmup_train_loader = _build_loader(
+        train_dataset if args.maol_warmup_augment else clean_train_dataset,
+        batch_size=int(args.batch_size),
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        pin_memory=pin_memory,
+        seed=int(args.seed) + 3,
+    )
 
     class_weights_tensor = None
     if args.class_weighting:
@@ -1323,20 +1630,13 @@ def main() -> None:
     _move_module_to_device(model, device)
     print(f"Using stage_channels={model.stage_channels} width_scale={model.width_scale:.3f}")
     if args.init_from:
-        try:
-            model.load_weights(args.init_from, map_location=device, strict=True)
-            print(f"Initialized from MAOL checkpoint: {args.init_from}")
-        except Exception as exc:
-            print(f"[warn] strict initialization failed ({exc}); loading matching backbone tensors only")
-            state, _ = load_checkpoint_state(args.init_from, map_location=device)
-            current = model.state_dict()
-            filtered = {
-                key: value
-                for key, value in state.items()
-                if key in current and tuple(current[key].shape) == tuple(value.shape)
-            }
-            model.load_state_dict(filtered, strict=False)
-            print(f"Loaded {len(filtered)} matching tensors from {args.init_from}")
+        loaded, skipped = _load_backbone_weights(model, args.init_from, device)
+        print(
+            f"Initialized backbone/fc1 tensors from {args.init_from}: "
+            f"loaded={loaded}, skipped={skipped} (classifier/head/token keys are not loaded)"
+        )
+        if loaded == 0:
+            print("[warn] no matching backbone tensors were loaded from --init-from")
 
     run_tag = "maol-probe" if args.maol_probe_only else ("maol-warmup" if args.maol_warmup_only else "maol")
     run_dir = Path(args.maol_probe_output) if args.maol_probe_output else _prepare_run_dir(args, run_tag, index)
@@ -1346,6 +1646,20 @@ def main() -> None:
         if not warmup_ckpt.is_file():
             raise SystemExit(f"Probe requires a warm-up checkpoint: {warmup_ckpt}")
         model, stats = _load_warmup(warmup_ckpt, index, args=args, device=device)
+        loaded_val = evaluate_warmup_ce(
+            model,
+            val_loader,
+            device,
+            class_weights=class_weights_tensor,
+            amp_dtype=_resolve_amp_dtype(device, args.amp_mode),
+        )
+        _check_warmup_or_abort(
+            stats,
+            loaded_val["acc"],
+            model.num_classes,
+            args,
+            run_dir,
+        )
         _probe(model, stats, train_loader, args, device, run_dir)
         _verify_dataset_unchanged(data_dir, pre_signature, bool(args.enforce_readonly_dataset))
         return
@@ -1353,21 +1667,44 @@ def main() -> None:
     if warmup_ckpt.is_file() and not args.maol_warmup_only and not args.maol_force_warmup:
         print(f"Loading warm-up checkpoint: {warmup_ckpt}")
         model, stats = _load_warmup(warmup_ckpt, index, args=args, device=device)
+        loaded_val = evaluate_warmup_ce(
+            model,
+            val_loader,
+            device,
+            class_weights=class_weights_tensor,
+            amp_dtype=_resolve_amp_dtype(device, args.amp_mode),
+        )
+        _check_warmup_or_abort(
+            stats,
+            loaded_val["acc"],
+            model.num_classes,
+            args,
+            run_dir,
+        )
     else:
         print(f"Running MAOL warm-up for {args.maol_warmup_epochs} epochs")
+        print(f"Warm-up augmentation: {bool(args.maol_warmup_augment)}")
         stats, warmup_rows = run_warmup(
             model,
-            train_loader,
+            warmup_train_loader,
             clean_train_loader,
             val_loader,
             args,
             device,
             class_weights=class_weights_tensor,
         )
-        _save_warmup(model, stats, warmup_ckpt, args)
         _write_json(run_dir / "warmup_stats.json", stats.to_metadata())
         for row in warmup_rows:
             _append_jsonl(run_dir / "warmup_metrics.jsonl", row)
+        diagnostics = _check_warmup_or_abort(
+            stats,
+            float(warmup_rows[-1]["val_acc"]) if warmup_rows else float("nan"),
+            model.num_classes,
+            args,
+            run_dir,
+            tau_fallback_epochs=int(warmup_rows[-1].get("tau_fallback_epochs", 0)) if warmup_rows else 0,
+        )
+        _save_warmup(model, stats, warmup_ckpt, args, diagnostics=diagnostics)
         print(f"Saved warm-up checkpoint: {warmup_ckpt}")
         if args.maol_warmup_only:
             _verify_dataset_unchanged(data_dir, pre_signature, bool(args.enforce_readonly_dataset))

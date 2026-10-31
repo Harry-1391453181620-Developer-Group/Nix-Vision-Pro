@@ -52,3 +52,6 @@
   loss normalization, checkpoint round-trip, plotting, and training utilities.
 - Smoke runs cover warm-up, 100-step-style probe (shortened for CI), full training
   from a warm-up checkpoint, and prediction.
+- Follow-up warm-up/probe hardening (tau fallback, sanity abort, no-update probe,
+  group gradients) is documented in
+  `Agent_History/docs/plans/2026-10-31-warmup-probe-hardening.md`.

@@ -88,6 +88,15 @@ python -m venv --system-site-packages venv313
 python -m pip install -r requirements.txt
 ```
 
+On the DGX Spark (Linux), create a Linux venv instead; the Windows `venv313`
+binaries are not usable there:
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
 Python 3.13 is the tested runtime.  Training was validated on the DGX Spark via
 Syncthing and locally on CPU for smoke tests.
 
@@ -95,37 +104,65 @@ Syncthing and locally on CPU for smoke tests.
 
 ### 1. Warm-up only
 
-Warm-up must be at least 5 epochs:
+Warm-up must be at least 5 epochs.  It uses clean images by default (RandAugment
+is off), recomputes leaf centers at every epoch, and freezes them.  `tau` is
+fixed at `1.0` for the first 100 iterations; afterwards the measured `tau_warm`
+is used.  If `tau_warm < --maol-tau-floor` (default `1e-2`), the code falls back
+to `tau=1.0` instead of using a collapsed value.
+
+Recommended: initialize the CNN/fc1 backbone from the 93.6% pure-CE checkpoint.
+`--init-from` loads **only** `conv*/bn*/se*/fc1*`; the old classifier/token head
+and any prototype head are ignored.
 
 ```powershell
 python train.py `
   --data-dir Dataset `
   --device cuda `
-  --epochs 1 `
   --batch-size 128 `
+  --num-workers 8 `
   --model-width-scale 1.5 `
+  --init-from checkpoints/best_torch_model_with_pure_ce_loss.pt `
   --maol-warmup-epochs 5 `
   --maol-warmup-only `
   --checkpoint checkpoints/maol_model.pt `
   --maol-warmup-ckpt checkpoints/maol_warmup.pt `
-  --json-dir runs
+  --json-dir runs `
+  --no-early-stop
 ```
 
-This writes `checkpoints/maol_warmup.pt` (backbone + wells + statistics +
-margins) and a run directory under `runs/`.
+Without a pretrained checkpoint, warm-up uses `2 * lr[0]` by default.  You can
+override that with `--maol-warmup-lr`; from scratch, use 15-20 epochs.
+
+At the end, the sanity gate checks:
+
+```text
+val_acc >= 2 / num_classes
+d_inter >= d_intra
+q_max / q_median <= 10
+tau0 >= tau_floor
+```
+
+If any check fails, the run writes `warmup_diagnostics.json` and
+`warmup_rejected.json`, prints the failures, and exits with code `2`.  No valid
+`maol_warmup.pt` is saved; fix the initialization/epochs/LR and rerun.  Use
+`--no-maol-warmup-sanity` only for debugging.
 
 ### 2. Scale probe
 
-The probe starts from the warm-up checkpoint, runs exactly 100 optimizer steps
-with all lambdas at `1.0`, records the six loss means and gradient norms, and
-writes JSON only.  It does not save model weights.
+The probe starts from the warm-up checkpoint and runs exactly 100 steps.  By
+default it is **measurement-only** (`--maol-probe-no-update`): it never calls
+`optimizer.step()`, so it cannot damage the warm-up state.  Use
+`--maol-probe-update` to run a clipped 100-step trajectory instead.
 
 ```powershell
 python train.py `
   --data-dir Dataset `
   --device cuda `
+  --batch-size 128 `
+  --num-workers 8 `
   --maol-probe-only `
   --maol-probe-steps 100 `
+  --maol-probe-no-update `
   --maol-warmup-ckpt checkpoints/maol_warmup.pt `
   --checkpoint checkpoints/maol_model.pt `
   --json-dir runs
@@ -133,23 +170,23 @@ python train.py `
 
 Outputs:
 
-- `probe_metrics.jsonl`: one row per step with `loss`, `grad_h`,
-  `total_grad_norm`
-- `probe_summary.json`: means and a note that no model was saved
+- `probe_metrics.jsonl`: per-step `loss`, `grad_h`, `grad_param`,
+  `total_grad_norm` (pre-clip), `total_grad_norm_postclip`, `tau`, `lr`
+- `probe_summary.json`: mean/median/p90/min/max for each metric; per-term
+  gradients for `backbone`, `fc1`, `centers`, `radii`
 
-`grad_h` records each term's gradient norm w.r.t. the shared embedding `h`.
-`L_nest`, `L_cov`, and `L_center` do not depend on `h`, so their `grad_h` is
-`0`; their scale is visible through `loss`.
+`grad_h` is the gradient norm w.r.t. the shared embedding `h`.  `L_nest`,
+`L_cov`, `L_center` have zero `grad_h` by construction; inspect their
+`grad_param` (centers/radii) and loss instead.
 
-Lambda guidance from the theory/probe plan:
+Lambda guidance:
 
 - If a term's `grad_h` is more than 10x `CE`, lower its lambda to `0.1` or
   `0.01`.
 - If a term's `grad_h` is more than 100x smaller than `CE`, raise its lambda to
   `2-5`.
 - Target: all six terms within roughly one order of magnitude.
-- `L_sep` is noisy early because batch means are noisy; starting at `0.1` is
-  reasonable.
+- `L_sep` is noisy early; starting at `0.1` is reasonable.
 - `L_cov` and `L_center` are stability terms; keep them in `0.1-1.0`.
 
 ### 3. Full MAOL training
@@ -172,9 +209,11 @@ python train.py `
   --plot-real-time
 ```
 
-If `--maol-warmup-ckpt` exists, full training loads it and skips warm-up.  Use
-`--maol-force-warmup` to regenerate it.  Without the flag, a missing warm-up
-checkpoint is created automatically before full training.
+If `--maol-warmup-ckpt` exists, full training loads it, runs the same sanity
+gate on the validation split, and skips warm-up.  A failed gate exits with code
+`2` before any training step.  Use `--maol-force-warmup` to regenerate the
+checkpoint.  Without the flag, a missing warm-up checkpoint is created
+automatically and must pass the same gate before training starts.
 
 ## Inference
 

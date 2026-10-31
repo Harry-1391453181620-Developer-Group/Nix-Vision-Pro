@@ -27,8 +27,10 @@ MAOIDL, and the first full MAOL reconstruction on `main`.
 
 ## Validation
 
-- 32 focused tests passed.
+- 37 focused tests passed.
 - CPU smoke runs covered warm-up, probe, full training, and prediction.
+- Warm-up/probe hardening: tau fallback, hard sanity abort, clean warm-up,
+  backbone-only init, measurement-only probe, per-group gradients.
 
 ## Next Work
 

@@ -40,7 +40,7 @@ where it still fits the theory.
 
 ## Validation
 
-- `python -m pytest tests -q -p no:cacheprovider`: 32 passed.
+- `python -m pytest tests -q -p no:cacheprovider`: 37 passed.
 - Warm-up smoke (5 epochs, tiny nested dataset): warm-up checkpoint written.
 - Probe smoke (3 steps, shortened for CI): JSONL and summary written; no model
   file written.
@@ -54,5 +54,25 @@ where it still fits the theory.
 - The old 93.6% MAOIDL checkpoint can initialize only the CNN/fc1 backbone via
   `--init-from`; its token/linear head is skipped.
 - The GUI deliberately rejects old MAOIDL checkpoints.
-- `MAOL.docx` remains untracked locally pending the user's upload; it is not
-  added to `.gitignore` or `.stignore`.
+- `MAOL.docx` is tracked in git and not added to `.gitignore` or `.stignore`.
+
+## Follow-up: warm-up / probe hardening
+
+The first real warm-up exposed a collapsed tau (`1e-6`), an undertrained
+checkpoint (`8.97%` val_acc), `d_inter < d_intra`, and `q_max/q_median=107.6`.
+The probe also stepped with raw 253k gradients and reported a mean of 3444.
+
+Changes:
+
+- tau fallback to `1.0` when `tau_raw < 1e-2` or non-finite; log
+  `tau_raw/tau_used/tau_fallback`.
+- warm-up uses clean images by default; `--maol-warmup-augment` opts in.
+- `--init-from` now loads only `conv*/bn*/se*/fc1*`.
+- warm-up LR is `lr[0]` with pretrained init, `2*lr[0]` from scratch.
+- hard sanity gate (`val_acc`, `d_inter >= d_intra`, `q_max/q_median`,
+  `tau0`) with exit code 2 and `warmup_rejected.json`; the same gate runs when
+  loading an existing warm-up checkpoint.
+- probe defaults to `--maol-probe-no-update`; records pre/post-clip norms,
+  per-term gradients for backbone/fc1/centers/radii, and median/p90/max.
+- smoke-verified abort path, no-update probe, clipped update probe, and
+  backbone-only init. 37 tests pass.
