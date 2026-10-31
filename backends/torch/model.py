@@ -2,8 +2,8 @@
 
 The transformer branch, Omega projector, and IDSI instrumentation were removed
 when the project moved from MAOIDL to MAOL.  The model is a five-stage CNN with
-SE blocks; ``h`` is the 256-d ``fc1 + ReLU`` representation and the prototype
-head replaces the old linear classifier.
+SE blocks; ``h`` is the L2-normalized ``fc1 + ReLU`` representation and the
+prototype head replaces the old linear classifier.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from maol.head import PrototypeHead
@@ -36,6 +37,7 @@ class CheckpointRuntimeConfig:
     tree: ClassTree | None
     head_type: str
     embedding_dim: int
+    embedding_norm: str | None
     tau: float | None
     metadata: dict[str, Any]
 
@@ -192,6 +194,7 @@ def resolve_runtime_config_from_state(
         tree = None
 
     head_type = str(metadata_dict.get("head_type", "prototype" if prototype_centers is not None else "linear"))
+    embedding_norm = str(metadata_dict.get("embedding_norm", "raw")).strip().lower()
     embedding_dim = int(
         metadata_dict.get(
             "embedding_dim",
@@ -211,6 +214,7 @@ def resolve_runtime_config_from_state(
         tree=tree,
         head_type=head_type,
         embedding_dim=embedding_dim,
+        embedding_norm=embedding_norm,
         tau=tau,
         metadata=metadata_dict,
     )
@@ -411,10 +415,20 @@ class TorchCNN(nn.Module):
         x = self.pool5(self.se5(x))
         return x
 
-    def forward_embedding(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
+    def forward_raw_embedding(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
         x_tensor = self._normalize_runtime_input(x)
         features = self.forward_features(x_tensor)
         return torch.relu(self.fc1(torch.flatten(features, start_dim=1)))
+
+    def forward_embedding(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
+        """Return the L2-normalized embedding used by the head and all MAOL losses.
+
+        The backbone's raw ReLU scale is unbounded; normalizing here keeps the
+        classifier, wells, radii, quantiles, margins and tau in one unit-sphere
+        geometry.  This is parameter-free and does not add a layer.
+        """
+        raw = self.forward_raw_embedding(x)
+        return F.normalize(raw, p=2, dim=-1, eps=1e-6)
 
     def forward_with_representation(self, x: torch.Tensor | np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.forward_embedding(x)
@@ -444,6 +458,7 @@ class TorchCNN(nn.Module):
             "stage2_channels": int(self.stage2_channels),
             "stage_channels": list(self.stage_channels),
             "embedding_dim": int(self.embedding_dim),
+            "embedding_norm": "l2",
             "tau": float(self.head.tau.detach().cpu().item()),
             **({} if metadata is None else dict(metadata)),
         }

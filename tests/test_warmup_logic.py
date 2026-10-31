@@ -14,7 +14,13 @@ from backends.torch.train_backend import (
 from maol.stats import WarmupStats
 
 
-def _stats(*, d_intra: float = 0.5, d_inter: float = 1.0, q: list[float] | None = None) -> WarmupStats:
+def _stats(
+    *,
+    d_intra: float = 0.5,
+    d_inter: float = 1.0,
+    q: list[float] | None = None,
+    tau0: float = 0.25,
+) -> WarmupStats:
     q_values = q or [0.4, 0.5, 0.6]
     return WarmupStats(
         c_ema=torch.zeros((len(q_values), 2)),
@@ -27,8 +33,8 @@ def _stats(*, d_intra: float = 0.5, d_inter: float = 1.0, q: list[float] | None 
         m_max=0.9,
         k0=1.0,
         alpha=0.1,
-        tau0=0.25,
-        tau_warm=0.25,
+        tau0=tau0,
+        tau_warm=tau0,
         confusion=torch.zeros((len(q_values), len(q_values)), dtype=torch.long),
         w_vu=torch.ones(1),
         margins=torch.ones(1),
@@ -59,6 +65,8 @@ def test_sanity_gate_accepts_healthy_geometry() -> None:
         tau_floor=1e-2,
         acc_factor=2.0,
         max_q_ratio=10.0,
+        min_d_inter_ratio=1.3,
+        max_tau0=10.0,
     )
     assert diagnostics["passed"] is True
     assert diagnostics["failures"] == []
@@ -72,11 +80,28 @@ def test_sanity_gate_rejects_bad_geometry() -> None:
         tau_floor=1e-2,
         acc_factor=2.0,
         max_q_ratio=10.0,
+        min_d_inter_ratio=1.3,
+        max_tau0=10.0,
     )
     assert diagnostics["passed"] is False
     assert any("val_acc" in failure for failure in diagnostics["failures"])
     assert any("d_inter" in failure for failure in diagnostics["failures"])
     assert any("q_max/q_median" in failure for failure in diagnostics["failures"])
+
+
+def test_sanity_gate_rejects_tau0_ceiling() -> None:
+    diagnostics = _build_warmup_diagnostics(
+        _stats(tau0=1000.0),
+        val_acc=0.5,
+        num_classes=4,
+        tau_floor=1e-2,
+        acc_factor=2.0,
+        max_q_ratio=10.0,
+        min_d_inter_ratio=1.3,
+        max_tau0=10.0,
+    )
+    assert diagnostics["passed"] is False
+    assert any("tau_ceiling" in failure for failure in diagnostics["failures"])
 
 
 def test_value_summary_reports_median_and_tail() -> None:

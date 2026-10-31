@@ -511,12 +511,17 @@ def _build_warmup_diagnostics(
     tau_floor: float,
     acc_factor: float,
     max_q_ratio: float,
+    min_d_inter_ratio: float,
+    max_tau0: float,
     tau_fallback_epochs: int = 0,
 ) -> dict[str, Any]:
     q = stats.q.detach().float().cpu().numpy()
     q_median = float(np.median(q)) if q.size else 0.0
     q_max = float(np.max(q)) if q.size else 0.0
     q_ratio_value = float(q_max / q_median) if q_median > 0.0 else float("inf")
+    d_ratio_value = (
+        float(stats.d_inter / stats.d_intra) if stats.d_intra > 0.0 else float("inf")
+    )
     acc_threshold = float(acc_factor) / max(1, int(num_classes))
 
     checks = {
@@ -525,10 +530,10 @@ def _build_warmup_diagnostics(
             "threshold": acc_threshold,
             "passed": bool(np.isfinite(val_acc) and val_acc >= acc_threshold),
         },
-        "d_inter_ge_d_intra": {
-            "value": float(stats.d_inter),
-            "threshold": float(stats.d_intra),
-            "passed": bool(stats.d_inter >= stats.d_intra),
+        "d_inter_over_d_intra": {
+            "value": d_ratio_value,
+            "threshold": float(min_d_inter_ratio),
+            "passed": bool(np.isfinite(d_ratio_value) and d_ratio_value >= float(min_d_inter_ratio)),
         },
         "q_max_over_median": {
             "value": q_ratio_value,
@@ -540,20 +545,29 @@ def _build_warmup_diagnostics(
             "threshold": float(tau_floor),
             "passed": bool(stats.tau0 >= float(tau_floor)),
         },
+        "tau0_le_ceiling": {
+            "value": float(stats.tau0),
+            "threshold": float(max_tau0),
+            "passed": bool(np.isfinite(stats.tau0) and stats.tau0 <= float(max_tau0)),
+        },
     }
     failures: list[str] = []
     if not checks["val_acc"]["passed"]:
         failures.append(
             f"val_acc={val_acc:.4f} < {acc_threshold:.4f} (2/{num_classes})"
         )
-    if not checks["d_inter_ge_d_intra"]["passed"]:
-        failures.append(f"d_inter={stats.d_inter:.4f} < d_intra={stats.d_intra:.4f}")
+    if not checks["d_inter_over_d_intra"]["passed"]:
+        failures.append(
+            f"d_inter/d_intra={d_ratio_value:.3f} < {float(min_d_inter_ratio):.3f}"
+        )
     if not checks["q_max_over_median"]["passed"]:
         failures.append(
             f"q_max/q_median={q_ratio_value:.2f} > {float(max_q_ratio):.2f}"
         )
     if not checks["tau0_ge_floor"]["passed"]:
         failures.append(f"tau0={stats.tau0:.6g} < tau_floor={float(tau_floor):.6g}")
+    if not checks["tau0_le_ceiling"]["passed"]:
+        failures.append(f"tau0={stats.tau0:.6g} > tau_ceiling={float(max_tau0):.6g}")
 
     return {
         "passed": not failures,
@@ -564,6 +578,7 @@ def _build_warmup_diagnostics(
             "num_classes": int(num_classes),
             "d_intra": float(stats.d_intra),
             "d_inter": float(stats.d_inter),
+            "d_inter_over_d_intra": d_ratio_value,
             "q_median": q_median,
             "q_max": q_max,
             "q_max_over_median": q_ratio_value,
@@ -572,6 +587,8 @@ def _build_warmup_diagnostics(
             "tau_fallback_epochs": int(tau_fallback_epochs),
             "acc_factor": float(acc_factor),
             "max_q_ratio": float(max_q_ratio),
+            "min_d_inter_ratio": float(min_d_inter_ratio),
+            "max_tau0": float(max_tau0),
             "tau_floor": float(tau_floor),
         },
     }
@@ -593,6 +610,8 @@ def _check_warmup_or_abort(
         tau_floor=float(args.maol_tau_floor),
         acc_factor=float(args.maol_warmup_min_acc_factor),
         max_q_ratio=float(args.maol_warmup_max_q_ratio),
+        min_d_inter_ratio=float(args.maol_warmup_min_d_inter_ratio),
+        max_tau0=float(args.maol_warmup_max_tau0),
         tau_fallback_epochs=tau_fallback_epochs,
     )
     _write_json(run_dir / "warmup_diagnostics.json", diagnostics)
@@ -623,9 +642,9 @@ def run_warmup(
     warmup_lr = (
         float(args.maol_warmup_lr)
         if args.maol_warmup_lr is not None
-        else float(args.lr[0]) * (1.0 if args.init_from else 2.0)
+        else 2.0 * float(args.lr[0])
     )
-    print(f"Warm-up LR: {warmup_lr:.6f} (init_from={args.init_from is not None})")
+    print(f"Warm-up LR: {warmup_lr:.6f}")
     optimizer = _build_optimizer(args, model, lr_value=warmup_lr)
     amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
     scaler = _make_grad_scaler(device, amp_dtype)
@@ -795,30 +814,6 @@ def _save_warmup(
     )
 
 
-def _load_backbone_weights(model: TorchCNN, path: str | Path, device: torch.device) -> tuple[int, int]:
-    """Load only CNN/fc1 tensors from an old checkpoint.
-
-    Warm-up must recompute class means from the current backbone, so classifier
-    heads (old fc2/token head or a MAOL prototype head) are never loaded here.
-    """
-    state, _ = load_checkpoint_state(path, map_location=device)
-    current = model.state_dict()
-    allowed_prefixes = ("conv", "bn", "se", "fc1")
-    filtered: dict[str, torch.Tensor] = {}
-    skipped = 0
-    for key, value in state.items():
-        if not key.startswith(allowed_prefixes):
-            skipped += 1
-            continue
-        target = current.get(key)
-        if target is None or tuple(target.shape) != tuple(value.shape):
-            skipped += 1
-            continue
-        filtered[key] = value
-    model.load_state_dict(filtered, strict=False)
-    return len(filtered), skipped
-
-
 def _load_warmup(
     path: Path,
     index: DatasetIndex,
@@ -829,6 +824,10 @@ def _load_warmup(
     config_info = resolve_checkpoint_runtime_config(path, map_location=device)
     if config_info.tree is None:
         raise SystemExit(f"{path} is not a MAOL warm-up checkpoint (missing tree metadata)")
+    if config_info.head_type != "prototype" or config_info.embedding_norm != "l2":
+        raise SystemExit(
+            f"{path} predates the L2-normalized MAOL head; retrain it with the current code"
+        )
     if tuple(config_info.class_names) != tuple(index.class_names):
         raise SystemExit("Warm-up checkpoint class order does not match the current nested dataset")
     if config_info.tree.to_dict() != index.tree.to_dict():
@@ -1368,6 +1367,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--maol-warmup-min-acc-factor must be > 0")
     if args.maol_warmup_max_q_ratio <= 0.0:
         raise SystemExit("--maol-warmup-max-q-ratio must be > 0")
+    if args.maol_warmup_min_d_inter_ratio <= 0.0:
+        raise SystemExit("--maol-warmup-min-d-inter-ratio must be > 0")
+    if args.maol_warmup_max_tau0 <= 0.0:
+        raise SystemExit("--maol-warmup-max-tau0 must be > 0")
     if args.maol_warmup_lr is not None and args.maol_warmup_lr <= 0.0:
         raise SystemExit("--maol-warmup-lr must be > 0 when provided")
     for name in (
@@ -1463,7 +1466,6 @@ def main() -> None:
     parser.add_argument("--contrast", type=float, default=0.25)
     parser.add_argument("--saturation", type=float, default=0.25)
     parser.add_argument("--model-width-scale", type=float, default=1.5)
-    parser.add_argument("--init-from", type=str, default=None)
     parser.add_argument("--num-partitions", type=int, default=1)
     parser.add_argument("--partition", type=int, default=0)
     parser.add_argument("--auto-next-partition", action=argparse.BooleanOptionalAction, default=False)
@@ -1473,7 +1475,7 @@ def main() -> None:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--amp-mode", choices=["auto", "on", "off"], default="auto")
 
-    parser.add_argument("--maol-warmup-epochs", type=int, default=5)
+    parser.add_argument("--maol-warmup-epochs", type=int, default=15)
     parser.add_argument("--maol-warmup-only", action="store_true")
     parser.add_argument("--maol-force-warmup", action="store_true")
     parser.add_argument("--maol-warmup-ckpt", type=str, default=None)
@@ -1483,6 +1485,8 @@ def main() -> None:
     parser.add_argument("--maol-warmup-sanity", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--maol-warmup-min-acc-factor", type=float, default=2.0, help="Minimum warm-up val_acc as a multiple of 1/num_classes")
     parser.add_argument("--maol-warmup-max-q-ratio", type=float, default=10.0, help="Maximum q_max/q_median allowed after warm-up")
+    parser.add_argument("--maol-warmup-min-d-inter-ratio", type=float, default=1.3, help="Minimum d_inter/d_intra allowed after warm-up")
+    parser.add_argument("--maol-warmup-max-tau0", type=float, default=10.0, help="Maximum tau0 allowed after warm-up (unit-sphere scale)")
     parser.add_argument("--maol-probe-only", action="store_true")
     parser.add_argument("--maol-probe-steps", type=int, default=100)
     parser.add_argument("--maol-probe-output", type=str, default=None)
@@ -1629,14 +1633,6 @@ def main() -> None:
     )
     _move_module_to_device(model, device)
     print(f"Using stage_channels={model.stage_channels} width_scale={model.width_scale:.3f}")
-    if args.init_from:
-        loaded, skipped = _load_backbone_weights(model, args.init_from, device)
-        print(
-            f"Initialized backbone/fc1 tensors from {args.init_from}: "
-            f"loaded={loaded}, skipped={skipped} (classifier/head/token keys are not loaded)"
-        )
-        if loaded == 0:
-            print("[warn] no matching backbone tensors were loaded from --init-from")
 
     run_tag = "maol-probe" if args.maol_probe_only else ("maol-warmup" if args.maol_warmup_only else "maol")
     run_dir = Path(args.maol_probe_output) if args.maol_probe_output else _prepare_run_dir(args, run_tag, index)

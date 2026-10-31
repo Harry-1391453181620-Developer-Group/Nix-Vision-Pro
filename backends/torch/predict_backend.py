@@ -35,6 +35,10 @@ def load_maol_model(weights_path: str | Path, device: torch.device) -> TorchCNN:
             "This build supports MAOL prototype checkpoints only. "
             "Old MAOIDL checkpoints are intentionally not compatible."
         )
+    if config_info.embedding_norm != "l2":
+        raise SystemExit(
+            "This checkpoint predates the L2-normalized MAOL head; retrain it with the current code."
+        )
     model = TorchCNN(
         input_size=config_info.input_size,
         num_classes=config_info.num_classes,

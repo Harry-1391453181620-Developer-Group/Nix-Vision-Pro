@@ -14,8 +14,10 @@ from maol.tree import ClassTree
 class PrototypeHead(nn.Module):
     """Prototype classifier and well geometry for one MAOL class tree.
 
-    Only leaf centers and leaf radii are learnable.  Internal centers/radii are
-    derived bottom-up from child centers and the training sample counts ``n_u``.
+    The model passes a unit-norm embedding ``h``; centers are free parameters
+    normalized on read.  Only leaf centers and leaf radii are learnable;
+    internal centers/radii are derived bottom-up from child centers and the
+    training sample counts ``n_u``.
     """
 
     def __init__(
@@ -95,6 +97,11 @@ class PrototypeHead(nn.Module):
     def radii(self) -> torch.Tensor:
         return F.softplus(self.raw_radii) + self.eps
 
+    @property
+    def centers_hat(self) -> torch.Tensor:
+        """Unit-sphere centers used by the prototype head and all geometry losses."""
+        return F.normalize(self.centers, p=2, dim=-1, eps=self.eps)
+
     def set_trainable(self, trainable: bool) -> None:
         requires_grad = bool(trainable)
         self.centers.requires_grad_(requires_grad)
@@ -104,7 +111,13 @@ class PrototypeHead(nn.Module):
         if tuple(means.shape) != tuple(self.centers.shape):
             raise ValueError(f"Expected centers of shape {tuple(self.centers.shape)}, got {tuple(means.shape)}")
         with torch.no_grad():
-            self.centers.copy_(means.detach().to(device=self.centers.device, dtype=self.centers.dtype))
+            normalized = F.normalize(
+                means.detach().to(device=self.centers.device, dtype=self.centers.dtype),
+                p=2,
+                dim=-1,
+                eps=self.eps,
+            )
+            self.centers.copy_(normalized)
 
     def initialize_from_stats(
         self,
@@ -118,7 +131,7 @@ class PrototypeHead(nn.Module):
         with torch.no_grad():
             self.c_ema.copy_(c_ema)
             self.q.copy_(q)
-            self.centers.copy_(c_ema)
+            self.centers.copy_(F.normalize(c_ema, p=2, dim=-1, eps=self.eps))
             self.raw_radii.copy_(torch.log(torch.expm1(q)))
             self.tau.fill_(float(max(tau, self.eps)))
 
@@ -140,13 +153,14 @@ class PrototypeHead(nn.Module):
         """Return ``(centers, radii)`` for every node, with gradient paths to leaves."""
         dtype = self.centers.dtype
         device = self.centers.device
+        leaf_centers = self.centers_hat
         all_centers: list[torch.Tensor | None] = [None] * self.num_nodes
         all_radii: list[torch.Tensor | None] = [None] * self.num_nodes
 
         for node_index in self._compute_order:
             node = self.tree.nodes[node_index]
             if node.leaf_index is not None:
-                all_centers[node_index] = self.centers[node.leaf_index]
+                all_centers[node_index] = leaf_centers[node.leaf_index]
                 all_radii[node_index] = self.radii[node.leaf_index]
                 continue
 
@@ -173,7 +187,7 @@ class PrototypeHead(nn.Module):
     # ------------------------------------------------------------------
     def logits(self, h: torch.Tensor, *, tau: float | None = None) -> torch.Tensor:
         temperature = self.tau if tau is None else torch.as_tensor(float(tau), device=h.device, dtype=h.dtype)
-        centers = self.centers.to(dtype=h.dtype)
+        centers = self.centers_hat.to(dtype=h.dtype)
         h2 = torch.sum(h * h, dim=-1, keepdim=True)
         c2 = torch.sum(centers * centers, dim=-1).unsqueeze(0)
         cross = h @ centers.transpose(0, 1)
@@ -187,7 +201,7 @@ class PrototypeHead(nn.Module):
     # Losses
     # ------------------------------------------------------------------
     def intra_loss(self, h: torch.Tensor, labels: torch.Tensor, *, gamma: float = 0.5) -> torch.Tensor:
-        leaf_centers = self.centers[labels]
+        leaf_centers = self.centers_hat[labels]
         loss = torch.sum((h - leaf_centers) ** 2, dim=-1)
 
         ancestor_nodes = self._ancestor_nodes[labels].clamp_min(0)
@@ -263,7 +277,7 @@ class PrototypeHead(nn.Module):
         present = torch.unique(labels)
         if present.numel() == 0:
             return torch.zeros((), device=labels.device, dtype=self.centers.dtype)
-        gaps = self.centers[present] - self.c_ema.to(device=self.centers.device, dtype=self.centers.dtype)[present]
+        gaps = self.centers_hat[present] - self.c_ema.to(device=self.centers.device, dtype=self.centers.dtype)[present]
         return torch.sum(gaps * gaps, dim=-1).mean()
 
     @torch.no_grad()
@@ -288,9 +302,15 @@ class PrototypeHead(nn.Module):
             distances = torch.linalg.vector_norm(class_h - self.c_ema[class_index].float(), dim=-1)
             batch_q = torch.quantile(distances, 0.95, interpolation="linear")
             self.q[class_index] = float(m_q) * self.q[class_index] + (1.0 - float(m_q)) * batch_q
-            self.c_ema[class_index] = (
+            updated_mean = (
                 float(m) * self.c_ema[class_index] + (1.0 - float(m)) * batch_mean
             )
+            self.c_ema[class_index] = F.normalize(
+                updated_mean.unsqueeze(0),
+                p=2,
+                dim=-1,
+                eps=self.eps,
+            )[0]
 
     def extra_repr(self) -> str:
         return (

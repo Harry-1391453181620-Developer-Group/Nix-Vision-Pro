@@ -7,6 +7,7 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from maol.head import PrototypeHead
 from maol.tree import ClassTree
@@ -145,7 +146,8 @@ def compute_warmup_statistics(
         tree.num_leaves,
         head.embedding_dim,
     )
-    head.set_centers(means)
+    c_ema = F.normalize(means, p=2, dim=-1, eps=head.eps)
+    head.set_centers(c_ema)
     head.tau.fill_(1.0)
 
     distances: list[list[float]] = [[] for _ in range(tree.num_leaves)]
@@ -156,7 +158,7 @@ def compute_warmup_statistics(
         x = _prepare_input(x_cpu, device)
         y = y_cpu.to(device=device, dtype=torch.long)
         h = forward_embedding(x).detach().float()
-        class_means = means.to(device=h.device)
+        class_means = c_ema.to(device=h.device)
         distances_per_sample = torch.linalg.vector_norm(h - class_means[y], dim=-1)
         total_distance += float(distances_per_sample.sum().item())
         total_samples += int(y.numel())
@@ -195,7 +197,7 @@ def compute_warmup_statistics(
     q = torch.tensor(q_values, dtype=torch.float32, device=device)
 
     d_intra = float(total_distance / max(1, total_samples))
-    leaf_centers = means.detach().cpu()
+    leaf_centers = c_ema.detach().cpu()
     leaf_pairs = tree.leaf_sibling_pairs()
     if leaf_pairs:
         pair_distances = [
@@ -258,7 +260,7 @@ def compute_warmup_statistics(
     )
 
     return WarmupStats(
-        c_ema=means.detach().cpu(),
+        c_ema=c_ema.detach().cpu(),
         q=q.detach().cpu(),
         node_weights=node_weights,
         d_intra=d_intra,

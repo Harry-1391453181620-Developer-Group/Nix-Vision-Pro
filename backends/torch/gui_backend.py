@@ -407,6 +407,10 @@ class InferenceApp:
                     "This build supports MAOL prototype checkpoints only; "
                     "the old MAOIDL architecture is not loaded."
                 )
+            if config_info.embedding_norm != "l2":
+                raise ValueError(
+                    "This checkpoint predates the L2-normalized MAOL head; retrain it."
+                )
             model = load_maol_model(checkpoint, self.device)
             self.model = model
             self.weights_path = checkpoint

@@ -51,8 +51,8 @@ where it still fits the theory.
 
 ## Notes
 
-- The old 93.6% MAOIDL checkpoint can initialize only the CNN/fc1 backbone via
-  `--init-from`; its token/linear head is skipped.
+- MAOL warm-up and probe do not use a pretrained `--init-from`; the backbone
+  forms the unit-sphere geometry itself.
 - The GUI deliberately rejects old MAOIDL checkpoints.
 - `MAOL.docx` is tracked in git and not added to `.gitignore` or `.stignore`.
 
@@ -67,12 +67,23 @@ Changes:
 - tau fallback to `1.0` when `tau_raw < 1e-2` or non-finite; log
   `tau_raw/tau_used/tau_fallback`.
 - warm-up uses clean images by default; `--maol-warmup-augment` opts in.
-- `--init-from` now loads only `conv*/bn*/se*/fc1*`.
-- warm-up LR is `lr[0]` with pretrained init, `2*lr[0]` from scratch.
-- hard sanity gate (`val_acc`, `d_inter >= d_intra`, `q_max/q_median`,
-  `tau0`) with exit code 2 and `warmup_rejected.json`; the same gate runs when
-  loading an existing warm-up checkpoint.
+- `--init-from` was removed from warm-up/probe; MAOL warm-up starts from the
+  current backbone, default 15 epochs, LR `2*lr[0]`.
+- hard sanity gate (`val_acc`, `d_inter/d_intra >= 1.3`, `q_max/q_median`,
+  `tau_floor <= tau0 <= 10`) with exit code 2 and `warmup_rejected.json`; the
+  same gate runs when loading an existing warm-up checkpoint.
 - probe defaults to `--maol-probe-no-update`; records pre/post-clip norms,
   per-term gradients for backbone/fc1/centers/radii, and median/p90/max.
-- smoke-verified abort path, no-update probe, clipped update probe, and
-  backbone-only init. 37 tests pass.
+- smoke-verified abort path, no-update probe, and clipped update probe. 37 tests
+  pass.
+
+## Follow-up: L2-normalized embedding
+
+The second real warm-up (18 classes) produced `tau0=3.37e6`,
+`tau_warm=5.88e6`, `d_intra=1837`, `d_inter=2165`, and a sparse `c_EMA` with
+row norms ~6000–6660.  This was feature-scale explosion, not a tau arithmetic
+bug.  The model now applies parameter-free L2 normalization after `fc1+ReLU`;
+the prototype head, centers, radii, q, margins and all five geometry losses use
+the same unit-sphere `h`.  Centers are free parameters normalized on read.
+Checkpoints now record `embedding_norm=l2`; older raw-scale checkpoints are
+rejected and must be retrained.

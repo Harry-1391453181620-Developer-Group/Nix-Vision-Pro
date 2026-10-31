@@ -15,7 +15,7 @@ def _head() -> PrototypeHead:
     tree = ClassTree.from_leaf_paths(["animal/cat", "animal/dog", "plant"])
     head = PrototypeHead(tree, 2, node_weights=[4, 3, 2, 1, 1])
     with torch.no_grad():
-        head.centers.copy_(torch.tensor([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]]))
+        head.centers.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]))
         head.raw_radii.zero_()
     return head
 
@@ -23,9 +23,9 @@ def _head() -> PrototypeHead:
 def test_parent_geometry_is_weighted_bottom_up() -> None:
     head = _head()
     centers, radii = head.node_geometry()
-    # animal = (2*cat + 1*dog)/3 = (2/3, 0); root = (3*animal + plant)/4
-    assert torch.allclose(centers[1], torch.tensor([2.0 / 3.0, 0.0]), atol=1e-6)
-    assert torch.allclose(centers[0], torch.tensor([0.5, 0.5]), atol=1e-6)
+    # animal = (2*cat + 1*dog)/3 = (2/3, 1/3); root = (3*animal + plant)/4
+    assert torch.allclose(centers[1], torch.tensor([2.0 / 3.0, 1.0 / 3.0]), atol=1e-6)
+    assert torch.allclose(centers[0], torch.tensor([0.25, 0.25]), atol=1e-6)
     assert radii.shape == (5,)
     assert torch.all(radii > 0)
 

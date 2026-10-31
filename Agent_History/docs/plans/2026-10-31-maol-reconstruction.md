@@ -11,8 +11,9 @@
 - Keep only the five-stage CNN + SE backbone.  Remove the token/Transformer path,
   Omega loss/projector, IDSI loss/projections, MixUp, CutMix, focal loss, label
   smoothing, and the NumPy backend.
-- Use leaf wells + deterministic parent geometry.  `h` is the 256-d
-  `fc1 + ReLU` representation; the prototype head replaces the linear head.
+- Use leaf wells + deterministic parent geometry.  `h` is the parameter-free
+  L2-normalized `fc1 + ReLU` representation; the prototype head replaces the
+  linear head.
 - Warm-up follows the B1 variant:
   - at each epoch start, recompute leaf centers from the current backbone;
   - centers are frozen (`requires_grad=False`) during warm-up;

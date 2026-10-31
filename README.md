@@ -75,7 +75,7 @@ The current dataset has 18 leaf classes and 34,233 images.
 
 - Five stages: `Conv -> BN -> ReLU -> Conv -> BN -> ReLU -> SE -> MaxPool`
 - Width scale over `(32, 64, 128, 256, 256)`; default `1.5`
-- `h = ReLU(fc1(flatten(features)))`, 256-d
+- `h = L2Normalize(ReLU(fc1(flatten(features))))`, unit norm; the classifier and all geometry losses use this same normalized `h`
 - `PrototypeHead` with 18 leaf wells (current dataset)
 - Input `224 x 224`, total stride `/32`
 - No transformer, no Omega projector, no IDSI projections, no linear classifier
@@ -104,15 +104,14 @@ Syncthing and locally on CPU for smoke tests.
 
 ### 1. Warm-up only
 
-Warm-up must be at least 5 epochs.  It uses clean images by default (RandAugment
-is off), recomputes leaf centers at every epoch, and freezes them.  `tau` is
-fixed at `1.0` for the first 100 iterations; afterwards the measured `tau_warm`
-is used.  If `tau_warm < --maol-tau-floor` (default `1e-2`), the code falls back
-to `tau=1.0` instead of using a collapsed value.
+Warm-up must be at least 5 epochs; the default is 15 because MAOL warm-up does
+**not** use a pretrained `--init-from` backbone.  It uses clean images by
+default (RandAugment is off), recomputes leaf centers at every epoch, and freezes
+them.  `tau` is fixed at `1.0` for the first 100 iterations; afterwards the
+measured `tau_warm` is used.  If `tau_warm < --maol-tau-floor` (default `1e-2`),
+the code falls back to `tau=1.0` instead of using a collapsed value.
 
-Recommended: initialize the CNN/fc1 backbone from the 93.6% pure-CE checkpoint.
-`--init-from` loads **only** `conv*/bn*/se*/fc1*`; the old classifier/token head
-and any prototype head are ignored.
+Warm-up LR defaults to `2 * lr[0]`; override with `--maol-warmup-lr`.
 
 ```powershell
 python train.py `
@@ -121,8 +120,7 @@ python train.py `
   --batch-size 128 `
   --num-workers 8 `
   --model-width-scale 1.5 `
-  --init-from checkpoints/best_torch_model_with_pure_ce_loss.pt `
-  --maol-warmup-epochs 5 `
+  --maol-warmup-epochs 15 `
   --maol-warmup-only `
   --checkpoint checkpoints/maol_model.pt `
   --maol-warmup-ckpt checkpoints/maol_warmup.pt `
@@ -130,22 +128,19 @@ python train.py `
   --no-early-stop
 ```
 
-Without a pretrained checkpoint, warm-up uses `2 * lr[0]` by default.  You can
-override that with `--maol-warmup-lr`; from scratch, use 15-20 epochs.
-
 At the end, the sanity gate checks:
 
 ```text
 val_acc >= 2 / num_classes
-d_inter >= d_intra
+d_inter / d_intra >= 1.3
 q_max / q_median <= 10
-tau0 >= tau_floor
+tau_floor <= tau0 <= 10
 ```
 
 If any check fails, the run writes `warmup_diagnostics.json` and
 `warmup_rejected.json`, prints the failures, and exits with code `2`.  No valid
-`maol_warmup.pt` is saved; fix the initialization/epochs/LR and rerun.  Use
-`--no-maol-warmup-sanity` only for debugging.
+`maol_warmup.pt` is saved; fix the epoch count, LR, or feature scale and rerun.
+Use `--no-maol-warmup-sanity` only for debugging.
 
 ### 2. Scale probe
 
@@ -222,9 +217,9 @@ python predict.py Dataset/living-matters/animals/cat/0001.jpg `
   --weights checkpoints/maol_model.pt --probabilities --top-k 3 --device cuda
 ```
 
-Only MAOL prototype checkpoints are accepted.  Old MAOIDL token/linear
-checkpoints intentionally fail with a clear message; the old architecture is not
-part of this build.
+Only MAOL prototype checkpoints with `embedding_norm=l2` are accepted.  Old
+MAOIDL token/linear checkpoints and old raw-scale MAOL checkpoints fail with a
+clear message; the old architectures are not part of this build.
 
 ## GUI
 
@@ -272,16 +267,8 @@ python train.py ... --plot-real-time
 - Temporary backbone freeze is optional and **off by default**.
 - AMP is supported with `--amp-mode {auto,on,off}`.
 - Checkpoints are loaded with `weights_only=True`; load only trusted files.
-
-## Initializing from the old CNN backbone
-
-`--init-from` accepts an old MAOIDL checkpoint and loads only matching backbone
-tensors (the old token/linear head is skipped).  This is useful for starting MAOL
-from the 93.6% pure-CE CNN backbone.
-
-```powershell
-python train.py ... --init-from checkpoints/best_torch_model_with_pure_ce_loss.pt
-```
+- Warm-up and probe do **not** use `--init-from`; MAOL starts from the current
+  backbone and forms the unit-sphere geometry itself.
 
 ## Tests
 
