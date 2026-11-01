@@ -1,4 +1,4 @@
-"""MAOL inference backend (CNN prototype head only)."""
+"""Inference backend for MAOL prototype and CE linear checkpoints."""
 
 from __future__ import annotations
 
@@ -28,12 +28,55 @@ def _resolve_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def load_model(weights_path: str | Path, device: torch.device) -> TorchCNN:
+    """Load either a MAOL prototype checkpoint or a CE linear checkpoint."""
+    config_info = resolve_checkpoint_runtime_config(weights_path, map_location=device)
+    if config_info.head_type == "prototype":
+        if config_info.embedding_norm != "l2":
+            raise SystemExit(
+                "This checkpoint predates the L2-normalized MAOL head; retrain it with the current code."
+            )
+        model = TorchCNN(
+            input_size=config_info.input_size,
+            num_classes=config_info.num_classes,
+            tree=config_info.tree,
+            width_scale=config_info.width_scale,
+            embedding_dim=config_info.embedding_dim,
+            seed=42,
+        )
+    elif config_info.head_type == "linear":
+        if config_info.metadata.get("maol") is not False:
+            raise SystemExit(
+                "This linear checkpoint is not a CE-control checkpoint from the current code; "
+                "retrain it with --maol-mode none."
+            )
+        model = TorchCNN(
+            input_size=config_info.input_size,
+            num_classes=config_info.num_classes,
+            tree=config_info.tree,
+            maol=False,
+            class_names=config_info.class_names or None,
+            width_scale=config_info.width_scale,
+            embedding_dim=config_info.embedding_dim,
+            seed=42,
+        )
+    else:
+        raise SystemExit(
+            "This build supports MAOL prototype checkpoints and CE linear controls only."
+        )
+    model.load_weights(weights_path, map_location=device, strict=True)
+    model.to(device)
+    model.eval()
+    return model
+
+
 def load_maol_model(weights_path: str | Path, device: torch.device) -> TorchCNN:
+    """Load a MAOL checkpoint for the GUI; linear CE controls are rejected here."""
     config_info = resolve_checkpoint_runtime_config(weights_path, map_location=device)
     if config_info.head_type != "prototype" or config_info.tree is None:
         raise SystemExit(
-            "This build supports MAOL prototype checkpoints only. "
-            "Old MAOIDL checkpoints are intentionally not compatible."
+            "This build's GUI supports MAOL prototype checkpoints only. "
+            "Use predict.py for a CE linear control checkpoint."
         )
     if config_info.embedding_norm != "l2":
         raise SystemExit(
@@ -54,9 +97,9 @@ def load_maol_model(weights_path: str | Path, device: torch.device) -> TorchCNN:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Predict one image with a MAOL prototype checkpoint")
+    parser = argparse.ArgumentParser(description="Predict one image with a MAOL or CE linear checkpoint")
     parser.add_argument("image", type=str, help="Path to image file")
-    parser.add_argument("--weights", type=str, required=True, help="MAOL .pt/.pth checkpoint")
+    parser.add_argument("--weights", type=str, required=True, help="MAOL or CE linear .pt/.pth checkpoint")
     parser.add_argument("--probabilities", action="store_true")
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -70,7 +113,7 @@ def main() -> None:
         raise SystemExit(f"Weights not found: {weights_path}")
 
     device = _resolve_device(args.device)
-    model = load_maol_model(weights_path, device)
+    model = load_model(weights_path, device)
     image = load_image(image_path)
     x = preprocess_image(
         image,

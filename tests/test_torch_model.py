@@ -61,3 +61,39 @@ def test_maol_model_forward_and_checkpoint_round_trip() -> None:
     model.eval()
     with torch.no_grad():
         assert torch.allclose(model(x), restored(x), atol=1e-6)
+
+
+def test_linear_control_head_uses_raw_embedding() -> None:
+    tree = _tree()
+    model = TorchCNN(
+        input_size=(64, 64),
+        num_classes=3,
+        tree=tree,
+        maol=False,
+        class_names=["cat", "dog", "plant"],
+        seed=7,
+        width_scale=0.75,
+    )
+    x = torch.randn(2, 3, 64, 64)
+    logits = model(x)
+    h = model.forward_embedding(x)
+    assert tuple(logits.shape) == (2, 3)
+    assert "fc2.weight" in model.state_dict()
+    assert "head.centers" not in model.state_dict()
+    assert not torch.allclose(torch.linalg.vector_norm(h, dim=-1), torch.ones(2), atol=1e-3)
+
+    checkpoint = workspace_tmp_path("maol_models") / "ce_linear.pt"
+    model.save_weights(checkpoint)
+    state, metadata = load_checkpoint_state(checkpoint)
+    assert metadata["head_type"] == "linear"
+    assert metadata["theory"] == "CE"
+    assert metadata["embedding_norm"] == "raw"
+    assert metadata["maol"] is False
+    assert "fc2.weight" in state
+    assert "head.centers" not in state
+
+    runtime = resolve_checkpoint_runtime_config(checkpoint)
+    assert runtime.head_type == "linear"
+    assert runtime.embedding_norm == "raw"
+    assert runtime.num_classes == 3
+    assert runtime.class_names == ("cat", "dog", "plant")

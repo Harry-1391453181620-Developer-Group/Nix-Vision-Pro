@@ -46,7 +46,7 @@ def load_checkpoint_state(
     path: str | Path,
     map_location: str | torch.device | None = None,
 ) -> tuple[Mapping[str, torch.Tensor], dict[str, Any]]:
-    """Load a structured MAOL checkpoint with ``weights_only=True``."""
+    """Load a structured MAOL/CE checkpoint with ``weights_only=True``."""
     checkpoint = Path(path).resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
@@ -238,24 +238,28 @@ class SqueezeExcitation(nn.Module):
 
 
 class TorchCNN(nn.Module):
-    """Five-stage CNN + SE backbone with a MAOL prototype classifier."""
+    """Five-stage CNN + SE backbone with a MAOL prototype or CE linear head."""
 
     def __init__(
         self,
         input_size: Tuple[int, int],
         num_classes: int,
-        tree: ClassTree | None,
+        tree: ClassTree | None = None,
         *,
+        maol: bool = True,
+        class_names: Iterable[str] | None = None,
         seed: int | None = None,
         width_scale: float = 0.75,
         embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         node_weights: Iterable[float] | None = None,
     ):
         super().__init__()
-        if tree is None:
-            raise ValueError("MAOL requires a class tree")
-        if int(num_classes) != tree.num_leaves:
-            raise ValueError(f"num_classes={num_classes} does not match tree leaves={tree.num_leaves}")
+        self.maol = bool(maol)
+        if self.maol:
+            if tree is None:
+                raise ValueError("MAOL requires a class tree")
+            if int(num_classes) != tree.num_leaves:
+                raise ValueError(f"num_classes={num_classes} does not match tree leaves={tree.num_leaves}")
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
@@ -303,11 +307,15 @@ class TorchCNN(nn.Module):
 
         feat_h, feat_w = height // 32, width // 32
         self.fc1 = nn.Linear(feat_h * feat_w * c5, int(embedding_dim))
-        self.head = PrototypeHead(
-            tree,
-            int(embedding_dim),
-            node_weights=list(node_weights) if node_weights is not None else None,
-        )
+        if self.maol:
+            self.head: PrototypeHead | None = PrototypeHead(
+                tree,
+                int(embedding_dim),
+                node_weights=list(node_weights) if node_weights is not None else None,
+            )
+        else:
+            self.head = None
+            self.fc2 = nn.Linear(int(embedding_dim), int(num_classes))
 
         self._input_size = tuple(input_size)
         self._num_classes = int(num_classes)
@@ -315,7 +323,14 @@ class TorchCNN(nn.Module):
         self._stage2_channels = int(c2)
         self._embedding_dim = int(embedding_dim)
         self.tree = tree
-        self.class_names = tuple(tree.class_names)
+        if class_names is not None:
+            self.class_names = tuple(str(name) for name in class_names)
+        elif tree is not None:
+            self.class_names = tuple(tree.class_names)
+        else:
+            self.class_names = tuple(f"class-{index}" for index in range(int(num_classes)))
+        if len(self.class_names) != int(num_classes):
+            raise ValueError("class_names must contain one name per class")
 
     # ------------------------------------------------------------------
     # Properties and module groups
@@ -358,7 +373,10 @@ class TorchCNN(nn.Module):
                 self.bn6, self.bn7, self.bn8, self.bn9, self.bn10)
 
     def head_modules(self) -> tuple[nn.Module, ...]:
-        return (self.fc1, self.head)
+        if self.maol:
+            assert self.head is not None
+            return (self.fc1, self.head)
+        return (self.fc1, self.fc2)
 
     def iter_head_parameters(self) -> Iterable[nn.Parameter]:
         for module in self.head_modules():
@@ -421,21 +439,28 @@ class TorchCNN(nn.Module):
         return torch.relu(self.fc1(torch.flatten(features, start_dim=1)))
 
     def forward_embedding(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Return the L2-normalized embedding used by the head and all MAOL losses.
+        """Return the representation consumed by the classifier.
 
-        The backbone's raw ReLU scale is unbounded; normalizing here keeps the
-        classifier, wells, radii, quantiles, margins and tau in one unit-sphere
-        geometry.  This is parameter-free and does not add a layer.
+        MAOL uses the L2-normalized unit-sphere embedding; the CE control keeps
+        the raw ReLU embedding and a linear head.
         """
         raw = self.forward_raw_embedding(x)
+        if not self.maol:
+            return raw
         return F.normalize(raw, p=2, dim=-1, eps=1e-6)
 
     def forward_with_representation(self, x: torch.Tensor | np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.forward_embedding(x)
-        return self.head.logits(h), h
+        if self.maol:
+            assert self.head is not None
+            return self.head.logits(h), h
+        return self.fc2(h), h
 
     def forward(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
-        return self.head.logits(self.forward_embedding(x))
+        if self.maol:
+            assert self.head is not None
+            return self.head.logits(self.forward_embedding(x))
+        return self.fc2(self.forward_embedding(x))
 
     # ------------------------------------------------------------------
     # Checkpoints
@@ -447,19 +472,20 @@ class TorchCNN(nn.Module):
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         payload_metadata = {
             "checkpoint_version": 3,
-            "theory": "MAOL",
-            "head_type": "prototype",
+            "theory": "MAOL" if self.maol else "CE",
+            "head_type": "prototype" if self.maol else "linear",
             "backend": "torch",
             "num_classes": int(self.num_classes),
             "class_names": list(self.class_names),
-            "tree": self.tree.to_dict(),
+            "tree": self.tree.to_dict() if self.tree is not None else None,
             "input_size": list(self.input_size),
             "width_scale": float(self.width_scale),
             "stage2_channels": int(self.stage2_channels),
             "stage_channels": list(self.stage_channels),
             "embedding_dim": int(self.embedding_dim),
-            "embedding_norm": "l2",
-            "tau": float(self.head.tau.detach().cpu().item()),
+            "embedding_norm": "l2" if self.maol else "raw",
+            "maol": bool(self.maol),
+            "tau": float(self.head.tau.detach().cpu().item()) if self.head is not None else None,
             **({} if metadata is None else dict(metadata)),
         }
         payload = {"model": self.state_dict(), "meta": payload_metadata}

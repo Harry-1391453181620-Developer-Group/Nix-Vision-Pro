@@ -1,10 +1,14 @@
-"""PyTorch training backend for MAOL (CNN-only).
+"""PyTorch training backend for MAOL (CNN-only) and the CE linear control.
 
-Workflow:
+MAOL workflow:
 1. Warm-up on the prototype head with epoch-wise class means and CE only.
 2. Save a warm-up checkpoint containing backbone, wells, statistics and margins.
 3. Optional scale probe from that checkpoint (100 steps, six loss terms + grads).
 4. Full MAOL training from the warm-up checkpoint with tuned lambdas.
+
+CE control (`--maol-mode none`):
+- raw ``fc1 + ReLU`` embedding, ``Linear(256, N)`` head, CE only;
+- no warm-up/probe, optional EMA, same schedule/augmentation as MAOL.
 """
 
 from __future__ import annotations
@@ -747,6 +751,46 @@ def run_warmup(
     return stats, rows
 
 
+@torch.no_grad()
+def evaluate_linear_loader(
+    model: torch.nn.Module,
+    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None,
+    device: torch.device,
+    *,
+    class_weights: torch.Tensor | None,
+    amp_dtype: torch.dtype | None,
+) -> dict[str, float]:
+    """CE-only evaluation for the no-MAOL linear control."""
+    if loader is None or len(cast(Sized, loader.dataset)) == 0:
+        return _empty_metrics()
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    count = 0
+    for x_cpu, y_cpu in loader:
+        x, y = _move_batch(x_cpu, y_cpu, device)
+        with _autocast(device, amp_dtype):
+            logits = cast(TorchCNN, model)(x)
+            loss = F.cross_entropy(logits, y, weight=class_weights)
+        total_loss += float(loss.item())
+        batch_correct, batch_count = _accuracy(logits, y)
+        correct += batch_correct
+        count += batch_count
+    batches = max(1, len(loader))
+    mean_loss = total_loss / batches
+    return {
+        "loss_total": mean_loss,
+        "loss_ce": mean_loss,
+        "loss_intra": 0.0,
+        "loss_sep": 0.0,
+        "loss_nest": 0.0,
+        "loss_cov": 0.0,
+        "loss_center": 0.0,
+        "acc": correct / max(1, count),
+        "gradient_norm": float("nan"),
+    }
+
+
 def _checkpoint_metadata(
     model: TorchCNN,
     stats: WarmupStats,
@@ -756,6 +800,8 @@ def _checkpoint_metadata(
     best_epoch: int,
 ) -> dict[str, Any]:
     return {
+        "stage": "maol",
+        "maol_mode": "full",
         "is_ema": bool(is_ema),
         "ema_decay": float(args.ema_decay) if is_ema else None,
         "best_epoch": int(best_epoch),
@@ -774,6 +820,24 @@ def _checkpoint_metadata(
             "mbase_scale": float(args.maol_mbase_scale),
             "mmax_scale": float(args.maol_mmax_scale),
         },
+    }
+
+
+def _linear_checkpoint_metadata(
+    args: argparse.Namespace,
+    *,
+    is_ema: bool,
+    best_epoch: int,
+) -> dict[str, Any]:
+    return {
+        "stage": "ce",
+        "theory": "CE",
+        "maol_mode": "none",
+        "maol": False,
+        "is_ema": bool(is_ema),
+        "ema_decay": float(args.ema_decay) if is_ema else None,
+        "best_epoch": int(best_epoch),
+        "class_weighting": bool(args.class_weighting),
     }
 
 
@@ -1215,10 +1279,6 @@ def _run_training(
             else val_acc > (previous_best_acc + float(args.min_delta))
         )
         if improved:
-            if args.early_stop_metric == "val_loss":
-                best_val_loss = val_loss
-            else:
-                best_val_acc = val_acc
             best_epoch = epoch + 1
             bad_epochs = 0
             checkpoint_model = eval_model
@@ -1228,10 +1288,8 @@ def _run_training(
             )
         else:
             bad_epochs += 1
-            if args.early_stop_metric != "val_loss":
-                best_val_loss = min(best_val_loss, val_loss)
-            if args.early_stop_metric != "val_acc":
-                best_val_acc = max(best_val_acc, val_acc)
+        best_val_loss = min(best_val_loss, val_loss)
+        best_val_acc = max(best_val_acc, val_acc)
 
         if args.freeze_enabled and val_loader is not None:
             if backbone_frozen:
@@ -1318,6 +1376,7 @@ def _run_training(
     summary = {
         "run_dir": str(run_dir),
         "checkpoint": str(Path(args.checkpoint).resolve()),
+        "maol_mode": "full",
         "best_epoch": int(best_epoch),
         "best_val_acc": float(best_val_acc),
         "best_val_loss": float(best_val_loss),
@@ -1336,6 +1395,249 @@ def _run_training(
     return summary
 
 
+def _run_linear_training(
+    model: TorchCNN,
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] | None,
+    args: argparse.Namespace,
+    device: torch.device,
+    run_dir: Path,
+    *,
+    class_weights: torch.Tensor | None,
+) -> dict[str, Any]:
+    """CE-only linear-head control (no wells, no geometry losses, no L2)."""
+    metrics_path = run_dir / "epoch_metrics.jsonl"
+    summary_path = run_dir / "summary.json"
+    if metrics_path.exists():
+        metrics_path.unlink()
+    plotter = _build_plotter(metrics_path, args) if args.plot_real_time else None
+    metric_rows: list[dict[str, Any]] = []
+
+    ema: ModelEMA | None = None
+    if args.ema:
+        ema_model = TorchCNN(
+            input_size=model.input_size,
+            num_classes=model.num_classes,
+            tree=model.tree,
+            maol=False,
+            class_names=model.class_names,
+            seed=args.seed,
+            width_scale=model.width_scale,
+            embedding_dim=model.embedding_dim,
+        )
+        _move_module_to_device(ema_model, device)
+        for parameter in ema_model.parameters():
+            parameter.requires_grad_(False)
+        ema_model.eval()
+        ema = ModelEMA(
+            ema_model,
+            decay=float(args.ema_decay),
+            phase_warmup_steps=max(1, len(train_loader)),
+            skip_prefixes=(),
+        )
+        ema.sync_from(model)
+
+    optimizer = _build_optimizer(args, model, lr_value=float(args.lr[0]))
+    amp_dtype = _resolve_amp_dtype(device, args.amp_mode)
+    scaler = _make_grad_scaler(device, amp_dtype)
+    phase_map = build_epoch_phase_map(int(args.epochs), int(args.phase_count))
+    current_phase = -1
+    phase_base_lr = float(args.lr[0])
+    phase_offset = 0.0
+    current_lr = phase_base_lr
+
+    best_val_acc = 0.0
+    best_val_loss = float("inf")
+    best_epoch = 0
+    bad_epochs = 0
+    final_metrics: dict[str, Any] = {}
+    num_batches = max(1, len(train_loader))
+
+    for epoch in range(int(args.epochs)):
+        phase = phase_map[epoch]
+        if phase.phase_index != current_phase:
+            current_phase = phase.phase_index
+            phase_base_lr = float(args.lr[current_phase])
+            phase_offset = 0.0
+            model.train()
+            optimizer = _build_optimizer(args, model, lr_value=phase_base_lr)
+            scaler = _make_grad_scaler(device, amp_dtype)
+            print(f"[phase {current_phase + 1}/{args.phase_count}] base_lr={phase_base_lr:.6f}")
+
+        model.train()
+        epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_count = 0
+        grad_norm_total = 0.0
+        grad_norm_count = 0
+        hidden_norm_total = 0.0
+        hidden_norm_count = 0
+
+        for batch_index, (x_cpu, y_cpu) in enumerate(train_loader):
+            x, y = _move_batch(x_cpu, y_cpu, device)
+            scheduled_lr = compute_phase_learning_rate(
+                base_lr=phase_base_lr,
+                schedule=args.lr_schedule,
+                min_lr_ratio=float(args.min_lr_ratio),
+                gamma=float(args.gamma),
+                step_size=int(args.step_size),
+                warmup_epochs=int(args.warmup_epochs),
+                epoch_index_in_phase=phase.epoch_index_in_phase,
+                epochs_in_phase=phase.epochs_in_phase,
+                batch_index=batch_index,
+                num_batches=num_batches,
+            )
+            current_lr = compute_effective_learning_rate(
+                scheduled_lr,
+                phase_offset,
+                phase_base_lr,
+                float(args.min_lr_ratio),
+            )
+            _set_optimizer_lr(optimizer, current_lr)
+            optimizer.zero_grad(set_to_none=True)
+            with _autocast(device, amp_dtype):
+                h = model.forward_embedding(x)
+                logits = model.fc2(h)
+                loss = F.cross_entropy(logits, y, weight=class_weights)
+            gradient_norm = _backward_and_step(
+                loss,
+                optimizer,
+                model,
+                grad_clip=float(args.grad_clip),
+                scaler=scaler,
+            )
+            if not np.isnan(gradient_norm):
+                grad_norm_total += gradient_norm
+                grad_norm_count += 1
+            hidden_norm_total += float(torch.linalg.vector_norm(h.detach().float(), dim=-1).mean().item())
+            hidden_norm_count += 1
+            if ema is not None:
+                ema.update(model, step_in_phase=phase.epoch_index_in_phase * num_batches + batch_index)
+
+            epoch_loss += float(loss.item())
+            batch_correct, batch_count = _accuracy(logits, y)
+            epoch_correct += batch_correct
+            epoch_count += batch_count
+
+        train_acc = epoch_correct / max(1, epoch_count)
+        train_loss = epoch_loss / num_batches
+        eval_model = ema.ema_model if ema is not None else model
+        val = evaluate_linear_loader(
+            eval_model,
+            val_loader,
+            device,
+            class_weights=class_weights,
+            amp_dtype=amp_dtype,
+        )
+        val_acc = val["acc"]
+        val_loss = val["loss_total"]
+        previous_best_acc = best_val_acc
+        if not np.isnan(val_acc):
+            best_val_acc = max(best_val_acc, val_acc)
+        improved = (
+            val_loss < (best_val_loss - float(args.min_delta))
+            if args.early_stop_metric == "val_loss"
+            else val_acc > (previous_best_acc + float(args.min_delta))
+        )
+        if improved:
+            best_epoch = epoch + 1
+            bad_epochs = 0
+            eval_model.save_weights(
+                Path(args.checkpoint),
+                metadata=_linear_checkpoint_metadata(
+                    args,
+                    is_ema=ema is not None,
+                    best_epoch=best_epoch,
+                ),
+            )
+        else:
+            bad_epochs += 1
+        best_val_loss = min(best_val_loss, val_loss)
+        best_val_acc = max(best_val_acc, val_acc)
+
+        gap = train_acc - val_acc
+        final_metrics = {
+            "epoch": epoch + 1,
+            "phase": current_phase + 1,
+            "maol_mode": "none",
+            "lr": float(current_lr),
+            "train_loss_total": float(train_loss),
+            "train_loss_ce": float(train_loss),
+            "train_loss_intra": 0.0,
+            "train_loss_sep": 0.0,
+            "train_loss_nest": 0.0,
+            "train_loss_cov": 0.0,
+            "train_loss_center": 0.0,
+            "train_acc": float(train_acc),
+            "val_loss_total": float(val_loss),
+            "val_loss_ce": float(val_loss),
+            "val_loss_intra": 0.0,
+            "val_loss_sep": 0.0,
+            "val_loss_nest": 0.0,
+            "val_loss_cov": 0.0,
+            "val_loss_center": 0.0,
+            "val_acc": float(val_acc),
+            "generalization_gap": float(gap),
+            "gradient_norm": float(grad_norm_total / max(1, grad_norm_count)),
+            "hidden_norm": float(hidden_norm_total / max(1, hidden_norm_count)),
+            "tau": 0.0,
+            "d_intra": 0.0,
+            "d_inter": 0.0,
+            "margin_cap": 0.0,
+            "mean_leaf_radius": 0.0,
+            "mean_leaf_center_norm": 0.0,
+            "lambda_intra": 0.0,
+            "lambda_sep": 0.0,
+            "lambda_nest": 0.0,
+            "lambda_cov": 0.0,
+            "lambda_center": 0.0,
+            "improved": bool(improved),
+            "backbone_frozen": False,
+        }
+        metric_rows.append(final_metrics)
+        _append_jsonl(metrics_path, final_metrics)
+        if plotter is not None:
+            plotter.update(metric_rows)
+        print(
+            f"[epoch {epoch + 1}/{args.epochs}] lr={current_lr:.6f} "
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} gap={gap:.3f}"
+            + (" *" if improved else "")
+        )
+        if args.early_stop and bad_epochs >= int(args.patience):
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+    if val_loader is None or len(cast(Sized, val_loader.dataset)) == 0:
+        model.save_weights(
+            Path(args.checkpoint),
+            metadata=_linear_checkpoint_metadata(args, is_ema=False, best_epoch=best_epoch),
+        )
+
+    summary = {
+        "run_dir": str(run_dir),
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "maol_mode": "none",
+        "head_type": "linear",
+        "ema": bool(args.ema),
+        "best_epoch": int(best_epoch),
+        "best_val_acc": float(best_val_acc),
+        "best_val_loss": float(best_val_loss),
+        "final_metrics": final_metrics,
+        "warmup_stats": None,
+        "lambdas": {key: 0.0 for key in DEFAULT_LAMBDAS},
+        "class_names": list(model.class_names),
+        "tree": model.tree.to_dict() if model.tree is not None else None,
+        "note": "CE linear-head control; no MAOL wells or geometry losses.",
+    }
+    _write_json(summary_path, summary)
+    if args.plot_once and metric_rows:
+        plotter = _build_plotter(metrics_path, args)
+        plotter.save(metric_rows)
+        plotter.show(block=True)
+    return summary
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.epochs <= 0:
         raise SystemExit("--epochs must be > 0")
@@ -1345,7 +1647,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--num-workers must be >= 0")
     if not (0.0 <= args.val_split < 1.0):
         raise SystemExit("--val-split must satisfy 0 <= value < 1")
-    if args.maol_warmup_epochs < 5:
+    if args.maol_mode == "none":
+        if args.maol_probe_only:
+            raise SystemExit("--maol-probe-only is MAOL-only; use --maol-mode full")
+        if args.maol_warmup_only:
+            raise SystemExit("--maol-warmup-only is MAOL-only; use --maol-mode full")
+        if args.maol_force_warmup:
+            raise SystemExit("--maol-force-warmup is MAOL-only; use --maol-mode full")
+    elif args.maol_warmup_epochs < 5:
         raise SystemExit("--maol-warmup-epochs must be >= 5")
     if args.maol_probe_steps <= 0:
         raise SystemExit("--maol-probe-steps must be > 0")
@@ -1466,6 +1775,8 @@ def main() -> None:
     parser.add_argument("--contrast", type=float, default=0.25)
     parser.add_argument("--saturation", type=float, default=0.25)
     parser.add_argument("--model-width-scale", type=float, default=1.5)
+    parser.add_argument("--maol-mode", choices=["full", "none"], default="full", help="full = MAOL wells/geometry; none = CE linear-head control")
+    parser.add_argument("--no-maol", dest="maol_mode", action="store_const", const="none", help="Alias for --maol-mode none")
     parser.add_argument("--num-partitions", type=int, default=1)
     parser.add_argument("--partition", type=int, default=0)
     parser.add_argument("--auto-next-partition", action=argparse.BooleanOptionalAction, default=False)
@@ -1626,6 +1937,8 @@ def main() -> None:
         input_size=config.INPUT_SIZE,
         num_classes=index.tree.num_leaves,
         tree=index.tree,
+        maol=args.maol_mode != "none",
+        class_names=index.class_names,
         seed=int(args.seed),
         width_scale=float(args.model_width_scale),
         embedding_dim=256,
@@ -1633,10 +1946,30 @@ def main() -> None:
     )
     _move_module_to_device(model, device)
     print(f"Using stage_channels={model.stage_channels} width_scale={model.width_scale:.3f}")
+    print(f"MAOL mode: {args.maol_mode}")
 
-    run_tag = "maol-probe" if args.maol_probe_only else ("maol-warmup" if args.maol_warmup_only else "maol")
+    if args.maol_mode == "none":
+        run_tag = "ce"
+    else:
+        run_tag = "maol-probe" if args.maol_probe_only else ("maol-warmup" if args.maol_warmup_only else "maol")
     run_dir = Path(args.maol_probe_output) if args.maol_probe_output else _prepare_run_dir(args, run_tag, index)
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.maol_mode == "none":
+        summary = _run_linear_training(
+            model,
+            train_loader,
+            val_loader,
+            args,
+            device,
+            run_dir,
+            class_weights=class_weights_tensor,
+        )
+        print(f"Run summary: {run_dir / 'summary.json'}")
+        print(f"Best epoch: {summary['best_epoch']}  best_val_acc={summary['best_val_acc']:.4f}")
+        if args.enforce_readonly_dataset and pre_signature is not None:
+            _verify_dataset_unchanged(data_dir, pre_signature, True)
+        return
 
     if args.maol_probe_only:
         if not warmup_ckpt.is_file():

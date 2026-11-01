@@ -1,4 +1,4 @@
-# Nix Vision Pro — MAOL
+# Nix Vision Pro — MAOL and CE Control
 
 CNN-only image classification implementing **MAOL (Multi-Attractor Optimized
 Learning)**.  The active theory is `MAOL.docx`; the old MAOIDL Omega/IDSI system,
@@ -11,14 +11,19 @@ space.  Wells are nested in a tree defined by the dataset directory hierarchy.
 Only leaf centers/radii are learnable; parent centers/radii are derived bottom-up
 from child centers and subtree training counts.
 
-Classification uses a prototype head, not a linear classifier:
+Classification in MAOL mode uses a prototype head, not a linear classifier:
 
 ```text
 logits_c = -||h - c_c||^2 / tau
 ```
 
-`h` is the `fc1 + ReLU` representation of the five-stage CNN.  No additional
-module is inserted into the backbone.
+`h = L2Normalize(ReLU(fc1(flatten(features))))`; the prototype head and all five
+geometry losses share this unit-sphere representation.  No additional module is
+inserted into the backbone.
+
+`--maol-mode none` is the **CE linear control**: it uses the same CNN backbone,
+raw `ReLU(fc1(...))`, a plain `Linear(256, num_classes)` head, and CE only.  It
+does not build wells, radii, `c_EMA`, or `tau`, and it skips MAOL warm-up/probe.
 
 The six losses are:
 
@@ -192,9 +197,11 @@ python train.py `
   --epochs 120 `
   --batch-size 128 `
   --model-width-scale 1.5 `
+  --maol-mode full `
+  --ema `
   --maol-warmup-ckpt checkpoints/maol_warmup.pt `
-  --maol-lambda-intra 0.1 `
-  --maol-lambda-sep 0.1 `
+  --maol-lambda-intra 1.0 `
+  --maol-lambda-sep 2.0 `
   --maol-lambda-nest 1.0 `
   --maol-lambda-cov 0.5 `
   --maol-lambda-center 0.5 `
@@ -209,6 +216,49 @@ gate on the validation split, and skips warm-up.  A failed gate exits with code
 checkpoint.  Without the flag, a missing warm-up checkpoint is created
 automatically and must pass the same gate before training starts.
 
+### 4. CE linear control (no MAOL)
+
+`--maol-mode none` is the no-MAOL control: raw `fc1+ReLU`, `Linear(256, N)`, CE
+only, no warm-up, no probe, no wells.  Use the same epochs/LR/augmentation/EMA as
+the MAOL run you are comparing against.
+
+```powershell
+python train.py `
+  --data-dir Dataset `
+  --device cuda `
+  --epochs 120 `
+  --batch-size 128 `
+  --num-workers 8 `
+  --seed 42 `
+  --amp-mode auto `
+  --optimizer adamw `
+  --lr 0.0002 `
+  --lr-schedule cosine `
+  --min-lr-ratio 0.05 `
+  --warmup-epochs 5 `
+  --weight-decay 1e-4 `
+  --grad-clip 1.0 `
+  --augment `
+  --rotation 20 `
+  --brightness 0.25 `
+  --contrast 0.25 `
+  --saturation 0.25 `
+  --model-width-scale 1.5 `
+  --maol-mode none `
+  --ema `
+  --early-stop `
+  --early-stop-metric val_acc `
+  --patience 50 `
+  --min-delta 0.000001 `
+  --checkpoint checkpoints/ce_model.pt `
+  --json-dir runs `
+  --plot-real-time
+```
+
+The run directory is named `...-ce-seed_42`; checkpoints record
+`head_type=linear`, `embedding_norm=raw`, and `maol=false`.  `predict.py` accepts
+both MAOL and CE checkpoints; the GUI remains MAOL-only.
+
 ## Inference
 
 ```powershell
@@ -216,9 +266,10 @@ python predict.py Dataset/living-matters/animals/cat/0001.jpg `
   --weights checkpoints/maol_model.pt --probabilities --top-k 3 --device cuda
 ```
 
-Only MAOL prototype checkpoints with `embedding_norm=l2` are accepted.  Old
-MAOIDL token/linear checkpoints and old raw-scale MAOL checkpoints fail with a
-clear message; the old architectures are not part of this build.
+`predict.py` accepts both MAOL prototype checkpoints (`embedding_norm=l2`) and
+CE linear checkpoints (`head_type=linear`, `embedding_norm=raw`, `maol=false`).
+Old MAOIDL token/linear checkpoints and old raw-scale MAOL checkpoints fail with
+a clear message; the old architectures are not part of this build.
 
 ## GUI
 
@@ -235,10 +286,11 @@ size, `tau`, and checkpoint metadata.  It does **not** load old MAOIDL models.
 Each run writes:
 
 ```text
-runs/<timestamp>-maol-seed_42/
+runs/<timestamp>-maol-seed_42/   # MAOL
+runs/<timestamp>-ce-seed_42/     # CE linear control
   config.json
-  warmup_metrics.jsonl      # when warm-up ran in this directory
-  warmup_stats.json
+  warmup_metrics.jsonl      # MAOL only
+  warmup_stats.json         # MAOL only
   epoch_metrics.jsonl
   summary.json
 ```
@@ -246,6 +298,7 @@ runs/<timestamp>-maol-seed_42/
 Per epoch the trainer logs train/val total, CE, intra, sep, nest, cov, center,
 accuracy, gap, gradient norm, hidden norm, `tau`, `d_intra`, `d_inter`,
 `margin_cap`, mean leaf radius, mean leaf center norm, and the five lambdas.
+The CE control logs zero for the well/geometry fields and no `warmup_*` files.
 
 Plotting is owned by the trainer:
 
@@ -260,8 +313,9 @@ python train.py ... --plot-real-time
 
 - MixUp, CutMix, focal loss, and label smoothing are removed.
 - RandAugment remains; validation is always clean.
-- EMA is optional and **off by default** for MAOL; if enabled, well statistics
-  (`c_EMA`, `q`, `tau`, margins) are copied exactly rather than blended.
+- EMA is optional and **off by default**; use `--ema` for both MAOL and CE
+  controls.  In MAOL mode, well statistics (`c_EMA`, `q`, `tau`, margins) are
+  copied exactly rather than blended.
 - Class weighting is optional and **off by default** (standard CE).
 - Temporary backbone freeze is optional and **off by default**.
 - AMP is supported with `--amp-mode {auto,on,off}`.
