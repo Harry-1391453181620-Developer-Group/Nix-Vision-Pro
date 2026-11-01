@@ -78,7 +78,6 @@ The current dataset has 18 leaf classes and 34,233 images.
 - `h = L2Normalize(ReLU(fc1(flatten(features))))`, unit norm; the classifier and all geometry losses use this same normalized `h`
 - `PrototypeHead` with 18 leaf wells (current dataset)
 - Input `224 x 224`, total stride `/32`
-- No transformer, no Omega projector, no IDSI projections, no linear classifier
 
 ## Install
 

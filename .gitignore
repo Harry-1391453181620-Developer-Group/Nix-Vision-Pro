@@ -73,3 +73,6 @@ test_image/
 .stignore
 .stfolder
 .stfolder/
+
+# Agents
+.agents/
