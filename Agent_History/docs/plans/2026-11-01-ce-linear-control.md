@@ -2,7 +2,7 @@
 
 ## Goal
 
-Provide a fair, 17-class **no-MAOL** control for the current CNN backbone:
+Provide a fair, 18-class **no-MAOL** control for the current CNN backbone:
 
 - same five-stage CNN / SE backbone and width scale;
 - raw `ReLU(fc1(flatten(features)))` embedding;
@@ -11,9 +11,10 @@ Provide a fair, 17-class **no-MAOL** control for the current CNN backbone:
 - no MAOL warm-up and no probe;
 - optional EMA, enabled in both control and future MAOL runs.
 
-The old 93.6% checkpoint used 18 classes and a different (token-transformer)
-head, so it is not a direct comparison.  This control is the correct 17-class
-baseline.
+The old 93.6% checkpoint used **12 classes** and a different (token-transformer)
+head, so it is not a direct comparison with the 18-class MAOL runs.  This
+control is the correct 18-class baseline: same backbone, same data, same
+augmentation, same epochs/LR, same EMA switch.
 
 ## Design
 

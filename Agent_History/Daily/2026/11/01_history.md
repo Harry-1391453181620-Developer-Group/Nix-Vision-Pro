@@ -2,7 +2,7 @@
 
 ## Task
 
-Add a 17-class no-MAOL CE control with a linear head, and use EMA on both sides
+Add an 18-class no-MAOL CE control with a linear head, and use EMA on both sides
 of the comparison.
 
 ## Changes
@@ -35,7 +35,8 @@ of the comparison.
 
 ## Notes
 
-- 17-class tree is read from `Dataset/`; no warm-up checkpoint is used in CE
-  mode, so there is no 18-class tree mismatch.
-- The old 93.6% model was 18-class and used a token-transformer head; the new
-  control is the fair 17-class CNN comparison.
+- The CE control reads the same 18-class tree from `Dataset/`; no warm-up
+  checkpoint is used in CE mode, so there is no MAOL tree mismatch.
+- The old 93.6% model was **12-class** and used a token-transformer head, so it
+  is not directly comparable with the 18-class MAOL runs.  The fair comparison
+  is 18-class MAOL vs 18-class CE linear, both with EMA.

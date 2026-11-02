@@ -222,6 +222,10 @@ automatically and must pass the same gate before training starts.
 only, no warm-up, no probe, no wells.  Use the same epochs/LR/augmentation/EMA as
 the MAOL run you are comparing against.
 
+The current dataset has 18 leaf classes, so both MAOL and this control run
+18-class.  The historical 93.6% MAOIDL model used **12 classes** and a
+token-transformer head; it is not a direct comparison with the current runs.
+
 ```powershell
 python train.py `
   --data-dir Dataset `

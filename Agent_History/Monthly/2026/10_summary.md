@@ -7,9 +7,9 @@ MAOIDL, and the first full MAOL reconstruction on `main`.
 
 ## Main Outcomes
 
-- Confirmed the 93.6% pure-CE CNN + token-transformer hybrid as the best MAOIDL
-  result; the token path was still Transformer-heavy and the MAOIDL losses did
-  not improve the final accuracy.
+- Confirmed the 93.6% pure-CE CNN + token-transformer hybrid (12 classes) as the
+  best MAOIDL result; the token path was still Transformer-heavy and the MAOIDL
+  losses did not improve the final accuracy.
 - Retired the MAOIDL theory and old repository.
 - Implemented MAOL:
   - leaf wells with centers/radii;
@@ -38,4 +38,5 @@ MAOIDL, and the first full MAOL reconstruction on `main`.
 - Run the long MAOL experiments on the DGX Spark with the nested ImageNet-expanded
   dataset.
 - Use the probe JSON to tune the five lambdas.
-- Compare MAOL against the 93.6% pure-CE baseline.
+- Compare MAOL (18-class) against the 18-class CE linear control with the same
+  EMA; the old 93.6% model is 12-class and is not a direct comparison.
