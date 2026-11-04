@@ -5,6 +5,8 @@
 - Added the 18-class no-MAOL CE linear control.
 - Added `--maol-mode {full,none}` and `--no-maol`.
 - Enabled EMA consistently in the documented MAOL and CE training commands.
+- Fixed EMA evaluation to copy BatchNorm/statistic buffers from the live model
+  and allowed `--ema <decay>`.
 
 ## Result
 
@@ -12,7 +14,12 @@
   radii, `c_EMA`, `tau`, warm-up, or geometry losses.
 - `predict.py` supports both MAOL prototype and CE linear checkpoints.
 - GUI remains MAOL-only.
-- 38 tests pass, including linear-checkpoint metadata and raw-embedding checks.
+- `ModelEMA` now copies BatchNorm and MAOL statistic buffers exactly from the
+  live model; only parameters are averaged.
+- `--ema` accepts an optional decay (`--ema 0.999`); bare `--ema` uses
+  `--ema-decay` (default `0.9993`).
+- 41 tests pass, including linear-checkpoint metadata, EMA buffer copying, and
+  EMA decay CLI resolution.
 
 ## Corrections
 

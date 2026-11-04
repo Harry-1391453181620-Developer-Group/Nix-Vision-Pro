@@ -198,7 +198,7 @@ python train.py `
   --batch-size 128 `
   --model-width-scale 1.5 `
   --maol-mode full `
-  --ema `
+  --ema 0.9993 `
   --maol-warmup-ckpt checkpoints/maol_warmup.pt `
   --maol-lambda-intra 1.0 `
   --maol-lambda-sep 2.0 `
@@ -249,7 +249,7 @@ python train.py `
   --saturation 0.25 `
   --model-width-scale 1.5 `
   --maol-mode none `
-  --ema `
+  --ema 0.9993 `
   --early-stop `
   --early-stop-metric val_acc `
   --patience 50 `
@@ -317,9 +317,11 @@ python train.py ... --plot-real-time
 
 - MixUp, CutMix, focal loss, and label smoothing are removed.
 - RandAugment remains; validation is always clean.
-- EMA is optional and **off by default**; use `--ema` for both MAOL and CE
-  controls.  In MAOL mode, well statistics (`c_EMA`, `q`, `tau`, margins) are
-  copied exactly rather than blended.
+- EMA is optional and **off by default**.  `--ema` enables it with
+  `--ema-decay` (default `0.9993`); `--ema 0.999` sets the decay directly;
+  `--no-ema` disables it.  BatchNorm running statistics and MAOL statistic
+  buffers are copied exactly from the live model each update; only parameters
+  are averaged.  Use the same EMA setting for MAOL and CE controls.
 - Class weighting is optional and **off by default** (standard CE).
 - Temporary backbone freeze is optional and **off by default**.
 - AMP is supported with `--amp-mode {auto,on,off}`.

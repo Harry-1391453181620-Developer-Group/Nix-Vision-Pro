@@ -1638,6 +1638,26 @@ def _run_linear_training(
     return summary
 
 
+def _resolve_ema_args(args: argparse.Namespace) -> None:
+    """Normalize ``--ema``/``--no-ema``/``--ema-decay`` into a bool + decay.
+
+    ``--ema`` without a value uses ``--ema-decay`` (default 0.9993).
+    ``--ema 0.999`` explicitly sets the decay; ``--no-ema`` disables EMA.
+    """
+    raw = getattr(args, "ema", None)
+    if raw is None or raw is False:
+        args.ema = False
+    elif raw is True:
+        args.ema = True
+    else:
+        args.ema = True
+        args.ema_decay = float(raw)
+    try:
+        args.ema_decay = validate_ema_decay(args.ema_decay)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.epochs <= 0:
         raise SystemExit("--epochs must be > 0")
@@ -1758,8 +1778,18 @@ def main() -> None:
     parser.add_argument("--early-stop-metric", choices=["val_loss", "val_acc"], default="val_acc")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--class-weighting", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--ema-decay", type=float, default=0.9993)
+    ema_group = parser.add_mutually_exclusive_group()
+    ema_group.add_argument(
+        "--ema",
+        nargs="?",
+        const=True,
+        default=None,
+        type=float,
+        metavar="DECAY",
+        help="Enable EMA; optional decay in (0,1), e.g. --ema 0.999. Bare --ema uses --ema-decay.",
+    )
+    ema_group.add_argument("--no-ema", dest="ema", action="store_const", const=False, help="Disable EMA")
+    parser.add_argument("--ema-decay", type=float, default=0.9993, help="Decay used by bare --ema")
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--patience", type=int, default=50)
     parser.add_argument("--min-delta", type=float, default=1e-6)
@@ -1840,6 +1870,7 @@ def main() -> None:
         default=True,
     )
     args = parser.parse_args()
+    _resolve_ema_args(args)
     _validate_args(args)
 
     torch.manual_seed(args.seed)

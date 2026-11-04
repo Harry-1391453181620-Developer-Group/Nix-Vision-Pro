@@ -78,6 +78,71 @@ def test_ema_copies_skipped_statistics_exactly() -> None:
     assert torch.allclose(ema.ema_model.stat, torch.full((2,), 3.0))
 
 
+def test_ema_copies_buffers_exactly() -> None:
+    torch = pytest.importorskip("torch")
+    from torch import nn
+
+    class Tiny(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2))
+            self.register_buffer("buf", torch.zeros(2))
+
+    model = Tiny()
+    ema_model = Tiny()
+    ema = ModelEMA(ema_model, decay=0.5)
+    ema.sync_from(model)
+    with torch.no_grad():
+        model.weight.add_(2.0)
+        model.buf.add_(3.0)
+    ema.update(model, step_in_phase=10)
+    assert torch.allclose(ema.ema_model.weight, torch.ones(2))
+    assert torch.allclose(ema.ema_model.buf, torch.full((2,), 3.0))
+
+
+def test_ema_copies_batchnorm_running_stats() -> None:
+    torch = pytest.importorskip("torch")
+    from torch import nn
+
+    class Tiny(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bn = nn.BatchNorm1d(2)
+
+    model = Tiny()
+    ema_model = Tiny()
+    ema = ModelEMA(ema_model, decay=0.5)
+    ema.sync_from(model)
+    with torch.no_grad():
+        model.bn.running_mean.add_(3.0)
+        model.bn.running_var.add_(2.0)
+        model.bn.weight.add_(2.0)
+    ema.update(model, step_in_phase=10)
+    assert torch.allclose(ema.ema_model.bn.running_mean, model.bn.running_mean)
+    assert torch.allclose(ema.ema_model.bn.running_var, model.bn.running_var)
+    assert torch.allclose(ema.ema_model.bn.weight, torch.full((2,), 2.0))
+
+
+def test_ema_cli_decay_resolution() -> None:
+    from argparse import Namespace
+
+    from backends.torch.train_backend import _resolve_ema_args
+
+    args = Namespace(ema=True, ema_decay=0.9993)
+    _resolve_ema_args(args)
+    assert args.ema is True
+    assert args.ema_decay == pytest.approx(0.9993)
+
+    args = Namespace(ema=0.999, ema_decay=0.9993)
+    _resolve_ema_args(args)
+    assert args.ema is True
+    assert args.ema_decay == pytest.approx(0.999)
+
+    args = Namespace(ema=False, ema_decay=0.9993)
+    _resolve_ema_args(args)
+    assert args.ema is False
+
+
 def test_validators_and_bool_parser() -> None:
     config = validate_augmentation_args(12.0, 0.2, 0.3, 0.4)
     assert config.rotation == pytest.approx(12.0)
