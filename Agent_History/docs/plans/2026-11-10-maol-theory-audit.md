@@ -10,9 +10,9 @@ Scope: `maol/head.py`, `maol/losses.py`, `maol/stats.py`, `maol/tree.py`,
 `backends/torch/model.py`, `backends/torch/train_backend.py`,
 `utils/training.py`, `config.py`, `predict.py` / `train.py`.
 
-Snapshot: working tree at 2026-11-10 10:10, on `HEAD 7360be8` plus concurrent
-modifications to `maol/head.py`, `maol/stats.py`, `tests/test_maol_head.py`,
-`tests/test_maol_stats.py` (see "Changes made during this audit").
+Snapshot: post-fix tree on 2026-11-10; the two statistics fixes and this report
+were committed together as `7aa34b9` after the audit draft (the audit itself was
+read-only; the fixes came from a concurrent implementation pass).
 
 ## Method
 
@@ -210,6 +210,9 @@ Two real mismatches were found by both passes and fixed in the working tree at
    only the quantile statistic `q` (`:304-311`); `c_EMA` is updated for every
    class present in the batch (`:312-320`), matching the docx, which says
    "otherwise q_c is left unchanged".
+
+Both fixes, their tests and this report are committed as `7aa34b9`
+("Align warm-up tau and c_EMA updates with MAOL theory").
 
 Consequences for this report: line numbers in `maol/head.py` (322 → 329 lines),
 `maol/stats.py` (309 → 318 lines) and `tests/` moved slightly; every citation

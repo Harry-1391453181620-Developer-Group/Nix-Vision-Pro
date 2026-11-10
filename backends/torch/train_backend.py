@@ -1854,7 +1854,7 @@ def main() -> None:
     parser.add_argument("--maol-warmup-only", action="store_true")
     parser.add_argument("--maol-force-warmup", action="store_true")
     parser.add_argument("--maol-warmup-ckpt", type=str, default=None)
-    parser.add_argument("--maol-warmup-lr", type=float, default=None, help="Override warm-up LR; default is lr[0] from a pretrained init, 2*lr[0] from scratch")
+    parser.add_argument("--maol-warmup-lr", type=float, default=None, help="Override warm-up LR; default is 2*lr[0] from scratch")
     parser.add_argument("--maol-warmup-augment", action=argparse.BooleanOptionalAction, default=False, help="Use RandAugment during warm-up (default: off)")
     parser.add_argument("--maol-tau-floor", type=float, default=1e-2, help="If tau_warm falls below this, fall back to tau=1.0")
     parser.add_argument("--maol-warmup-sanity", action=argparse.BooleanOptionalAction, default=True)

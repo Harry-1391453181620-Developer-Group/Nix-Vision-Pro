@@ -59,6 +59,11 @@ Two parts requested by the user:
   in the batch and keeps the `n_min` gate only on the `q` statistic.
 - Tests updated/added in `tests/test_maol_head.py` and
   `tests/test_maol_stats.py`.
+- `--maol-warmup-lr` help text corrected (the pretrained-init path no longer
+  exists; the default is always `2 * lr[0]`).
+- README metric notes clarified: `mean_leaf_center_norm` is the raw center
+  parameter norm, and `d_intra`/`d_inter`/`margin_cap` are static warm-up
+  constants.
 
 ## Validation
 

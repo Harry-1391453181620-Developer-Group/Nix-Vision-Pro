@@ -302,6 +302,10 @@ runs/<timestamp>-ce-seed_42/     # CE linear control
 Per epoch the trainer logs train/val total, CE, intra, sep, nest, cov, center,
 accuracy, gap, gradient norm, hidden norm, `tau`, `d_intra`, `d_inter`,
 `margin_cap`, mean leaf radius, mean leaf center norm, and the five lambdas.
+`mean_leaf_center_norm` is the norm of the raw `head.centers` parameter (the head
+classifies with internally normalized centers, so the reported value is slightly
+below 1); `d_intra`, `d_inter` and `margin_cap` are warm-up-derived constants and
+therefore identical in every row by design.
 The CE control logs zero for the well/geometry fields and no `warmup_*` files.
 
 Plotting is owned by the trainer:
