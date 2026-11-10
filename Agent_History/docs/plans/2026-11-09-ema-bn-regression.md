@@ -100,9 +100,10 @@ Validation: `42 passed`.
 
 ## Follow-up for the next remote run
 
-- The fix restores the semantics of the healthy 11-02 EMA run, so rerun MAOL
-  with `--ema 0.9993` (or `--ema 0.999`). A decay of `0.9999` is not required
-  and implies a very long lag; keep it only as an explicit experiment.
+- Rerun MAOL with `--ema 0.9999`, the decay chosen after the `0.9993`
+  experiment (which was not better than no EMA). The 11-04 collapse was caused
+  by the buffer-copy bug, not by the decay; with self-consistent EMA statistics
+  the long-window `0.9999` EMA is the intended configuration.
 - `checkpoints/maol_model.pt` currently contains the collapsed run's EMA epoch-1
   weights (`best_epoch=1`, 73.46% val accuracy). Rerun warm-up/full training or
   use `checkpoints/maol_best_model.pt` (non-EMA, 89.93%) until then.

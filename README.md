@@ -198,7 +198,7 @@ python train.py `
   --batch-size 128 `
   --model-width-scale 1.5 `
   --maol-mode full `
-  --ema 0.9993 `
+  --ema 0.9999 `
   --maol-warmup-ckpt checkpoints/maol_warmup.pt `
   --maol-lambda-intra 1.0 `
   --maol-lambda-sep 2.0 `
@@ -249,7 +249,7 @@ python train.py `
   --saturation 0.25 `
   --model-width-scale 1.5 `
   --maol-mode none `
-  --ema 0.9993 `
+  --ema 0.9999 `
   --early-stop `
   --early-stop-metric val_acc `
   --patience 50 `
@@ -318,7 +318,9 @@ python train.py ... --plot-real-time
 - MixUp, CutMix, focal loss, and label smoothing are removed.
 - RandAugment remains; validation is always clean.
 - EMA is optional and **off by default**.  `--ema` enables it with
-  `--ema-decay` (default `0.9993`); `--ema 0.999` sets the decay directly;
+  `--ema-decay` (default `0.9993`; the documented training commands set
+  `--ema 0.9999`, the decay chosen after the `0.9993` experiment); `--ema 0.999`
+  sets the decay directly;
   `--no-ema` disables it.  Parameters **and floating buffers** (BatchNorm
   `running_mean`/`running_var`) are averaged with the same decay, so the
   evaluated EMA model always uses statistics that belong to its own lagged

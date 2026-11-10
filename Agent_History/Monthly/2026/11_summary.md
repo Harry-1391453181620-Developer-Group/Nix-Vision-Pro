@@ -40,8 +40,9 @@
 ## Next Work
 
 - Run the 18-class CE linear control with EMA.
-- Re-run MAOL with EMA (decay `0.9993`) on the same 18-class tree and compare
-  best val accuracy, macro accuracy, and per-class errors.
+- Re-run MAOL with EMA (decay `0.9999`, chosen after the `0.9993` experiment)
+  on the same 18-class tree and compare best val accuracy, macro accuracy, and
+  per-class errors.
 - Log live and EMA validation metrics side by side each epoch so EMA
   regressions are visible immediately.
 - Keep the old 93.6% number out of the direct comparison: that model was

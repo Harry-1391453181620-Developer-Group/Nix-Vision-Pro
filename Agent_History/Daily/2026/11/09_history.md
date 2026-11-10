@@ -44,8 +44,9 @@ produced a much worse result than the earlier runs.
 
 ## Next
 
-- Rerun the 18-class MAOL training on the DGX with `--ema 0.9993` (the tested
-  decay), using `checkpoints/maol_warmup.pt` if it passes the sanity gate.
+- Rerun the 18-class MAOL training on the DGX with `--ema 0.9999` (the decay
+  chosen after the 0.9993 experiment), using `checkpoints/maol_warmup.pt` if it
+  passes the sanity gate.
 - `checkpoints/maol_model.pt` currently holds the collapsed run's EMA epoch-1
   weights; treat it as invalid. `checkpoints/maol_best_model.pt` (non-EMA,
   89.93%) remains the best valid MAOL checkpoint.
