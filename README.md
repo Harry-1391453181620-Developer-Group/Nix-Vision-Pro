@@ -319,9 +319,15 @@ python train.py ... --plot-real-time
 - RandAugment remains; validation is always clean.
 - EMA is optional and **off by default**.  `--ema` enables it with
   `--ema-decay` (default `0.9993`); `--ema 0.999` sets the decay directly;
-  `--no-ema` disables it.  BatchNorm running statistics and MAOL statistic
-  buffers are copied exactly from the live model each update; only parameters
-  are averaged.  Use the same EMA setting for MAOL and CE controls.
+  `--no-ema` disables it.  Parameters **and floating buffers** (BatchNorm
+  `running_mean`/`running_var`) are averaged with the same decay, so the
+  evaluated EMA model always uses statistics that belong to its own lagged
+  weights.  Integer counters (`num_batches_tracked`) and MAOL statistic buffers
+  (`c_EMA`, `q`, `tau`, margins) are copied exactly.  Do not copy live
+  BatchNorm statistics into a lagged EMA model: measured on this project, a
+  one-epoch statistics/weights mismatch drops validation accuracy from 73.5%
+  to 63.9%, and a 112-epoch mismatch drops it to 4.2%.  Use the same EMA
+  setting for MAOL and CE controls.
 - Class weighting is optional and **off by default** (standard CE).
 - Temporary backbone freeze is optional and **off by default**.
 - AMP is supported with `--amp-mode {auto,on,off}`.

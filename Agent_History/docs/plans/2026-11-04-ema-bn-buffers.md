@@ -68,3 +68,28 @@ EMA checkpoints at each epoch and compare best, final, and macro accuracy.
 - Checkpoint loading still uses `weights_only=True`.
 - No new shell execution, network access, or arbitrary deserialization.
 - EMA decay is validated to `0 < decay < 1`.
+
+## Correction (2026-11-09)
+
+The buffer-copy decision documented above was wrong. Copying live BatchNorm
+statistics into an EMA model whose parameters lag creates a weights/statistics
+mismatch, not consistency. The 2026-11-04 MAOL run (`ema_decay=0.9999`, same
+code) collapsed from warm-up accuracy `73.28%` at epoch 1 to `44.24%` at epoch
+51 while the live training trajectory stayed bit identical to the healthy runs.
+
+Measured on the exact validation split by swapping BatchNorm buffers:
+
+```text
+EMA epoch-1 checkpoint as-is                           73.455%
+EMA epoch-1 weights + warm-up BatchNorm buffers        63.901%
+non-EMA epoch-112 checkpoint as-is                     89.934%
+non-EMA epoch-112 weights + warm-up BatchNorm buffers   4.222%
+```
+
+`14ecf02` was therefore reverted in `ModelEMA.update` on 2026-11-09: parameters
+and floating buffers (BatchNorm running statistics) are EMA-blended with the
+same decay again; integer counters and `skip_prefixes` MAOL statistics are
+still copied exactly. The `--ema <decay>` CLI from this change is kept.
+
+See `Agent_History/docs/plans/2026-11-09-ema-bn-regression.md` for the full
+evidence and fix.

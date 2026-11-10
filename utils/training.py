@@ -31,12 +31,17 @@ class AugmentationConfig:
 
 
 class ModelEMA:
-    """EMA over model parameters; non-parameter buffers are copied exactly.
+    """EMA over model parameters and floating buffers.
 
-    BatchNorm running statistics, MAOL well statistics, and counters describe
-    the live model's current distribution.  Averaging them with the EMA
-    parameters creates a mismatched evaluation model, so all buffers are copied
-    from the live model on every update.
+    Batchnorm ``running_mean``/``running_var`` are averaged with the same decay
+    as the parameters so the evaluated EMA model always carries the statistics
+    that belong to its own weights.  Copying live statistics into a lagged EMA
+    model creates a weights/statistics mismatch (measured: 73.5% -> 63.9% val
+    accuracy after one epoch of mismatch, and -> 4.2% with a 112-epoch gap).
+
+    Integer counters (``num_batches_tracked``) and ``skip_prefixes`` statistics
+    (the MAOL well/statistics buffers, which describe the current data
+    distribution rather than the weights) are copied exactly.
     """
 
     def __init__(
@@ -51,7 +56,6 @@ class ModelEMA:
         self.decay = validate_ema_decay(decay)
         self.phase_warmup_steps = max(0, int(phase_warmup_steps))
         self.skip_prefixes = tuple(str(prefix) for prefix in skip_prefixes)
-        self.buffer_keys = frozenset(name for name, _ in self.ema_model.named_buffers())
         self.num_updates = 0
 
     def sync_from(self, model: Any) -> None:
@@ -80,9 +84,7 @@ class ModelEMA:
         if list(ema_state.keys()) != list(model_state.keys()):
             raise ValueError("EMA model state does not match source model state")
         for key in ema_state:
-            if key in self.buffer_keys:
-                _copy_state_value_inplace(ema_state[key], model_state[key])
-            elif self.skip_prefixes and key.startswith(self.skip_prefixes):
+            if self.skip_prefixes and key.startswith(self.skip_prefixes):
                 _copy_state_value_inplace(ema_state[key], model_state[key])
             elif _is_floating_state_value(model_state[key]):
                 _blend_state_value_inplace(ema_state[key], model_state[key], decay)

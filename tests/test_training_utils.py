@@ -78,7 +78,7 @@ def test_ema_copies_skipped_statistics_exactly() -> None:
     assert torch.allclose(ema.ema_model.stat, torch.full((2,), 3.0))
 
 
-def test_ema_copies_buffers_exactly() -> None:
+def test_ema_blends_floating_buffers() -> None:
     torch = pytest.importorskip("torch")
     from torch import nn
 
@@ -97,10 +97,29 @@ def test_ema_copies_buffers_exactly() -> None:
         model.buf.add_(3.0)
     ema.update(model, step_in_phase=10)
     assert torch.allclose(ema.ema_model.weight, torch.ones(2))
-    assert torch.allclose(ema.ema_model.buf, torch.full((2,), 3.0))
+    assert torch.allclose(ema.ema_model.buf, torch.full((2,), 1.5))
 
 
-def test_ema_copies_batchnorm_running_stats() -> None:
+def test_ema_copies_integer_counters_exactly() -> None:
+    torch = pytest.importorskip("torch")
+    from torch import nn
+
+    class Tiny(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("counter", torch.zeros(2, dtype=torch.long))
+
+    model = Tiny()
+    ema_model = Tiny()
+    ema = ModelEMA(ema_model, decay=0.5)
+    ema.sync_from(model)
+    with torch.no_grad():
+        model.counter.add_(3)
+    ema.update(model, step_in_phase=10)
+    assert torch.equal(ema.ema_model.counter, torch.full((2,), 3, dtype=torch.long))
+
+
+def test_ema_blends_batchnorm_running_stats() -> None:
     torch = pytest.importorskip("torch")
     from torch import nn
 
@@ -118,9 +137,12 @@ def test_ema_copies_batchnorm_running_stats() -> None:
         model.bn.running_var.add_(2.0)
         model.bn.weight.add_(2.0)
     ema.update(model, step_in_phase=10)
-    assert torch.allclose(ema.ema_model.bn.running_mean, model.bn.running_mean)
-    assert torch.allclose(ema.ema_model.bn.running_var, model.bn.running_var)
+    # BatchNorm statistics must lag with the parameters, not follow the live
+    # model, otherwise the EMA model is evaluated with foreign statistics.
+    assert torch.allclose(ema.ema_model.bn.running_mean, torch.full((2,), 1.5))
+    assert torch.allclose(ema.ema_model.bn.running_var, torch.full((2,), 2.0))
     assert torch.allclose(ema.ema_model.bn.weight, torch.full((2,), 2.0))
+    assert torch.equal(ema.ema_model.bn.num_batches_tracked, model.bn.num_batches_tracked)
 
 
 def test_ema_cli_decay_resolution() -> None:
