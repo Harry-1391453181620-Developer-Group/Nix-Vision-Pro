@@ -290,18 +290,25 @@ class PrototypeHead(nn.Module):
         m_q: float = 0.9,
         n_min: int = 5,
     ) -> None:
-        """Update ``c_EMA`` and the 95th-percentile radius statistic for classes in this batch."""
+        """Update ``c_EMA`` and the 95th-percentile radius statistic for classes in this batch.
+
+        The theory gates only the noisy quantile statistic on ``n_min``; the
+        EMA class mean is updated for every class that appears in the batch
+        (``c_EMA <- m*c_EMA + (1-m)*batch_mean``).
+        """
         for class_index in torch.unique(labels).tolist():
             class_index = int(class_index)
             mask = labels == class_index
-            count = int(mask.sum().item())
-            if count < int(n_min):
-                continue
             class_h = h[mask].detach().float()
             batch_mean = class_h.mean(dim=0)
-            distances = torch.linalg.vector_norm(class_h - self.c_ema[class_index].float(), dim=-1)
-            batch_q = torch.quantile(distances, 0.95, interpolation="linear")
-            self.q[class_index] = float(m_q) * self.q[class_index] + (1.0 - float(m_q)) * batch_q
+            if int(mask.sum().item()) >= int(n_min):
+                distances = torch.linalg.vector_norm(
+                    class_h - self.c_ema[class_index].float(), dim=-1
+                )
+                batch_q = torch.quantile(distances, 0.95, interpolation="linear")
+                self.q[class_index] = (
+                    float(m_q) * self.q[class_index] + (1.0 - float(m_q)) * batch_q
+                )
             updated_mean = (
                 float(m) * self.c_ema[class_index] + (1.0 - float(m)) * batch_mean
             )

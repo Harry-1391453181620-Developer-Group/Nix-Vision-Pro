@@ -7,7 +7,29 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from maol.stats import WarmupStats, lambert_w
+from maol.stats import WarmupStats, compute_class_means, lambert_w
+
+
+def test_compute_class_means_tau_uses_normalized_centers() -> None:
+    samples = [
+        (torch.tensor([[1.0, 0.0], [0.6, 0.8]]), torch.tensor([0, 0])),
+        (torch.tensor([[0.0, 1.0], [0.8, 0.6], [-0.6, 0.8]]), torch.tensor([1, 1, 1])),
+    ]
+    means, counts, tau_warm = compute_class_means(
+        lambda x: x,
+        samples,
+        torch.device("cpu"),
+        num_classes=2,
+        embedding_dim=2,
+    )
+    stacked = torch.cat([x for x, _ in samples])
+    labels = torch.cat([y for _, y in samples])
+    expected_means = torch.stack([stacked[labels == c].mean(dim=0) for c in range(2)])
+    normalized = torch.nn.functional.normalize(expected_means, p=2, dim=-1)
+    expected_tau = torch.mean(torch.sum((stacked - normalized[labels]) ** 2, dim=-1))
+    assert torch.allclose(means, expected_means)
+    assert torch.allclose(counts, torch.tensor([2.0, 3.0]))
+    assert tau_warm == pytest.approx(float(expected_tau), rel=1e-6)
 
 
 def test_lambert_w_inverts_k_times_exp_k() -> None:

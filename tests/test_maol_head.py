@@ -71,7 +71,7 @@ def test_cov_lambda_is_added_after_ce() -> None:
     assert torch.allclose(terms.total, terms.ce + 0.5 * terms.cov)
 
 
-def test_ema_stats_update_only_with_enough_samples() -> None:
+def test_ema_stats_gates_q_but_updates_c_ema_for_any_present_class() -> None:
     head = _head()
     h = torch.tensor(
         [
@@ -84,7 +84,12 @@ def test_ema_stats_update_only_with_enough_samples() -> None:
         ]
     )
     labels = torch.tensor([0, 0, 0, 0, 0, 1])
-    before = head.c_ema.clone()
+    before_c_ema = head.c_ema.clone()
+    before_q = head.q.clone()
     head.update_ema_stats(h, labels, n_min=5)
-    assert not torch.allclose(head.c_ema[0], before[0])
-    assert torch.allclose(head.c_ema[1], before[1])  # only one dog sample
+    # c_EMA is updated for every class present in the batch (theory gates only q).
+    assert not torch.allclose(head.c_ema[0], before_c_ema[0])
+    assert not torch.allclose(head.c_ema[1], before_c_ema[1])  # only one dog sample
+    # q is an EMA of a per-batch quantile and is skipped below n_min samples.
+    assert not torch.allclose(head.q[0], before_q[0])
+    assert torch.allclose(head.q[1], before_q[1])

@@ -11,6 +11,7 @@
 - Added `--ema <decay>`.
 - Fixed the training-plot lifecycle (`--plot-real-time`, `--plot-once`) so
   interactive windows and headless PNG artifacts both work as documented.
+- Completed the 2026-11-10 MAOL.docx theory-vs-code audit.
 
 ## Result
 
@@ -28,8 +29,16 @@
   are no longer misclassified as headless, `--plot-real-time` and
   `--plot-once` always save `epoch_metrics_plot.<ext>`, and headless runs print
   an explicit diagnostic instead of silently doing nothing.
-- 48 tests pass, including linear-checkpoint metadata, EMA buffer blending,
-  EMA decay CLI resolution, and plotting backend/lifecycle regressions.
+- 2026-11-10 MAOL theory audit: the six loss formulas, prototype head, warm-up,
+  τ rules, margin derivation and tree geometry in `MAOL.docx` were verified
+  against the implementation formula by formula (OMML-tree disambiguation);
+  report at `Agent_History/docs/plans/2026-11-10-maol-theory-audit.md`.
+  Two statistics mismatches were fixed: `tau_warm` now measures distance to the
+  normalized class centers used by the head, and `c_EMA` updates for every
+  present class while only `q` keeps the `n_min=5` gate.
+- 49 tests pass, including linear-checkpoint metadata, EMA buffer blending,
+  EMA decay CLI resolution, plotting backend/lifecycle regressions, and the two
+  theory-audit statistics fixes.
 
 ## Corrections
 
@@ -42,11 +51,15 @@
   to the healthy runs. The fix EMA-blends floating buffers with the parameters
   again. Evidence and measurements in
   `Agent_History/docs/plans/2026-11-09-ema-bn-regression.md`.
+- 2026-11-10 theory audit: the earlier suspicion that `L_sep`/`L_cov` used
+  squared distances came from flat OMML text extraction; the indented formula
+  trees show the implementation was already correct. Only the two statistics
+  details above actually differed.
 
 ## Next Work
 
-- Finish and apply the 2026-11-10 MAOL.docx theory-vs-code audit
-  (`Agent_History/docs/plans/2026-11-10-maol-theory-audit.md`).
+- Re-run warm-up + probe + full training on the corrected statistics baseline
+  (τ_warm normalization and ungated `c_EMA`); treat it as a new baseline.
 - Run the 18-class CE linear control with EMA.
 - Re-run MAOL with EMA (decay `0.9999`, chosen after the `0.9993` experiment)
   on the same 18-class tree and compare best val accuracy, macro accuracy, and

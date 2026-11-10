@@ -92,10 +92,12 @@ def compute_class_means(
     num_classes: int,
     embedding_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Return class means, counts, and mean squared distance to the class mean.
+    """Return class means, counts, and mean squared distance to the frozen center.
 
     This is the single pass used at the start of each warm-up epoch.  It also
     provides ``tau_warm`` for the part of warm-up after the first 100 steps.
+    The prototype head classifies against unit-sphere centers, so the distance
+    is measured to the normalized class mean, not to the raw mean.
     """
     sums = torch.zeros((num_classes, embedding_dim), device=device, dtype=torch.float32)
     sum_squares = torch.zeros((num_classes,), device=device, dtype=torch.float32)
@@ -114,8 +116,15 @@ def compute_class_means(
             counts[class_index] += float(class_h.shape[0])
 
     means = sums / counts.clamp_min(1.0)[:, None]
-    total_sq = sum_squares.sum() - torch.sum(counts * torch.sum(means * means, dim=-1))
-    tau_warm = float((total_sq / counts.sum().clamp_min(1.0)).clamp_min(0.0).item())
+    # tau_warm must be the mean squared distance to the centers actually used by
+    # the head (normalized class means).  With unit-norm centers:
+    #   sum_i ||h_i - m_hat_{y_i}||^2
+    #   = sum_i ||h_i||^2 - 2 * sum_i h_i . m_hat_{y_i} + N
+    # and sum_i h_i . m_hat_{y_i} = sum_c ||sum_c|| because m_hat_c = sum_c / ||sum_c||.
+    total_count = counts.sum().clamp_min(1.0)
+    projection = torch.linalg.vector_norm(sums, dim=-1).sum()
+    total_sq = sum_squares.sum()
+    tau_warm = float(((total_sq - 2.0 * projection + total_count) / total_count).clamp_min(0.0).item())
     return means, counts, tau_warm
 
 

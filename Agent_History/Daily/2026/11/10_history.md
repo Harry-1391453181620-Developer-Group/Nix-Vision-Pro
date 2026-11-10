@@ -26,10 +26,20 @@ Two parts requested by the user:
 ### MAOL theory audit
 
 - Full theory text extracted from `MAOL.docx` (paragraphs + inline OMML math) to
-  `.maol_tmp/MAOL_theory_wrapped.txt`; a read-only audit against
-  `maol/head.py`, `maol/losses.py`, `maol/stats.py`, `maol/tree.py`,
-  `backends/torch/model.py`, `backends/torch/train_backend.py` and
-  `utils/training.py` is in progress (report to be written).
+  `.maol_tmp/MAOL_theory_wrapped.txt`; formulas with `max(0, ...)`, squared norms
+  and Lambert-W were re-read from indented OMML trees because flat text hides the
+  bracket/superscript grouping.
+- Audited `maol/head.py`, `maol/losses.py`, `maol/stats.py`, `maol/tree.py`,
+  `backends/torch/model.py`, `backends/torch/train_backend.py`,
+  `utils/training.py`.
+- Verdict: the six losses, prototype head, warm-up, τ rules, margin derivation
+  and tree geometry match the document. The earlier apparent `L_sep`/`L_cov`
+  mismatch was an extraction artifact.
+- Two implementation mismatches found and fixed:
+  1. `tau_warm` was measured to the raw class mean; the head classifies against
+     normalized centers, so τ now uses the normalized mean (closed form).
+  2. `c_EMA` was gated by `n_min` together with `q`; the theory gates only `q`.
+- Report: `Agent_History/docs/plans/2026-11-10-maol-theory-audit.md`.
 
 ## Changes
 
@@ -43,16 +53,26 @@ Two parts requested by the user:
   headless save test, and `_finalize_plotting` behavior tests.
 - `README.md` plotting section and `best_train_commands.txt` notes updated.
 - Added `Agent_History/docs/plans/2026-11-10-plotting-lifecycle.md`.
+- `maol/stats.py`: `compute_class_means()` now measures `tau_warm` to the
+  normalized class center.
+- `maol/head.py`: `update_ema_stats()` updates `c_EMA` for every class present
+  in the batch and keeps the `n_min` gate only on the `q` statistic.
+- Tests updated/added in `tests/test_maol_head.py` and
+  `tests/test_maol_stats.py`.
 
 ## Validation
 
-- Full test suite: `48 passed`.
+- Full test suite: `49 passed`.
 - Headless end-to-end smoke (`MPLBACKEND=Agg`, CPU, synthetic 5-class dataset):
   `--plot-real-time` and `--plot-once` both write
   `runs/<run>/epoch_metrics_plot.png` and print the expected diagnostics.
 - `MPLBACKEND=TkAgg`: `interactive=True`, window created, figure saved.
+- No local training run (training happens on the DGX Spark); the two statistics
+  fixes change training dynamics slightly, so the next run is a new baseline.
 
 ## Pending
 
-- Finish the MAOL theory-vs-code audit report and fix any confirmed mismatches
-  in a separate commit.
+- Re-run MAOL warm-up + probe + full training with the audited statistics so the
+  next comparison starts from the corrected baseline.
+- Re-run EMA validation metrics alongside live metrics (see 2026-11-09 EMA
+  analysis) when the next training runs.
