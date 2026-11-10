@@ -9,6 +9,8 @@
   copied live statistics into the EMA model; that regressed and was corrected
   on 2026-11-09, see below.
 - Added `--ema <decay>`.
+- Fixed the training-plot lifecycle (`--plot-real-time`, `--plot-once`) so
+  interactive windows and headless PNG artifacts both work as documented.
 
 ## Result
 
@@ -22,8 +24,12 @@
   exactly.
 - `--ema` accepts an optional decay (`--ema 0.999`); bare `--ema` uses
   `--ema-decay` (default `0.9993`).
-- 42 tests pass, including linear-checkpoint metadata, EMA buffer blending, and
-  EMA decay CLI resolution.
+- Plotting lifecycle fixed on 2026-11-10: GUI backends (`qtagg`, `tkagg`, ...)
+  are no longer misclassified as headless, `--plot-real-time` and
+  `--plot-once` always save `epoch_metrics_plot.<ext>`, and headless runs print
+  an explicit diagnostic instead of silently doing nothing.
+- 48 tests pass, including linear-checkpoint metadata, EMA buffer blending,
+  EMA decay CLI resolution, and plotting backend/lifecycle regressions.
 
 ## Corrections
 
@@ -39,6 +45,8 @@
 
 ## Next Work
 
+- Finish and apply the 2026-11-10 MAOL.docx theory-vs-code audit
+  (`Agent_History/docs/plans/2026-11-10-maol-theory-audit.md`).
 - Run the 18-class CE linear control with EMA.
 - Re-run MAOL with EMA (decay `0.9999`, chosen after the `0.9993` experiment)
   on the same 18-class tree and compare best val accuracy, macro accuracy, and

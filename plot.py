@@ -13,6 +13,31 @@ from pathlib import Path
 from typing import Any
 
 
+# Matplotlib backends that cannot open a GUI window. GUI backends commonly end
+# in "agg" (qtagg, tkagg, gtk3agg, ...), so the backend must be checked against
+# this explicit set instead of a substring test.
+HEADLESS_BACKENDS = frozenset({"agg", "pdf", "ps", "svg", "cairo", "pgf", "template"})
+
+
+def backend_is_interactive(backend_name: str | None = None) -> bool:
+    """Return whether ``backend_name`` can display a GUI window.
+
+    ``None`` resolves the currently active matplotlib backend. Inline/notebook
+    backends (``module://...``) are treated as non-interactive because the
+    training script cannot own their widget lifecycle.
+    """
+    if backend_name is None:
+        import matplotlib
+
+        backend_name = matplotlib.get_backend()
+    name = str(backend_name).strip().lower()
+    if not name:
+        return False
+    if name.startswith("module://"):
+        return False
+    return name not in HEADLESS_BACKENDS
+
+
 SCALAR_PLOT_METRICS = [
     "train_loss_total",
     "train_loss_ce",
@@ -84,13 +109,14 @@ class EpochMetricsPlotter:
         self.output_path = Path(output_path)
         self.title = title
         self._plt = plt
-        self._interactive = "agg" not in plt.get_backend().lower()
+        self.backend = plt.get_backend()
+        self.interactive = backend_is_interactive(self.backend)
         self._figure = plt.figure(num="MAOL Experiment Metrics")
         self._axes: dict[str, Any] = {}
         self._lines: dict[tuple[str, str], Any] = {}
         self._panel_specs = [(f"scalar:{name}", name, [name]) for name in SCALAR_PLOT_METRICS]
         self._create_axes()
-        if self._interactive:
+        if self.interactive:
             plt.ion()
             self._figure.show()
             plt.show(block=False)
@@ -98,7 +124,7 @@ class EpochMetricsPlotter:
 
     def update(self, rows: list[dict[str, Any]]) -> None:
         self._draw(rows)
-        if self._interactive:
+        if self.interactive:
             self._figure.canvas.draw_idle()
             self._plt.pause(0.05)
 
@@ -109,7 +135,7 @@ class EpochMetricsPlotter:
         return self.output_path
 
     def show(self, *, block: bool) -> None:
-        if not self._interactive:
+        if not self.interactive:
             return
         self._plt.ioff()
         self._plt.show(block=block)

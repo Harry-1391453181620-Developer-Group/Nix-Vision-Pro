@@ -1083,7 +1083,7 @@ def _build_plotter(metrics_path: Path, args: argparse.Namespace):
         from plot import EpochMetricsPlotter, resolve_plot_output_path
     except Exception as exc:
         raise SystemExit(f"Failed to initialize metric plotting: {exc}") from exc
-    return EpochMetricsPlotter(
+    plotter = EpochMetricsPlotter(
         metrics_path=metrics_path,
         output_path=resolve_plot_output_path(
             metrics_path,
@@ -1091,6 +1091,38 @@ def _build_plotter(metrics_path: Path, args: argparse.Namespace):
             output_format=args.plot_output_format,
         ),
     )
+    if args.plot_real_time:
+        if plotter.interactive:
+            print(f"[plot] live metric window enabled (matplotlib backend: {plotter.backend}).")
+        else:
+            print(
+                f"[plot] matplotlib backend '{plotter.backend}' cannot open a window; "
+                f"real-time updates stay in memory and the final plot will be saved to {plotter.output_path}"
+            )
+    return plotter
+
+
+def _finalize_plotting(
+    plotter: Any | None,
+    metric_rows: list[dict[str, Any]],
+    metrics_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Always write the final plot; show a window only when one can exist."""
+    if not metric_rows or not (args.plot_once or args.plot_real_time):
+        return
+    if plotter is None:
+        plotter = _build_plotter(metrics_path, args)
+    plotter.save(metric_rows)
+    print(f"[plot] metrics plot saved to: {plotter.output_path}")
+    if args.plot_once:
+        if plotter.interactive:
+            plotter.show(block=True)
+        else:
+            print(
+                f"[plot] matplotlib backend '{plotter.backend}' cannot show a GUI window; "
+                f"open the saved image instead: {plotter.output_path}"
+            )
 
 
 def _run_training(
@@ -1388,10 +1420,7 @@ def _run_training(
         "note": "MAOL run; MixUp, CutMix, focal loss and label smoothing are not used.",
     }
     _write_json(summary_path, summary)
-    if args.plot_once and metric_rows:
-        plotter = _build_plotter(metrics_path, args)
-        plotter.save(metric_rows)
-        plotter.show(block=True)
+    _finalize_plotting(plotter, metric_rows, metrics_path, args)
     return summary
 
 
@@ -1631,10 +1660,7 @@ def _run_linear_training(
         "note": "CE linear-head control; no MAOL wells or geometry losses.",
     }
     _write_json(summary_path, summary)
-    if args.plot_once and metric_rows:
-        plotter = _build_plotter(metrics_path, args)
-        plotter.save(metric_rows)
-        plotter.show(block=True)
+    _finalize_plotting(plotter, metric_rows, metrics_path, args)
     return summary
 
 
@@ -1795,8 +1821,16 @@ def main() -> None:
     parser.add_argument("--min-delta", type=float, default=1e-6)
     parser.add_argument("--checkpoint", type=str, default=str(config.CHECKPOINT_DIR / "maol_model.pt"))
     parser.add_argument("--json-dir", type=str, default="runs")
-    parser.add_argument("--plot-once", action="store_true")
-    parser.add_argument("--plot-real-time", action="store_true")
+    parser.add_argument(
+        "--plot-once",
+        action="store_true",
+        help="Save the metrics plot after training and show a window when the backend supports one",
+    )
+    parser.add_argument(
+        "--plot-real-time",
+        action="store_true",
+        help="Update a live metrics window during training when the backend supports one; the final plot is always saved",
+    )
     parser.add_argument("--plot-output-format", choices=["png", "jpg", "jpeg"], default="png")
     parser.add_argument("--plot-output-dir", type=str, default=None)
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)

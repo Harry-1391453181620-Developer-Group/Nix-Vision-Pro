@@ -307,9 +307,22 @@ The CE control logs zero for the well/geometry fields and no `warmup_*` files.
 Plotting is owned by the trainer:
 
 ```powershell
-python train.py ... --plot-once
-python train.py ... --plot-real-time
+python train.py ... --plot-once        # save the plot and open a window after training
+python train.py ... --plot-real-time   # update a live window during training
 ```
+
+Both flags always write `runs/<run>/epoch_metrics_plot.<ext>` (format via
+`--plot-output-format`, default `png`; directory via `--plot-output-dir`). A GUI
+window opens only when the active matplotlib backend supports one:
+
+- Interactive backends (`qtagg`, `tkagg`, `gtk3agg`, ...) open a window.
+- Headless backends (`agg`, `pdf`, `svg`, ...) cannot show a window; the trainer
+  prints a warning and still saves the final image. This is the normal case on
+  the DGX Spark or any SSH/batch run (the runbook sets `MPLBACKEND=Agg`), so copy
+  the PNG back instead of expecting a window.
+- GUI backend names also end in `agg`; interactivity is detected from the exact
+  backend name, not a substring test (older code misclassified `qtagg`/`tkagg`
+  as headless and silently disabled both the window and drawing updates).
 
 `plot.py` can also be run directly to pick an existing JSONL file.
 
